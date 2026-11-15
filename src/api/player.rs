@@ -625,6 +625,8 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // All options must precede the media URL to satisfy iina-cli syntax and header requirements.
                 cmd.arg("--keep-running");
                 cmd.arg("--no-stdin");
+                cmd.arg("--mpv-ytdl=no");
+                cmd.arg("--mpv-force-window=immediate");
                 cmd.arg("--mpv-referrer=https://zokoanime.video/");
                 cmd.arg("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
@@ -668,6 +670,8 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg(direct_url);
             } else {
                 // Standard MPV engine arguments
+                cmd.arg("--ytdl=no");
+                cmd.arg("--force-window=immediate");
                 cmd.arg("--referrer=https://zokoanime.video/");
                 cmd.arg("--input-terminal=no");
                 cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));

@@ -305,6 +305,18 @@ pub async fn fetch_stream_info(
     episode: u32,
     is_dub: bool,
 ) -> StreamInfo {
+    fetch_stream_info_with_mal(anilist_id, None, query_title, episode, is_dub).await
+}
+
+/// Variant of `fetch_stream_info` that reuses a cached MyAnimeList ID when available
+/// to skip the AniList GraphQL `idMal` roundtrip.
+pub async fn fetch_stream_info_with_mal(
+    anilist_id: i64,
+    mal_id_hint: Option<i64>,
+    query_title: &str,
+    episode: u32,
+    is_dub: bool,
+) -> StreamInfo {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(3))
@@ -315,7 +327,7 @@ pub async fn fetch_stream_info(
     // Run stream resolution and external multi-language subtitle fetching in parallel,
     // bounding external subtitle scraping to 4s so stream detection never stalls.
     let (stream_res, ext_subs_res) = tokio::join!(
-        resolve_primary_stream(&client, anilist_id, query_title, episode, is_dub),
+        resolve_primary_stream(&client, anilist_id, mal_id_hint, query_title, episode, is_dub),
         tokio::time::timeout(
             Duration::from_secs(4),
             fetch_external_subtitles(&client, anilist_id, query_title, episode),
@@ -406,12 +418,17 @@ async fn check_mal_dub_available(client: &reqwest::Client, mal_id: i64, episode:
 async fn resolve_primary_stream(
     client: &reqwest::Client,
     anilist_id: i64,
+    mal_id_hint: Option<i64>,
     query_title: &str,
     episode: u32,
     is_dub: bool,
 ) -> Option<StreamInfo> {
-    // 1. First attempt: resolve MAL ID via AniList GraphQL
-    if let Some(mal_id) = fetch_mal_id(client, anilist_id).await {
+    // 1. First attempt: use cached MAL ID or resolve via AniList GraphQL
+    let mal_id = match mal_id_hint {
+        Some(mid) => Some(mid),
+        None => fetch_mal_id(client, anilist_id).await,
+    };
+    if let Some(mal_id) = mal_id {
         let (mal_res, dub_avail) = tokio::join!(
             fetch_stream_for_mal(client, mal_id, episode, is_dub),
             check_mal_dub_available(client, mal_id, episode)

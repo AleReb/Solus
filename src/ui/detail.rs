@@ -648,20 +648,64 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
 
     let end_idx = (state.episode_offset + visible_rows).min(total_eps_count);
 
+    let queue_inner_w = q_inner.width as usize;
     let mut q_lines = Vec::new();
     for &ep in &state.episode_list[state.episode_offset..end_idx] {
         let is_selected = ep == selected_ep;
         let is_aired = ep <= max_aired;
         let is_watched = state.watched_episodes.contains(&ep);
 
-        let default_title = format!("Episode {}", ep);
-        let ep_title = state.episode_titles.get(&ep).unwrap_or(&default_title);
-        let truncated_title: String = ep_title.chars().take(13).collect();
+        let mut suffix_spans: Vec<Span<'static>> = Vec::new();
+        let mut suffix_w = 0usize;
+
+        // Offline badge
+        if state.offline_episodes.contains_key(&ep) {
+            suffix_spans.push(Span::styled(" 󰇚", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)));
+            suffix_w += 2;
+        }
+
+        // Filler badge
+        if let Some(ftype) = state.anime_fillers.get(&ep) {
+            if ftype == "filler" {
+                suffix_spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 140, 40)).add_modifier(Modifier::BOLD)));
+                suffix_w += 2;
+            } else if ftype == "mixed" {
+                suffix_spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)));
+                suffix_w += 2;
+            }
+        }
+
+        // Progress or watched tag
+        if let Some(&(pos, dur)) = state.anime_progress.get(&ep) {
+            if dur > 0.0 && pos > 5.0 && pos / dur < 0.85 {
+                suffix_spans.push(Span::styled(
+                    format!(" {:02}:{:02}", (pos as u64) / 60, (pos as u64) % 60),
+                    Style::default().fg(Color::Rgb(139, 233, 253)),
+                ));
+                suffix_w += 6;
+            } else if is_watched {
+                suffix_spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
+                suffix_w += 2;
+            }
+        } else if is_watched {
+            suffix_spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
+            suffix_w += 2;
+        } else if !is_aired {
+            suffix_spans.push(Span::styled(" 󰌾", Style::default().fg(Color::Rgb(85, 85, 100))));
+            suffix_w += 2;
+        }
 
         let prefix = if is_selected { "▶ " } else { "  " };
+        let ep_prefix = format!("{prefix}E{ep:<2} ");
+        let prefix_w = ep_prefix.chars().count();
+        let title_w = queue_inner_w.saturating_sub(prefix_w + suffix_w).max(8);
+
+        let default_title = format!("Episode {}", ep);
+        let ep_title = state.episode_titles.get(&ep).unwrap_or(&default_title);
+        let truncated_title = truncate_queue_title(ep_title, title_w);
 
         let mut spans = vec![
-            Span::styled(format!("{prefix}E{ep:<2} {truncated_title:<13}"), if is_selected {
+            Span::styled(format!("{ep_prefix}{truncated_title:<title_w$}"), if is_selected {
                 Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
             } else if !is_aired {
                 Style::default().fg(Color::Rgb(85, 85, 100))
@@ -671,36 +715,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
                 Style::default().fg(Color::Rgb(200, 200, 210))
             }),
         ];
-
-        // Offline badge
-        if state.offline_episodes.contains_key(&ep) {
-            spans.push(Span::styled(" 󰇚", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)));
-        }
-
-        // Filler badge
-        if let Some(ftype) = state.anime_fillers.get(&ep) {
-            if ftype == "filler" {
-                spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 140, 40)).add_modifier(Modifier::BOLD)));
-            } else if ftype == "mixed" {
-                spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)));
-            }
-        }
-
-        // Progress or watched tag
-        if let Some(&(pos, dur)) = state.anime_progress.get(&ep) {
-            if dur > 0.0 && pos > 5.0 && pos / dur < 0.85 {
-                spans.push(Span::styled(
-                    format!(" {:02}:{:02}", (pos as u64) / 60, (pos as u64) % 60),
-                    Style::default().fg(Color::Rgb(139, 233, 253)),
-                ));
-            } else if is_watched {
-                spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
-            }
-        } else if is_watched {
-            spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
-        } else if !is_aired {
-            spans.push(Span::styled(" 󰌾", Style::default().fg(Color::Rgb(85, 85, 100))));
-        }
+        spans.extend(suffix_spans);
 
         q_lines.push(Line::from(spans));
     }
@@ -925,6 +940,28 @@ enum GenreVoice {
     VisceralEpic,
     /// Somber, poignant, and deeply introspective (Drama)
     MelancholicElegy,
+}
+
+fn truncate_queue_title(title: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() <= max_chars {
+        return title.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let limit = max_chars - 1;
+    let slice: String = chars[..limit].iter().collect();
+    let trimmed = if let Some(last_space) = slice.rfind(char::is_whitespace) {
+        if last_space >= limit / 2 {
+            slice[..last_space].trim_end()
+        } else {
+            slice.trim_end()
+        }
+    } else {
+        slice.trim_end()
+    };
+    format!("{trimmed}…")
 }
 
 fn detect_genre_voice(anime: &Anime) -> GenreVoice {

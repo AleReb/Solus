@@ -2322,10 +2322,11 @@ fn trigger_stream_detection(
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let anime_id = anime.id;
+    let mal_id = anime.mal_id;
     let title = anime.playback_query();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let info = api::subtitles::fetch_stream_info(anime_id, &title, episode, is_dub).await;
+        let info = api::subtitles::fetch_stream_info_with_mal(anime_id, mal_id, &title, episode, is_dub).await;
         let _ = tx.send(AppMessage::StreamInfoDetected(anime_id, episode, is_dub, info)).await;
     });
 }
@@ -5919,9 +5920,18 @@ async fn start_playback(
         services::remote::broadcast_state(&remote_state_init).await;
     });
 
-    // 4. Subtitle auto-sync (bounded so slow subtitle hosts never stall player launch)
-    if let Some(ref sub_u) = opts.sub_url {
-        if sub_u.starts_with("http://") || sub_u.starts_with("https://") {
+    // 4. Subtitle auto-sync (only needed for external [Auto-Synced] community subtitles;
+    // native stream subtitles are already synced and loaded directly by mpv in parallel)
+    let needs_subsync = opts.sub_url.as_ref().is_some_and(|u| {
+        (u.starts_with("http://") || u.starts_with("https://"))
+            && state
+                .playback_sub_languages
+                .iter()
+                .find(|s| s.url == *u)
+                .is_some_and(|s| s.stream_label.contains("[Auto-Synced]"))
+    });
+    if needs_subsync {
+        if let Some(ref sub_u) = opts.sub_url {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(3))
