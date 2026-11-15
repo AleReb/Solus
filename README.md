@@ -38,10 +38,18 @@ Paste **one command** for your platform—it automatically installs `solus`, `mp
 ```bash
 curl -fsSL https://raw.githubusercontent.com/abdullah-binmadhi/Solus/main/install.sh | bash
 ```
+*Prefer to inspect the script first?*
+```bash
+curl -fsSLO https://raw.githubusercontent.com/abdullah-binmadhi/Solus/main/install.sh && less install.sh && bash install.sh
+```
 
 ### Windows (PowerShell)
 ```powershell
 irm https://raw.githubusercontent.com/abdullah-binmadhi/Solus/main/install.ps1 | iex
+```
+*Prefer to inspect the script first?*
+```powershell
+irm https://raw.githubusercontent.com/abdullah-binmadhi/Solus/main/install.ps1 -OutFile install.ps1; notepad install.ps1; .\install.ps1
 ```
 
 Then open **Kitty** (macOS/Linux) or **WezTerm** (Windows) and run:

@@ -29,6 +29,9 @@ esac
 install_macos_deps() {
   if ! need_cmd brew; then
     info "Installing Homebrew..."
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]] && need_cmd sudo && [[ -e /dev/tty ]] && ! sudo -n true 2>/dev/null; then
+      sudo -v < /dev/tty || true
+    fi
     NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     if [[ -x /opt/homebrew/bin/brew ]]; then
       eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -67,6 +70,14 @@ install_ani_cli_from_git() {
 install_linux_deps() {
   local sudo_cmd=""
   if [[ "${EUID:-$(id -u)}" -ne 0 ]] && need_cmd sudo; then
+    if ! sudo -n true 2>/dev/null; then
+      if [[ -e /dev/tty ]]; then
+        info "Administrator privileges required to install system packages (mpv, ffmpeg, yt-dlp, kitty)..."
+        sudo -v < /dev/tty
+      else
+        fail "sudo requires an interactive terminal. Download and run ./install.sh locally instead."
+      fi
+    fi
     sudo_cmd="sudo"
   fi
 
