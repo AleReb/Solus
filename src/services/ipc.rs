@@ -48,6 +48,7 @@ async fn connect_ipc(sock_path: &str) -> Option<IpcStream> {
 /// Configuration for launching an mpv IPC monitoring session.
 pub struct IpcMonitorConfig {
     pub anime_id:        i64,
+    pub mal_id:          Option<i64>,
     pub episode:         u32,
     pub sock_path:       String,
     pub pool:            SqlitePool,
@@ -106,24 +107,57 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
 async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     let IpcMonitorConfig {
         anime_id,
+        mal_id,
         episode,
         sock_path,
         pool,
         tx,
         auth,
         trackers,
-        skip_intervals,
+        mut skip_intervals,
         auto_skip_intro,
     } = config;
 
-    // Retry connecting to the socket / named pipe for up to 5 seconds
-    let mut stream = None;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(s) = connect_ipc(&sock_path).await {
-            stream = Some(s);
-            break;
+    // Fetch AniSkip intervals in parallel while waiting for mpv's IPC socket so
+    // player startup is never blocked by AniList / AniSkip network round trips.
+    let connect_fut = async {
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(s) = connect_ipc(&sock_path).await {
+                return Some(s);
+            }
         }
+        None
+    };
+
+    let aniskip_fut = async {
+        if !skip_intervals.is_empty() || !auto_skip_intro {
+            return None;
+        }
+        let mid = if let Some(m) = mal_id {
+            Some(m)
+        } else {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(4))
+                .build()
+                .unwrap_or_default();
+            let resolved = crate::api::anilist::resolve_mal_id(&client, anime_id).await;
+            if let Some(m) = resolved {
+                let _ = tx.send(AppMessage::AnimeMalIdReady(anime_id, m)).await;
+            }
+            resolved
+        };
+        if let Some(m) = mid {
+            Some(crate::api::aniskip::fetch_skip_times(m, episode).await)
+        } else {
+            None
+        }
+    };
+
+    let (stream, fetched_skips) = tokio::join!(connect_fut, aniskip_fut);
+    if let Some(skips) = fetched_skips {
+        skip_intervals = skips;
     }
 
     let stream = match stream {

@@ -152,6 +152,15 @@ fn command_exists(name: &str) -> bool {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            if executable_exists(&PathBuf::from(dir).join(name)) {
+                return true;
+            }
+        }
+    }
+
     #[cfg(windows)]
     {
         if windows_fallback_exists(name) {
@@ -326,11 +335,14 @@ pub fn ensure_player_wrapper(real_player: &str) -> Result<PathBuf> {
     let wrapper_path = bin_dir.join(wrapper_name);
 
     let script_content = r#"#!/bin/bash
-set -e
 
 REAL_PLAYER="${SOLUS_REAL_PLAYER:-}"
 if [ -z "$REAL_PLAYER" ]; then
-    REAL_PLAYER="$(command -v mpv || echo "/opt/homebrew/bin/mpv")"
+    REAL_PLAYER="$(command -v mpv || command -v /opt/homebrew/bin/mpv || command -v /usr/local/bin/mpv || echo "mpv")"
+fi
+if [ ! -x "$REAL_PLAYER" ] && ! command -v "$REAL_PLAYER" >/dev/null 2>&1; then
+    echo "Program $REAL_PLAYER not found" >&2
+    exit 127
 fi
 
 args=()
@@ -380,7 +392,7 @@ fi
 if [[ "$video_link" =~ /index\.m3u8$ ]]; then
     master_url="${video_link%/*/*}/master.m3u8"
     if [ -n "$master_url" ]; then
-        has_audio=$(curl -s -m 2 -e "$refr" "$master_url" 2>/dev/null | grep -m 1 "TYPE=AUDIO" || true)
+        has_audio=$(curl -s --connect-timeout 1 -m 1 -e "$refr" "$master_url" 2>/dev/null | grep -m 1 "TYPE=AUDIO" || true)
         if [ -n "$has_audio" ]; then
             if [ "$is_iina" -eq 1 ]; then
                 escaped_master="${master_url//:/\\:}"

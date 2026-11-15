@@ -1208,7 +1208,7 @@ impl AppState {
         self.playback_logs.push(line);
     }
 
-    /// Check playback logs for known ani-cli error messages.
+    /// Check playback logs for known ani-cli or player error messages.
     /// Returns a user-facing error message if the logs indicate a failure.
     pub fn playback_error_message(&self) -> Option<&str> {
         for log in self.playback_logs.iter().rev() {
@@ -1223,6 +1223,9 @@ impl AppState {
             }
             if log.contains("No results found") {
                 return Some("Anime title could not be found on streaming sources.");
+            }
+            if log.contains("Player exited with error:") || log.contains("Player wait error:") {
+                return Some("Player failed to launch or stream expired — try another provider (HD-1 / Pahe / Gogo).");
             }
         }
         None

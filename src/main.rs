@@ -5919,11 +5919,15 @@ async fn start_playback(
         services::remote::broadcast_state(&remote_state_init).await;
     });
 
-    // 4. Subtitle auto-sync
+    // 4. Subtitle auto-sync (bounded so slow subtitle hosts never stall player launch)
     if let Some(ref sub_u) = opts.sub_url {
         if sub_u.starts_with("http://") || sub_u.starts_with("https://") {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
 
             // Locate verified reference subtitle from the primary stream (e.g. native official English .vtt)
             let ref_sub_url = state
@@ -5941,43 +5945,36 @@ async fn start_playback(
 
             let stream_ref = opts.stream_url.as_deref().or(state.pending_master_url.as_deref());
 
-            let (cached_path, sync_res) = services::subsync::ensure_synchronized_subtitle(
-                &client,
-                sub_u,
-                ref_sub_url,
-                stream_ref,
-                anime_id,
-                episode,
-                code,
+            if let Ok((cached_path, sync_res)) = tokio::time::timeout(
+                Duration::from_secs(4),
+                services::subsync::ensure_synchronized_subtitle(
+                    &client,
+                    sub_u,
+                    ref_sub_url,
+                    stream_ref,
+                    anime_id,
+                    episode,
+                    code,
+                ),
             )
-            .await;
+            .await
+            {
+                opts.sub_url = Some(cached_path);
 
-            opts.sub_url = Some(cached_path);
-
-            if let Some(res) = sync_res {
-                if res.applied {
-                    state.show_toast(
-                        format!("❖ Auto-Synced {} sub (offset: {:+.2}s)", code, res.offset_seconds),
-                        unix_now(),
-                    );
+                if let Some(res) = sync_res {
+                    if res.applied {
+                        state.show_toast(
+                            format!("❖ Auto-Synced {} sub (offset: {:+.2}s)", code, res.offset_seconds),
+                            unix_now(),
+                        );
+                    }
                 }
             }
         }
     }
 
-    // 5. Query AniSkip for intro/outro skip times
+    // 5. Spawn player immediately; AniSkip intervals are resolved concurrently by the IPC monitor
     let mal_id_opt = state.anime_mal_ids.get(&anime_id).copied();
-    let skip_intervals = if let Some(mid) = mal_id_opt {
-        api::aniskip::fetch_skip_times(mid, episode).await
-    } else {
-        let client = reqwest::Client::new();
-        if let Some(mid) = api::anilist::resolve_mal_id(&client, anime_id).await {
-            state.anime_mal_ids.insert(anime_id, mid);
-            api::aniskip::fetch_skip_times(mid, episode).await
-        } else {
-            Vec::new()
-        }
-    };
 
     let mut child = match api::player::spawn_async(&opts) {
         Ok(c) => c,
@@ -6003,13 +6000,14 @@ async fn start_playback(
     // 7. Spawn mpv IPC monitor for live tracking, auto-scrobble, and auto-skip
     let ipc_cfg = services::ipc::IpcMonitorConfig {
         anime_id,
+        mal_id: mal_id_opt,
         episode,
         sock_path,
         pool: pool.clone(),
         tx: tx.clone(),
         auth: state.auth.clone(),
         trackers: cfg.trackers.clone(),
-        skip_intervals,
+        skip_intervals: Vec::new(),
         auto_skip_intro: cfg.auto_skip_intro,
     };
     services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
@@ -6044,7 +6042,11 @@ async fn start_playback(
     tokio::spawn(async move {
         tokio::select! {
             status = child.wait() => {
-                let msg = format!("ani-cli exited: {:?}", status);
+                let msg = match status {
+                    Ok(st) if !st.success() => format!("Player exited with error: {}", st),
+                    Ok(st) => format!("Player exited: {}", st),
+                    Err(e) => format!("Player wait error: {}", e),
+                };
                 let _ = tx4.send(AppMessage::PlaybackLog(msg)).await;
                 let _ = tx4.send(AppMessage::PlaybackDone(my_gen)).await;
             }

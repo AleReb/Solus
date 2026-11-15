@@ -307,15 +307,21 @@ pub async fn fetch_stream_info(
 ) -> StreamInfo {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default();
 
-    // Run stream resolution and external multi-language subtitle fetching in parallel!
-    let (stream_res, ext_subs) = tokio::join!(
+    // Run stream resolution and external multi-language subtitle fetching in parallel,
+    // bounding external subtitle scraping to 4s so stream detection never stalls.
+    let (stream_res, ext_subs_res) = tokio::join!(
         resolve_primary_stream(&client, anilist_id, query_title, episode, is_dub),
-        fetch_external_subtitles(&client, anilist_id, query_title, episode)
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            fetch_external_subtitles(&client, anilist_id, query_title, episode),
+        )
     );
+    let ext_subs = ext_subs_res.unwrap_or_default();
 
     let mut info = stream_res.unwrap_or_else(StreamInfo::fallback);
 
@@ -602,14 +608,21 @@ pub async fn fetch_external_subtitles(
         }
     }
 
-    for title in search_titles {
+    let mut query_urls = Vec::new();
+    for title in &search_titles {
         for lang_filter in ["sublanguageid-ara", "sublanguageid-rus", "sublanguageid-ind", ""] {
             let query_path = if lang_filter.is_empty() {
-                format!("https://rest.opensubtitles.org/search/query-{}", urlencoding::encode(&title))
+                format!("https://rest.opensubtitles.org/search/query-{}", urlencoding::encode(title))
             } else {
-                format!("https://rest.opensubtitles.org/search/{}/query-{}", lang_filter, urlencoding::encode(&title))
+                format!("https://rest.opensubtitles.org/search/{}/query-{}", lang_filter, urlencoding::encode(title))
             };
+            query_urls.push(query_path);
+        }
+    }
 
+    let search_futs = query_urls.into_iter().map(|query_path| {
+        let client = client.clone();
+        async move {
             let req = client
                 .get(&query_path)
                 .header("User-Agent", "TemporaryUserAgent")
@@ -617,27 +630,32 @@ pub async fn fetch_external_subtitles(
 
             if let Ok(resp) = req.send().await {
                 if let Ok(items) = resp.json::<Vec<OpenSubtitlesItem>>().await {
-                    for it in items {
-                        let sep = it.series_episode.as_deref().unwrap_or("");
-                        let fn_str = it.sub_file_name.as_deref().unwrap_or("");
-                        let Some(dl_url) = it.sub_download_link.filter(|u| !u.is_empty()) else {
-                            continue;
-                        };
+                    return items;
+                }
+            }
+            Vec::new()
+        }
+    });
 
-                        if matches_episode(sep, fn_str, episode) {
-                            let lang_id = it.sub_language_id.as_deref().unwrap_or("eng");
-                            let (code, name) = resolve_lang_meta(fn_str, lang_id);
+    for items in futures_util::future::join_all(search_futs).await {
+        for it in items {
+            let sep = it.series_episode.as_deref().unwrap_or("");
+            let fn_str = it.sub_file_name.as_deref().unwrap_or("");
+            let Some(dl_url) = it.sub_download_link.filter(|u| !u.is_empty()) else {
+                continue;
+            };
 
-                            if seen.insert(code.clone()) {
-                                options.push(SubtitleOption {
-                                    code,
-                                    name: name.clone(),
-                                    stream_label: format!("{} [Auto-Synced]", name),
-                                    url: dl_url,
-                                });
-                            }
-                        }
-                    }
+            if matches_episode(sep, fn_str, episode) {
+                let lang_id = it.sub_language_id.as_deref().unwrap_or("eng");
+                let (code, name) = resolve_lang_meta(fn_str, lang_id);
+
+                if seen.insert(code.clone()) {
+                    options.push(SubtitleOption {
+                        code,
+                        name: name.clone(),
+                        stream_label: format!("{} [Auto-Synced]", name),
+                        url: dl_url,
+                    });
                 }
             }
         }
