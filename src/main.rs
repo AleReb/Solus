@@ -329,15 +329,20 @@ async fn main() -> anyhow::Result<()> {
     let mut picker = ratatui_image::picker::Picker::new((10, 20));
 
     picker.guess_protocol();
-    if std::env::var("KITTY_WINDOW_ID").is_ok()
-        || std::env::var("TERM").map(|t| t.contains("kitty")).unwrap_or(false)
-    {
-        picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
-    }
-    if std::env::var("WEZTERM_EXECUTABLE").is_ok()
-        || std::env::var("TERM_PROGRAM").map(|t| t.contains("WezTerm")).unwrap_or(false)
-    {
-        picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
+    let in_multiplexer = std::env::var_os("ZELLIJ").is_some()
+        || std::env::var_os("ZELLIJ_SESSION_NAME").is_some()
+        || std::env::var_os("TMUX").is_some();
+    if !in_multiplexer {
+        if std::env::var("KITTY_WINDOW_ID").is_ok()
+            || std::env::var("TERM").map(|t| t.contains("kitty")).unwrap_or(false)
+        {
+            picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        }
+        if std::env::var("WEZTERM_EXECUTABLE").is_ok()
+            || std::env::var("TERM_PROGRAM").map(|t| t.contains("WezTerm")).unwrap_or(false)
+        {
+            picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
+        }
     }
     state.picker = Some(picker);
     if has_cached {

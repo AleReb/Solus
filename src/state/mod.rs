@@ -829,13 +829,9 @@ impl AppState {
         }
     }
 
-    /// True if this terminal supports real images (Kitty / Sixel / Iterm2).
+    /// True when an image picker is initialized (Kitty / Sixel / iTerm2 / RGB Halfblocks).
     pub fn has_image_support(&self) -> bool {
-        use ratatui_image::picker::ProtocolType;
-        self.picker
-            .as_ref()
-            .map(|p| p.protocol_type != ProtocolType::Halfblocks)
-            .unwrap_or(false)
+        self.picker.is_some()
     }
 
     /// Stop any currently running player.
@@ -1652,5 +1648,16 @@ mod tests {
         state.skip_preload();
         assert!(!state.is_loading);
         assert!(!state.advance_preload(gen2));
+    }
+
+    #[test]
+    fn test_has_image_support_enables_halfblocks_for_alacritty_and_zellij() {
+        let mut state = AppState::new();
+        assert!(!state.has_image_support());
+
+        let mut picker = Picker::new((10, 20));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+        state.picker = Some(picker);
+        assert!(state.has_image_support());
     }
 }
