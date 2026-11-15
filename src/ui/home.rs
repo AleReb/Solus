@@ -1386,21 +1386,16 @@ fn render_bento_split(frame: &mut Frame, area: Rect, state: &mut AppState, data:
     };
     let wl_offset = state.row_offset("watchlist");
     let wl_dots = format_pagination_dots(wl_offset, data.watchlist.len());
-    let wl_src_summary = format_watchlist_source_summary(data);
+    let mut wl_title_spans = vec![Span::styled(
+        format!(" 󰋜 My Watchlist ({}) ", data.watchlist.len()),
+        wl_title_style,
+    )];
+    wl_title_spans.extend(watchlist_source_summary_spans(data, &theme));
     let wl_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(wl_border))
-        .title(Line::from(vec![
-            Span::styled(
-                format!(" 󰋜 My Watchlist ({}) ", data.watchlist.len()),
-                wl_title_style,
-            ),
-            Span::styled(
-                wl_src_summary,
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-            ),
-        ]))
+        .title(Line::from(wl_title_spans))
         .title(
             Line::from(vec![
                 Span::styled(wl_dots, Style::default().fg(if wl_active { theme.primary } else { theme.text_dim })),
@@ -1467,38 +1462,105 @@ fn watchlist_source_counts(data: &HomeData) -> (usize, usize, usize, usize) {
     (al, mal, both, local)
 }
 
-fn format_watchlist_source_summary(data: &HomeData) -> String {
-    if data.watchlist_sources.is_empty() {
-        return String::new();
-    }
-    let (al, mal, both, local) = watchlist_source_counts(data);
-    let mut parts = Vec::new();
-    if al > 0 {
-        parts.push(format!("✦AL:{al}"));
-    }
-    if mal > 0 {
-        parts.push(format!("◆MAL:{mal}"));
-    }
-    if both > 0 {
-        parts.push(format!("◈Both:{both}"));
-    }
-    if local > 0 {
-        parts.push(format!("•Loc:{local}"));
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}] ", parts.join(" · "))
+fn source_accent_color(source: WatchlistSource, theme: &crate::ui::theme::ThemePalette) -> Color {
+    match source {
+        WatchlistSource::AniList => theme.primary,
+        WatchlistSource::Mal => theme.secondary,
+        WatchlistSource::Both => theme.accent,
+        WatchlistSource::Local => theme.text_dim,
     }
 }
 
-fn source_accent_color(source: WatchlistSource) -> Color {
-    match source {
-        WatchlistSource::AniList => Color::Rgb(103, 232, 249),
-        WatchlistSource::Mal => Color::Rgb(108, 160, 255),
-        WatchlistSource::Both => Color::Rgb(251, 191, 36),
-        WatchlistSource::Local => Color::Rgb(150, 155, 182),
+fn watchlist_source_summary_spans(
+    data: &HomeData,
+    theme: &crate::ui::theme::ThemePalette,
+) -> Vec<Span<'static>> {
+    if data.watchlist_sources.is_empty() {
+        return Vec::new();
     }
+    let (al, mal, both, local) = watchlist_source_counts(data);
+    let mut entries: Vec<(String, Color)> = Vec::new();
+    if al > 0 {
+        entries.push((format!("✦AL:{al}"), source_accent_color(WatchlistSource::AniList, theme)));
+    }
+    if mal > 0 {
+        entries.push((format!("◆MAL:{mal}"), source_accent_color(WatchlistSource::Mal, theme)));
+    }
+    if both > 0 {
+        entries.push((format!("◈Both:{both}"), source_accent_color(WatchlistSource::Both, theme)));
+    }
+    if local > 0 {
+        entries.push((format!("•Loc:{local}"), source_accent_color(WatchlistSource::Local, theme)));
+    }
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let dim_style = Style::default().fg(theme.text_dim);
+    let mut spans = vec![Span::styled(" [", dim_style)];
+    for (idx, (text, color)) in entries.into_iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", dim_style));
+        }
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled("] ", dim_style));
+    spans
+}
+
+/// Count how many group divider pillars appear in `start..start + count`.
+fn count_watchlist_dividers(start: usize, count: usize, show_dividers: bool, data: &HomeData) -> usize {
+    if !show_dividers || count == 0 {
+        return 0;
+    }
+    let end = (start + count).min(data.watchlist.len());
+    let mut divs = 0usize;
+    let mut prev: Option<WatchlistSource> = None;
+    for anime in &data.watchlist[start..end] {
+        let src = watchlist_source_for(anime, data);
+        if prev != Some(src) {
+            divs += 1;
+            prev = Some(src);
+        }
+    }
+    divs
+}
+
+/// Solve `(card_count, card_width)` starting at `start` after subtracting exact divider widths
+/// so cards expand edge-to-edge without leaving an empty right-side void.
+fn fit_watchlist_slice(
+    start: usize,
+    usable_w: u16,
+    show_dividers: bool,
+    data: &HomeData,
+) -> (usize, u16) {
+    let min_card_w: u16 = 20;
+    let max_card_w: u16 = 25;
+    let avail = data.watchlist.len().saturating_sub(start);
+    if avail == 0 || usable_w < min_card_w {
+        return (1.min(avail), usable_w.min(max_card_w));
+    }
+
+    let mut best_n = 1usize;
+    for n in 1..=avail {
+        let divs = count_watchlist_dividers(start, n, show_dividers, data) as u16;
+        let div_w = divs * WATCHLIST_DIVIDER_STEP;
+        let gaps = n.saturating_sub(1) as u16 * CARD_GAP;
+        if div_w + (n as u16) * min_card_w + gaps <= usable_w {
+            best_n = n;
+        } else {
+            break;
+        }
+    }
+
+    let divs = count_watchlist_dividers(start, best_n, show_dividers, data) as u16;
+    let div_w = divs * WATCHLIST_DIVIDER_STEP;
+    let gaps = best_n.saturating_sub(1) as u16 * CARD_GAP;
+    let budget = usable_w.saturating_sub(div_w + gaps);
+    let card_w = (budget / best_n as u16).clamp(min_card_w, max_card_w);
+    (best_n, card_w)
 }
 
 /// Deterministically lay out Watchlist source dividers + cards so focused item is always visible.
@@ -1514,39 +1576,31 @@ pub fn compute_watchlist_slots(
         return Vec::new();
     }
 
-    let (approx_vis_n, card_w) = compute_row_card_metrics(usable_w);
     let clamped_offset = offset.min(data.watchlist.len().saturating_sub(1));
-    let show_dividers = !data.watchlist_sources.is_empty() && usable_w >= card_w + 10;
+    let show_dividers = !data.watchlist_sources.is_empty() && usable_w >= 30;
 
-    let mut start = row_view_start(clamped_offset, data.watchlist.len(), approx_vis_n.max(1))
-        .min(clamped_offset);
+    let (first_fit, _) = fit_watchlist_slice(0, usable_w, show_dividers, data);
+    let mut start = if clamped_offset < first_fit {
+        0
+    } else {
+        row_view_start(clamped_offset, data.watchlist.len(), first_fit.max(1)).min(clamped_offset)
+    };
 
-    loop {
-        let mut x = x_start;
-        let mut prev_src: Option<WatchlistSource> = None;
-        let mut selected_end = 0u16;
-        for idx in start..data.watchlist.len() {
-            let src = watchlist_source_for(&data.watchlist[idx], data);
-            let need_div = show_dividers && prev_src != Some(src);
-            let div_step = if need_div { WATCHLIST_DIVIDER_STEP } else { 0 };
-            if idx == clamped_offset {
-                selected_end = x + div_step + card_w;
-                break;
-            }
-            x += div_step + card_w + CARD_GAP;
-            prev_src = Some(src);
-        }
-        if selected_end <= x_start + usable_w || start >= clamped_offset {
+    while start < clamped_offset {
+        let (fit_n, _) = fit_watchlist_slice(start, usable_w, show_dividers, data);
+        if clamped_offset < start + fit_n.max(1) {
             break;
         }
         start += 1;
     }
 
+    let (fit_n, card_w) = fit_watchlist_slice(start, usable_w, show_dividers, data);
+
     let mut slots = Vec::new();
     let mut x = x_start;
     let mut prev_src: Option<WatchlistSource> = None;
 
-    for idx in start..data.watchlist.len() {
+    for idx in start..(start + fit_n).min(data.watchlist.len()) {
         let src = watchlist_source_for(&data.watchlist[idx], data);
         let need_div = show_dividers && prev_src != Some(src);
         let div_step = if need_div { WATCHLIST_DIVIDER_STEP } else { 0 };
@@ -1615,11 +1669,19 @@ pub fn watchlist_card_index_at(
     None
 }
 
-fn render_watchlist_divider(frame: &mut Frame, x: u16, y: u16, width: u16, height: u16, source: WatchlistSource) {
+fn render_watchlist_divider(
+    frame: &mut Frame,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    source: WatchlistSource,
+    theme: &crate::ui::theme::ThemePalette,
+) {
     if height < 2 || width < 4 {
         return;
     }
-    let accent = source_accent_color(source);
+    let accent = source_accent_color(source, theme);
     let badge = match source {
         WatchlistSource::AniList => "✦ AL ",
         WatchlistSource::Mal => "◆ MAL",
@@ -1637,8 +1699,7 @@ fn render_watchlist_divider(frame: &mut Frame, x: u16, y: u16, width: u16, heigh
         Paragraph::new(Span::styled(
             badge,
             Style::default()
-                .fg(Color::Black)
-                .bg(accent)
+                .fg(accent)
                 .add_modifier(Modifier::BOLD),
         )),
         badge_rect,
@@ -1648,7 +1709,7 @@ fn render_watchlist_divider(frame: &mut Frame, x: u16, y: u16, width: u16, heigh
     let mut rail_lines = Vec::with_capacity(line_h as usize);
     for r in 0..line_h {
         let ch = if r + 1 == line_h { "  ╵  " } else { "  │  " };
-        rail_lines.push(Line::from(Span::styled(ch, Style::default().fg(accent))));
+        rail_lines.push(Line::from(Span::styled(ch, Style::default().fg(theme.divider))));
     }
     frame.render_widget(
         Paragraph::new(rail_lines),
@@ -1670,6 +1731,7 @@ fn render_watchlist_slots_widgets(
     state: &mut AppState,
     data: &HomeData,
 ) {
+    let theme = state.theme();
     for slot in slots {
         match slot {
             WatchlistRenderSlot::Divider { source, x, width } => {
@@ -1680,7 +1742,7 @@ fn render_watchlist_slots_widgets(
                         _ => None,
                     })
                     .unwrap_or(0);
-                render_watchlist_divider(frame, *x, y, *width, CARD_HEIGHT.min(height), *source);
+                render_watchlist_divider(frame, *x, y, *width, CARD_HEIGHT.min(height), *source, &theme);
             }
             WatchlistRenderSlot::Card {
                 anime_idx,
@@ -1725,29 +1787,31 @@ fn render_single_row(frame: &mut Frame, area: Rect, state: &mut AppState, row: &
         Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)
     };
 
-    let wl_tag = if *row == CategoryRow::Watchlist {
-        format_watchlist_source_summary(data)
+    let base_prefix = format!("── {} ({})", label, items.len());
+    let summary_spans = if *row == CategoryRow::Watchlist {
+        watchlist_source_summary_spans(data, &theme)
     } else {
-        String::new()
+        Vec::new()
     };
-    let title_prefix = format!("── {} ({}){} ", label, items.len(), wl_tag);
+    let summary_chars: usize = summary_spans.iter().map(|s| s.content.chars().count()).sum();
+    let prefix_chars = base_prefix.chars().count() + summary_chars + 1;
     let title_suffix = format!(" {} [ {}/{} ] ──", dots, (offset + 1).min(items.len()), items.len());
     let sep_len = (area.width as usize)
-        .saturating_sub(title_prefix.chars().count() + title_suffix.chars().count() + 1);
+        .saturating_sub(prefix_chars + title_suffix.chars().count() + 1);
 
-    let title_line = Line::from(vec![
-        Span::styled(title_prefix, label_style),
-        Span::styled("─".repeat(sep_len), Style::default().fg(rail_color)),
-        Span::styled(
-            format!(" {} ", dots),
-            Style::default().fg(if is_active { theme.primary } else { theme.divider }),
-        ),
-        Span::styled(
-            format!("[ {}/{} ] ──", (offset + 1).min(items.len()), items.len()),
-            Style::default().fg(theme.text_dim),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(title_line), chunks[0]);
+    let mut header_spans = vec![Span::styled(base_prefix, label_style)];
+    header_spans.extend(summary_spans);
+    header_spans.push(Span::raw(" "));
+    header_spans.push(Span::styled("─".repeat(sep_len), Style::default().fg(rail_color)));
+    header_spans.push(Span::styled(
+        format!(" {} ", dots),
+        Style::default().fg(if is_active { theme.primary } else { theme.divider }),
+    ));
+    header_spans.push(Span::styled(
+        format!("[ {}/{} ] ──", (offset + 1).min(items.len()), items.len()),
+        Style::default().fg(theme.text_dim),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
     let card_area = chunks[1];
     if *row == CategoryRow::Watchlist {
@@ -1845,13 +1909,12 @@ fn render_card_with_source(
     }
 
     if let Some(src) = source_tag {
-        let src_color = source_accent_color(src);
+        let src_color = source_accent_color(src, &theme);
         block = block.title(
             Line::from(vec![Span::styled(
                 format!(" [{}] ", src.pill_tag()),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(src_color)
+                    .fg(src_color)
                     .add_modifier(Modifier::BOLD),
             )])
             .alignment(Alignment::Right),
@@ -2490,5 +2553,41 @@ mod tests {
         }
         assert!(modal_out.contains("ADD TO WATCHLIST DATABASES"));
         assert!(modal_out.contains("Both Databases (AniList + MyAnimeList + Solus)"));
+    }
+
+    #[test]
+    fn test_watchlist_slots_eliminate_right_void_with_dividers() {
+        let mut data = HomeData::empty();
+        for id in 1..=6 {
+            data.watchlist.push(Anime {
+                id,
+                title_romaji: format!("AL Show {id}"),
+                ..Anime::default()
+            });
+            data.watchlist_sources.insert(id, WatchlistSource::AniList);
+        }
+        data.watchlist.push(Anime {
+            id: 7,
+            title_romaji: "Local Show".into(),
+            ..Anime::default()
+        });
+        data.watchlist_sources.insert(7, WatchlistSource::Local);
+
+        let usable_w = 137u16;
+        let slots = compute_watchlist_slots(10, 5, usable_w, 10, 0, &data);
+        let cards: Vec<_> = slots
+            .iter()
+            .filter_map(|s| match s {
+                WatchlistRenderSlot::Card { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 6, "all 6 AL cards should pack cleanly alongside the divider");
+        let right_edge = cards.last().unwrap().x + cards.last().unwrap().width;
+        let trailing_slack = (10 + usable_w).saturating_sub(right_edge);
+        assert!(
+            trailing_slack <= 4,
+            "expected minimal right slack with divider present, got {trailing_slack} cols"
+        );
     }
 }
