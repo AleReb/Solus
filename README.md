@@ -2,35 +2,9 @@
 
 **The fast, featherlight anime theatre with zero ads, built-in AniList sync, TV casting, mobile remote, and no browser required.**
 
-https://github.com/user-attachments/assets/7f520a34-a56e-4465-b31e-c7046d798322
+https://github.com/user-attachments/assets/a7c6c35f-ac28-49ef-bb0f-fbfc72bc4177
 
 `Solus` is an anime theatre that lives directly inside your terminal. You get crisp cover art, real episode thumbnails, cinema-grade typography presets, local phone remote companion, direct Smart TV casting, and full AniList integration—all without opening a single browser tab, installing three ad-blockers, or fighting pop-up windows just to click Play.
-
-```text
-╔════════════════════════════════════════════════════════════════════════════════════════╗
-║  ❖ SOLUS // TERMINAL ANIME THEATRE                                    [t] Discover [?] ║
-╠════════════════════════════════════════════════════════════════════════════════════════╣
-║  ╭──────────────────╮  ZANKYOU NO TERROR (Terror in Resonance)                         ║
-║  │                  │  ★ 81%  ·  TV  ·  FINISHED  ·  11 Episodes  ·  [ SUB ]           ║
-║  │   1200 × 1800    │  [ Drama ]  [ Mystery ]  [ Psychological ]  [ Thriller ]         ║
-║  │   HD PORTRAIT    │                                                                  ║
-║  │    COVER ART     │  In an alternate version of the present, Tokyo has been          ║
-║  │                  │  decimated by a shocking terrorist attack, and the only hint     ║
-║  │                  │  to the identity of the culprit is a bizarre video uploaded...   ║
-║  ╰──────────────────╯  [ ▶ Continue Ep 4 ]  [ - Remove Watchlist ]                     ║
-╠════════════════════════════════════════════════════════════════════════════════════════╣
-║  ❖ Episodes (11) [v: Split View] ───┬─ ❖ Episode Inspector ────────────────────────────╣
-║    01. Falling                 󰄬    │  ╭──────────────────────╮  EPISODE 04            ║
-║    02. Call & Response         󰄬    │  │     1280 × 768       │  Break Through         ║
-║    03. Search & Destroy        󰄬    │  │  WIDESCREEN EPISODE  │  ❖ 24m · FHD · Aired   ║
-║  ▸ 04. Break Through           ❖    │  │    STILL PREVIEW     │  [ Enter: Play ]       ║
-║    05. Hide & Seek                  │  ╰──────────────────────╯  [ o: Stream ] [ w ]   ║
-║    06. Ready or Not                 │  ─ Episode Synopsis ──────────────────────────── ║
-║    07. Deuce                        │  Nine hacks into the police database while Lisa  ║
-║    08. My Fair Lady                 │  runs away from home and ends up caught in the   ║
-║    09. Highs & Lows                 │  crossfire of Sphinx's next riddle across Tokyo. ║
-╚═════════════════════════════════════╩══════════════════════════════════════════════════╝
-```
 
 ---
 
