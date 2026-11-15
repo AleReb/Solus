@@ -6,7 +6,9 @@ mod services;
 mod state;
 mod ui;
 
-pub use ui::components::cover::{build_stateful_protocol, scale_to_frame_cover};
+pub use ui::components::cover::{
+    build_stateful_protocol, hd_resize_mode, scale_to_frame_cover,
+};
 
 use anyhow::Context;
 use crossterm::{
@@ -856,8 +858,8 @@ async fn main() -> anyhow::Result<()> {
                         state.loading_episode_thumbnails.remove(&ep);
                         let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
                         let card_thumb = prepare_16_9_thumbnail_cover(img, font_size);
-                        if let Some(ref mut picker) = state.picker {
-                            let proto = picker.new_resize_protocol(card_thumb);
+                        if let Some(picker) = state.picker {
+                            let proto = build_stateful_protocol(picker, card_thumb);
                             state.episode_thumbnails.insert(ep, proto);
                         }
                     }
@@ -866,8 +868,8 @@ async fn main() -> anyhow::Result<()> {
                     state.loading_banners.remove(&anime_id);
                     let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
                     let card_banner = prepare_card_cover_with_font(img.clone(), font_size);
-                    if let Some(ref mut picker) = state.picker {
-                        let proto = picker.new_resize_protocol(card_banner.clone());
+                    if let Some(picker) = state.picker {
+                        let proto = build_stateful_protocol(picker, card_banner.clone());
                         state.anime_banners.insert(anime_id, proto);
                     }
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
@@ -6188,8 +6190,9 @@ fn trigger_home_cover_preload(
             let card_area = home_card_preencode_area();
             let mut card_proto = build_stateful_protocol(picker, card_img.clone());
             let mut banner_proto = build_stateful_protocol(picker, card_img);
-            card_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
-            banner_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
+            let resize_mode = hd_resize_mode();
+            card_proto.resize_encode(&resize_mode, picker.background_color, card_area);
+            banner_proto.resize_encode(&resize_mode, picker.background_color, card_area);
             Some((card_proto, banner_proto, img))
         })
         .await

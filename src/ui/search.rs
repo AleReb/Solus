@@ -182,9 +182,11 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &mut AppState) {
         if let Some(cover) =
             state.resolve_cover_protocol(anime.id, cols[0].width, cols[0].height, 0.15, false)
         {
-            let image_widget = ratatui_image::StatefulImage::new(None)
-                .resize(ratatui_image::Resize::Fit(None));
-            frame.render_stateful_widget(image_widget, cols[0], cover);
+            frame.render_stateful_widget(
+                crate::ui::components::cover::hd_image_widget(),
+                cols[0],
+                cover,
+            );
         } else {
             frame.render_widget(
                 crate::ui::components::cover::HalfblockCover { anime_id: anime.id, title: anime.display_title() },

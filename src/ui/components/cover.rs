@@ -42,7 +42,7 @@ pub fn scale_to_frame_cover(
     if current_aspect < target_aspect {
         let scale = target_w as f32 / w as f32;
         let scaled_h = ((h as f32 * scale).round() as u32).max(target_h);
-        let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::Triangle);
+        let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::CatmullRom);
 
         let excess_h = scaled.height().saturating_sub(target_h);
         let top = ((excess_h as f32) * upper_bias).round() as u32;
@@ -50,11 +50,200 @@ pub fn scale_to_frame_cover(
     } else {
         let scale = target_h as f32 / h as f32;
         let scaled_w = ((w as f32 * scale).round() as u32).max(target_w);
-        let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::Triangle);
+        let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::CatmullRom);
 
         let excess_w = scaled.width().saturating_sub(target_w);
         let left = excess_w / 2;
         scaled.crop_imm(left, 0, target_w, target_h)
+    }
+}
+
+/// Shared `Resize` mode using CatmullRom instead of ratatui-image's default `FilterType::Nearest`.
+pub fn hd_resize_mode() -> ratatui_image::Resize {
+    ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::CatmullRom))
+}
+
+/// Shared `StatefulImage` widget configured with high-quality CatmullRom downsampling.
+pub fn hd_image_widget() -> ratatui_image::StatefulImage {
+    ratatui_image::StatefulImage::new(None).resize(hd_resize_mode())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuadrantCell {
+    ch: char,
+    fg: Color,
+    bg: Color,
+}
+
+/// Encode a 2×2 block of sRGB pixels `[TL, TR, BL, BR]` into the perceptually closest
+/// Unicode Block Element (`U+2580..U+259F`) with 24-bit foreground and background colors.
+fn encode_quadrant_cell(pixels: [[u8; 3]; 4]) -> QuadrantCell {
+    const PARTITIONS: &[(char, [bool; 4])] = &[
+        ('█', [true, true, true, true]),
+        ('▀', [true, true, false, false]),
+        ('▌', [true, false, true, false]),
+        ('▚', [true, false, false, true]),
+        ('▘', [true, false, false, false]),
+        ('▝', [false, true, false, false]),
+        ('▖', [false, false, true, false]),
+        ('▗', [false, false, false, true]),
+    ];
+
+    let mut best_err = u64::MAX;
+    let mut best = QuadrantCell {
+        ch: '█',
+        fg: Color::Rgb(pixels[0][0], pixels[0][1], pixels[0][2]),
+        bg: Color::Rgb(pixels[0][0], pixels[0][1], pixels[0][2]),
+    };
+
+    for &(ch, mask) in PARTITIONS {
+        let (mut fg_r, mut fg_g, mut fg_b, mut fg_n) = (0u32, 0u32, 0u32, 0u32);
+        let (mut bg_r, mut bg_g, mut bg_b, mut bg_n) = (0u32, 0u32, 0u32, 0u32);
+        for i in 0..4 {
+            let p = pixels[i];
+            if mask[i] {
+                fg_r += p[0] as u32;
+                fg_g += p[1] as u32;
+                fg_b += p[2] as u32;
+                fg_n += 1;
+            } else {
+                bg_r += p[0] as u32;
+                bg_g += p[1] as u32;
+                bg_b += p[2] as u32;
+                bg_n += 1;
+            }
+        }
+
+        let fg = [
+            ((fg_r + fg_n / 2) / fg_n) as u8,
+            ((fg_g + fg_n / 2) / fg_n) as u8,
+            ((fg_b + fg_n / 2) / fg_n) as u8,
+        ];
+        let bg = if bg_n == 0 {
+            fg
+        } else {
+            [
+                ((bg_r + bg_n / 2) / bg_n) as u8,
+                ((bg_g + bg_n / 2) / bg_n) as u8,
+                ((bg_b + bg_n / 2) / bg_n) as u8,
+            ]
+        };
+
+        let mut err = 0u64;
+        for i in 0..4 {
+            let p = pixels[i];
+            let target = if mask[i] { fg } else { bg };
+            let dr = (p[0] as i64) - (target[0] as i64);
+            let dg = (p[1] as i64) - (target[1] as i64);
+            let db = (p[2] as i64) - (target[2] as i64);
+            // Perceptual RGB weights (human eye is most sensitive to luminance/green).
+            err += (2 * dr * dr + 4 * dg * dg + 3 * db * db) as u64;
+        }
+
+        if err < best_err {
+            best_err = err;
+            best = QuadrantCell {
+                ch: if fg == bg { '█' } else { ch },
+                fg: Color::Rgb(fg[0], fg[1], fg[2]),
+                bg: Color::Rgb(bg[0], bg[1], bg[2]),
+            };
+            if err == 0 {
+                break;
+            }
+        }
+    }
+
+    best
+}
+
+/// High-resolution 2×2 Unicode quadrant block protocol for terminals without Kitty/Sixel/iTerm2
+/// (e.g. Alacritty, Zellij, SSH). Renders 4 subpixels per cell (`2*W × 2*H`) using Lanczos3
+/// resampling — doubling horizontal sharpness compared to standard 1×2 `Halfblocks`.
+#[derive(Clone)]
+pub struct StatefulQuadrants {
+    source: ratatui_image::protocol::ImageSource,
+    current_rect: Rect,
+    cells: Vec<QuadrantCell>,
+    hash: u64,
+}
+
+impl StatefulQuadrants {
+    pub fn new(source: ratatui_image::protocol::ImageSource) -> Self {
+        Self {
+            source,
+            current_rect: Rect::default(),
+            cells: Vec::new(),
+            hash: 0,
+        }
+    }
+}
+
+impl StatefulProtocol for StatefulQuadrants {
+    fn needs_resize(&mut self, resize: &ratatui_image::Resize, area: Rect) -> Option<Rect> {
+        resize.needs_resize(&self.source, self.current_rect, area, false)
+    }
+
+    fn resize_encode(
+        &mut self,
+        resize: &ratatui_image::Resize,
+        _background_color: Option<image::Rgb<u8>>,
+        area: Rect,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let force = self.source.hash != self.hash;
+        let Some(rect) = resize.needs_resize(&self.source, self.current_rect, area, force) else {
+            return;
+        };
+        if rect.width == 0 || rect.height == 0 {
+            self.current_rect = rect;
+            self.cells.clear();
+            self.hash = self.source.hash;
+            return;
+        }
+
+        let target_w = (rect.width as u32) * 2;
+        let target_h = (rect.height as u32) * 2;
+        let rgb = self
+            .source
+            .image
+            .resize_exact(target_w, target_h, image::imageops::FilterType::CatmullRom)
+            .to_rgb8();
+
+        let mut cells = Vec::with_capacity((rect.width as usize) * (rect.height as usize));
+        for cy in 0..rect.height as u32 {
+            for cx in 0..rect.width as u32 {
+                let p0 = rgb.get_pixel(cx * 2, cy * 2).0;
+                let p1 = rgb.get_pixel(cx * 2 + 1, cy * 2).0;
+                let p2 = rgb.get_pixel(cx * 2, cy * 2 + 1).0;
+                let p3 = rgb.get_pixel(cx * 2 + 1, cy * 2 + 1).0;
+                cells.push(encode_quadrant_cell([p0, p1, p2, p3]));
+            }
+        }
+
+        self.cells = cells;
+        self.current_rect = rect;
+        self.hash = self.source.hash;
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let w = self.current_rect.width;
+        let h = self.current_rect.height;
+        if w == 0 || h == 0 || self.cells.is_empty() {
+            return;
+        }
+        let draw_w = w.min(area.width);
+        let draw_h = h.min(area.height);
+        for y in 0..draw_h {
+            let row_offset = (y as usize) * (w as usize);
+            for x in 0..draw_w {
+                let c = self.cells[row_offset + (x as usize)];
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
+                    cell.set_char(c.ch).set_fg(c.fg).set_bg(c.bg);
+                }
+            }
+        }
     }
 }
 
@@ -75,6 +264,9 @@ pub fn build_stateful_protocol(
             id,
             picker.is_tmux,
         ))
+    } else if picker.protocol_type == ratatui_image::picker::ProtocolType::Halfblocks {
+        let source = ratatui_image::protocol::ImageSource::new(img, picker.font_size);
+        Box::new(StatefulQuadrants::new(source))
     } else {
         picker.new_resize_protocol(img)
     }
@@ -279,5 +471,74 @@ mod tests {
     fn test_abbreviated_title_uppercase() {
         let abbrev = abbreviated_title("fullmetal alchemist brotherhood", 5);
         assert_eq!(abbrev, abbrev.to_uppercase());
+    }
+
+    #[test]
+    fn test_quadrant_protocol_preserves_vertical_edges_and_2x2_corners() {
+        use ratatui::widgets::StatefulWidget;
+
+        // Vertical left/right split -> must pick '▌' (which 1x2 Halfblocks cannot represent).
+        let cell_v = encode_quadrant_cell([
+            [255, 0, 0],
+            [0, 0, 255],
+            [255, 0, 0],
+            [0, 0, 255],
+        ]);
+        assert_eq!(cell_v.ch, '▌');
+        assert_eq!(cell_v.fg, Color::Rgb(255, 0, 0));
+        assert_eq!(cell_v.bg, Color::Rgb(0, 0, 255));
+
+        // Single bright top-left subpixel -> must pick '▘'.
+        let cell_tl = encode_quadrant_cell([
+            [255, 255, 255],
+            [10, 10, 10],
+            [10, 10, 10],
+            [10, 10, 10],
+        ]);
+        assert_eq!(cell_tl.ch, '▘');
+        assert_eq!(cell_tl.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(cell_tl.bg, Color::Rgb(10, 10, 10));
+
+        // Full StatefulQuadrants widget render via build_stateful_protocol(Halfblocks).
+        let mut picker = Picker::new((10, 20));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+
+        // Create an 80x40 image (desired 8x2 cells; fits into 4x1) with a sharp center vertical edge.
+        let mut rgb = image::RgbImage::new(80, 40);
+        for (x, _y, px) in rgb.enumerate_pixels_mut() {
+            *px = if x < 40 {
+                image::Rgb([220, 30, 30])
+            } else {
+                image::Rgb([30, 80, 230])
+            };
+        }
+        let dyn_img = image::DynamicImage::ImageRgb8(rgb);
+        let mut proto = build_stateful_protocol(picker, dyn_img);
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+        hd_image_widget().render(area, &mut buf, &mut proto);
+
+        // Far-left and far-right cells retain pure red and pure blue colors.
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "█");
+        assert_eq!(buf.cell((0, 0)).unwrap().fg, Color::Rgb(220, 30, 30));
+        assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "█");
+        assert_eq!(buf.cell((3, 0)).unwrap().fg, Color::Rgb(30, 80, 230));
+
+        // Sub-cell vertical edge inside a single 1x1 cell resolves to '▌'.
+        let mut picker2 = Picker::new((10, 20));
+        picker2.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+        let mut edge_img = image::RgbImage::new(20, 20);
+        for (x, _y, px) in edge_img.enumerate_pixels_mut() {
+            *px = if x < 10 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let mut edge_proto = build_stateful_protocol(picker2, image::DynamicImage::ImageRgb8(edge_img));
+        let edge_area = Rect::new(0, 0, 1, 1);
+        let mut edge_buf = Buffer::empty(edge_area);
+        hd_image_widget().render(edge_area, &mut edge_buf, &mut edge_proto);
+        assert_eq!(edge_buf.cell((0, 0)).unwrap().symbol(), "▌");
     }
 }

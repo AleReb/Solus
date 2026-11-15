@@ -116,9 +116,7 @@ fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anim
         if let Some(cover) =
             state.resolve_cover_protocol(anime.id, cover_inner.width, cover_inner.height, 0.15, true)
         {
-            let image_widget = ratatui_image::StatefulImage::new(None)
-                .resize(ratatui_image::Resize::Fit(None));
-            frame.render_stateful_widget(image_widget, cover_inner, cover);
+            frame.render_stateful_widget(crate::ui::components::cover::hd_image_widget(), cover_inner, cover);
         } else if state.cover_anime_id == Some(anime.id) {
             let label = if state.cover_failed_anime_id == Some(anime.id) {
                 "Cover unavailable"
@@ -425,21 +423,28 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
         let mut rendered_img = false;
         if state.has_image_support() {
             if let Some(thumb) = state.episode_thumbnails.get_mut(&ep) {
-                let img_widget = ratatui_image::StatefulImage::new(None)
-                    .resize(ratatui_image::Resize::Fit(None));
-                frame.render_stateful_widget(img_widget, thumb_rect, thumb);
+                frame.render_stateful_widget(
+                    crate::ui::components::cover::hd_image_widget(),
+                    thumb_rect,
+                    thumb,
+                );
                 rendered_img = true;
             } else {
                 if !state.episode_fallback_thumbnails.contains_key(&ep) {
-                    if let (Some(ref mut picker), Some(ref card_img)) = (&mut state.picker, &state.current_card_img) {
-                        let proto = picker.new_resize_protocol(card_img.clone());
+                    if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
+                        let proto = crate::ui::components::cover::build_stateful_protocol(
+                            picker,
+                            card_img.clone(),
+                        );
                         state.episode_fallback_thumbnails.insert(ep, proto);
                     }
                 }
                 if let Some(fallback_thumb) = state.episode_fallback_thumbnails.get_mut(&ep) {
-                    let img_widget = ratatui_image::StatefulImage::new(None)
-                        .resize(ratatui_image::Resize::Fit(None));
-                    frame.render_stateful_widget(img_widget, thumb_rect, fallback_thumb);
+                    frame.render_stateful_widget(
+                        crate::ui::components::cover::hd_image_widget(),
+                        thumb_rect,
+                        fallback_thumb,
+                    );
                     rendered_img = true;
                 }
             }
@@ -765,21 +770,28 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     let mut rendered_img = false;
     if state.has_image_support() {
         if let Some(thumb) = state.episode_thumbnails.get_mut(&selected_ep) {
-            let img_widget = ratatui_image::StatefulImage::new(None)
-                .resize(ratatui_image::Resize::Fit(None));
-            frame.render_stateful_widget(img_widget, thumb_area, thumb);
+            frame.render_stateful_widget(
+                crate::ui::components::cover::hd_image_widget(),
+                thumb_area,
+                thumb,
+            );
             rendered_img = true;
         } else {
             if !state.episode_fallback_thumbnails.contains_key(&selected_ep) {
-                if let (Some(ref mut picker), Some(ref card_img)) = (&mut state.picker, &state.current_card_img) {
-                    let proto = picker.new_resize_protocol(card_img.clone());
+                if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
+                    let proto = crate::ui::components::cover::build_stateful_protocol(
+                        picker,
+                        card_img.clone(),
+                    );
                     state.episode_fallback_thumbnails.insert(selected_ep, proto);
                 }
             }
             if let Some(fallback_thumb) = state.episode_fallback_thumbnails.get_mut(&selected_ep) {
-                let img_widget = ratatui_image::StatefulImage::new(None)
-                    .resize(ratatui_image::Resize::Fit(None));
-                frame.render_stateful_widget(img_widget, thumb_area, fallback_thumb);
+                frame.render_stateful_widget(
+                    crate::ui::components::cover::hd_image_widget(),
+                    thumb_area,
+                    fallback_thumb,
+                );
                 rendered_img = true;
             }
         }

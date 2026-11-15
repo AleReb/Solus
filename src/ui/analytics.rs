@@ -16,7 +16,8 @@ use ratatui::{
     },
     Frame,
 };
-use ratatui_image::{Resize, StatefulImage};
+#[cfg(test)]
+use ratatui_image::Resize;
 
 use crate::db::user::UserAnalytics;
 use crate::state::AppState;
@@ -1783,8 +1784,11 @@ fn render_podium_spotlight_card(
             if let Some(proto) =
                 state.resolve_cover_protocol(show.id, art_inner.width, art_inner.height, 0.16, false)
             {
-                let img = StatefulImage::new(None).resize(Resize::Fit(None));
-                frame.render_stateful_widget(img, art_inner, proto);
+                frame.render_stateful_widget(
+                    crate::ui::components::cover::hd_image_widget(),
+                    art_inner,
+                    proto,
+                );
                 true
             } else {
                 false

@@ -987,9 +987,11 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
             .get_mut(&anime.id)
             .or_else(|| state.banner_cache.get_mut(&anime.id))
         {
-            let image_widget = ratatui_image::StatefulImage::new(None)
-                .resize(ratatui_image::Resize::Fit(None));
-            frame.render_stateful_widget(image_widget, cover_inner, cover);
+            frame.render_stateful_widget(
+                crate::ui::components::cover::hd_image_widget(),
+                cover_inner,
+                cover,
+            );
         } else {
             let label = if state.cover_failed_anime_id == Some(anime.id) {
                 "Cover unavailable"
@@ -1937,9 +1939,11 @@ fn render_card_with_source(
         .is_some_and(|m| m.intersects(chunks[0]));
     if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state.cover_cache.get_mut(&anime.id) {
-            let image_widget = ratatui_image::StatefulImage::new(None)
-                .resize(ratatui_image::Resize::Fit(None));
-            frame.render_stateful_widget(image_widget, chunks[0], cover);
+            frame.render_stateful_widget(
+                crate::ui::components::cover::hd_image_widget(),
+                chunks[0],
+                cover,
+            );
         } else {
             frame.render_widget(
                 HalfblockCover {

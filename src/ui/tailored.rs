@@ -967,9 +967,11 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
                     0.15,
                     false,
                 ) {
-                    let image_widget = ratatui_image::StatefulImage::new(None)
-                        .resize(ratatui_image::Resize::Fit(None));
-                    frame.render_stateful_widget(image_widget, cover_inner, cover);
+                    frame.render_stateful_widget(
+                        crate::ui::components::cover::hd_image_widget(),
+                        cover_inner,
+                        cover,
+                    );
                 } else {
                     let loading_label = if state.cover_failed_anime_id == Some(anime.id) {
                         "Poster\nUnavailable"
