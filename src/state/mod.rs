@@ -69,6 +69,56 @@ pub enum UpdateModalPhase {
     },
 }
 
+/// Which inline text input mode is active inside `[L]` Connected Accounts & Sync Hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountInputMode {
+    #[default]
+    None,
+    PublicUsername(crate::config::TrackerProvider),
+    ManualToken(crate::config::TrackerProvider),
+    ClientId(crate::config::TrackerProvider),
+}
+
+/// Mode for the interactive Watchlist Database Target Picker popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchlistPromptMode {
+    Add,
+    RemoveShared,
+}
+
+/// Interactive Watchlist Database Target Picker modal overlay state.
+#[derive(Debug, Clone)]
+pub struct WatchlistTargetPrompt {
+    pub anime: Anime,
+    pub mode: WatchlistPromptMode,
+    pub cursor: usize,
+    pub from_detail: bool,
+}
+
+impl WatchlistTargetPrompt {
+    pub fn options_for_mode(&self) -> [crate::config::WatchlistTarget; 4] {
+        match self.mode {
+            WatchlistPromptMode::Add => [
+                crate::config::WatchlistTarget::Both,
+                crate::config::WatchlistTarget::AniList,
+                crate::config::WatchlistTarget::Mal,
+                crate::config::WatchlistTarget::Local,
+            ],
+            WatchlistPromptMode::RemoveShared => [
+                crate::config::WatchlistTarget::Both,
+                crate::config::WatchlistTarget::Mal,
+                crate::config::WatchlistTarget::AniList,
+                crate::config::WatchlistTarget::Local,
+            ],
+        }
+    }
+
+    pub fn selected_target(&self) -> crate::config::WatchlistTarget {
+        let opts = self.options_for_mode();
+        opts[self.cursor.min(opts.len() - 1)]
+    }
+}
+
 /// Which category row the cursor is on (Home screen).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CategoryRow {
@@ -348,10 +398,34 @@ pub struct AppState {
     /// Login overlay temporary feedback / error message
     pub login_status: Option<String>,
 
-    /// Account sync active tab (0: Local JSON archive, 1: Username sync, 2: Backup export)
+    /// Account sync active tab (0: Live Trackers, 1: Merge & Conflicts, 2: Archives & Vault)
     pub account_sync_tab: usize,
 
-    /// Auto-detected JSON export files found in ~/Downloads
+    /// Focused tracker provider card in Live Trackers view (AniList vs MAL)
+    pub account_focus_provider: crate::config::TrackerProvider,
+
+    /// Active inline typing mode inside `[L]` (Navigation vs Typing mode separation)
+    pub account_input_mode: AccountInputMode,
+
+    /// Text buffer for the active `[L]` input mode
+    pub account_text_input: String,
+
+    /// Currently awaiting browser OAuth loopback callback for this provider
+    pub oauth_pending: Option<crate::config::TrackerProvider>,
+
+    /// Watch sender to abort an active loopback OAuth server on Esc
+    pub oauth_cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// Cached cross-tracker reconciliation report & conflict diffs
+    pub merge_report: Option<crate::services::tracker_merge::MergeReport>,
+
+    /// Selected conflict row in `[2] Merge & Conflicts`
+    pub merge_diff_cursor: usize,
+
+    /// Interactive Watchlist Database Target Picker popup when adding/removing tracked items
+    pub watchlist_target_prompt: Option<WatchlistTargetPrompt>,
+
+    /// Auto-detected JSON / MAL XML export files found in ~/Downloads
     pub detected_export_files: Vec<std::path::PathBuf>,
 
     /// Cursor index of selected detected export file
@@ -584,6 +658,14 @@ impl AppState {
             login_token_input: String::new(),
             login_status:     None,
             account_sync_tab: 0,
+            account_focus_provider: crate::config::TrackerProvider::AniList,
+            account_input_mode: AccountInputMode::None,
+            account_text_input: String::new(),
+            oauth_pending: None,
+            oauth_cancel_tx: None,
+            merge_report: None,
+            merge_diff_cursor: 0,
+            watchlist_target_prompt: None,
             detected_export_files: Vec::new(),
             detected_file_cursor: 0,
             import_stats:     None,
@@ -886,16 +968,50 @@ impl AppState {
         }
     }
 
-    /// Open the AniList login and library sync overlay.
+    /// Open the Connected Trackers & Sync Hub overlay (`[L]`).
     pub fn open_login(&mut self) {
         self.overlay_base = self.current_base_screen();
         self.login_token_input = String::new();
+        self.account_text_input = String::new();
+        self.account_input_mode = AccountInputMode::None;
         self.login_status = None;
         self.account_sync_tab = 0;
+        self.merge_diff_cursor = 0;
         self.detected_export_files = crate::services::importer::detect_export_files();
         self.detected_file_cursor = 0;
         self.import_stats = None;
         self.screen = Screen::AniListLogin;
+    }
+
+    /// Cancel any active loopback OAuth server cleanly.
+    pub fn cancel_pending_oauth(&mut self) {
+        if let Some(tx) = self.oauth_cancel_tx.take() {
+            let _ = tx.send(true);
+        }
+        self.oauth_pending = None;
+    }
+
+    /// Open the interactive Watchlist Database Target Picker popup.
+    pub fn open_watchlist_prompt(&mut self, anime: Anime, mode: WatchlistPromptMode, from_detail: bool) {
+        let default_cursor = match mode {
+            WatchlistPromptMode::Add => {
+                let has_al = self.auth.has_anilist();
+                let has_mal = self.auth.has_mal();
+                match (has_al, has_mal) {
+                    (true, true) => 0,   // Both
+                    (true, false) => 1,  // AniList
+                    (false, true) => 2,  // MAL
+                    (false, false) => 3, // Local
+                }
+            }
+            WatchlistPromptMode::RemoveShared => 0,
+        };
+        self.watchlist_target_prompt = Some(WatchlistTargetPrompt {
+            anime,
+            mode,
+            cursor: default_cursor,
+            from_detail,
+        });
     }
 
     /// Open the Tailored Algorithm 10-question wizard.
@@ -1259,6 +1375,7 @@ mod tests {
             has_dub:       0,
             updated_at:    0,
             next_airing_episode: None,
+            mal_id: None,
         }
     }
 

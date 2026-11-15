@@ -40,6 +40,41 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("ALTER TABLE anime ADD COLUMN next_airing_episode INTEGER;")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE anime ADD COLUMN mal_id INTEGER;")
+        .execute(pool)
+        .await;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_anime_mal_id ON anime(mal_id);")
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS id_crosswalk (
+            mal_id      INTEGER PRIMARY KEY,
+            anilist_id  INTEGER NOT NULL,
+            resolved_at INTEGER NOT NULL,
+            source      TEXT    NOT NULL DEFAULT 'anilist_idmal'
+        );"
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_crosswalk_anilist ON id_crosswalk(anilist_id);")
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tracker_entries (
+            anime_id          INTEGER NOT NULL REFERENCES anime(id),
+            provider          TEXT    NOT NULL,
+            status            TEXT    NOT NULL,
+            progress          INTEGER NOT NULL DEFAULT 0,
+            score             INTEGER,
+            remote_updated_at INTEGER,
+            last_synced_at    INTEGER NOT NULL,
+            PRIMARY KEY (anime_id, provider)
+        );"
+    )
+    .execute(pool)
+    .await?;
     let _ = sqlx::query(
         "DELETE FROM sync_meta WHERE key IN ('seasonal', 'trending') AND EXISTS (SELECT 1 FROM anime WHERE status = 'RELEASING' AND next_airing_episode IS NULL);"
     )
@@ -140,6 +175,8 @@ mod tests {
         assert!(tables.contains(&"playback_prefs".to_string()));
         assert!(tables.contains(&"audio_prefs".to_string()));
         assert!(tables.contains(&"sync_meta".to_string()));
+        assert!(tables.contains(&"id_crosswalk".to_string()));
+        assert!(tables.contains(&"tracker_entries".to_string()));
     }
 
     #[tokio::test]

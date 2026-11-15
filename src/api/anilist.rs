@@ -12,6 +12,7 @@ const ANILIST_API: &str = "https://graphql.anilist.co";
 /// The GraphQL query for fetching a page of anime with full metadata.
 const MEDIA_FIELDS: &str = r#"
     id
+    idMal
     title { english romaji native }
     description(asHtml: false)
     episodes
@@ -207,6 +208,8 @@ struct MoviePagePayload {
 #[serde(rename_all = "camelCase")]
 struct RawAnime {
     id:            i64,
+    #[serde(default)]
+    id_mal:        Option<i64>,
     title:         RawTitle,
     description:   Option<String>,
     episodes:      Option<i64>,
@@ -269,6 +272,7 @@ impl RawAnime {
             has_dub:       0, // AniList doesn't expose dub info reliably
             updated_at:    now,
             next_airing_episode: self.next_airing_episode.map(|n| n.episode),
+            mal_id:        self.id_mal,
         }
     }
 }
@@ -280,6 +284,16 @@ pub struct ViewerInfo {
     pub id: i64,
     pub name: String,
     pub avatar_url: Option<String>,
+}
+
+/// Normalized AniList list entry preserving score and remote updated timestamp.
+#[derive(Debug, Clone)]
+pub struct AniListEntryRecord {
+    pub anime: Anime,
+    pub status: String,
+    pub progress: u32,
+    pub score: Option<i64>,
+    pub updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -469,6 +483,33 @@ impl AniListClient {
         Ok(())
     }
 
+    /// Save normalized status and optional progress to AniList (used by multi-tracker reconciliation).
+    pub async fn save_list_entry(
+        &self,
+        media_id: i64,
+        status: &str,
+        progress: Option<u32>,
+    ) -> Result<()> {
+        let al_status = match status {
+            "CURRENT" | "PLANNING" | "COMPLETED" | "PAUSED" | "DROPPED" => status,
+            _ => "CURRENT",
+        };
+        let mutation = r#"mutation($mediaId: Int, $status: MediaListStatus, $progress: Int) {
+            SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress) {
+                id
+                status
+                progress
+            }
+        }"#;
+        let vars = serde_json::json!({
+            "mediaId": media_id,
+            "status": al_status,
+            "progress": progress,
+        });
+        let _ = self.gql(mutation, vars).await?;
+        Ok(())
+    }
+
     /// Add an anime to the user's AniList Planning (Watchlist)
     pub async fn save_planning_entry(&self, media_id: i64) -> Result<()> {
         let mutation = r#"mutation($mediaId: Int) {
@@ -504,6 +545,137 @@ impl AniListClient {
             let _ = self.gql(del_mutation, serde_json::json!({ "id": entry_id })).await?;
         }
         Ok(())
+    }
+
+    /// Resolve the MyAnimeList ID for an AniList media ID using the shared HTTP client.
+    pub async fn lookup_mal_id(&self, anilist_id: i64) -> Option<i64> {
+        resolve_mal_id(&self.http, anilist_id).await
+    }
+
+    /// Fetch authenticated user list entries preserving scores and remote timestamps.
+    pub async fn detailed_user_entries(&self, user_id: i64, now: i64) -> Result<Vec<AniListEntryRecord>> {
+        let query = format!(
+            r#"query($userId: Int) {{
+                MediaListCollection(userId: $userId, type: ANIME) {{
+                    lists {{
+                        status
+                        entries {{
+                            status
+                            progress
+                            score(format: POINT_100)
+                            updatedAt
+                            media {{
+                                {}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            MEDIA_FIELDS
+        );
+        let raw = self.gql(&query, serde_json::json!({ "userId": user_id })).await?;
+        Ok(parse_detailed_entries(&raw, now))
+    }
+
+    /// Fetch public AniList user list entries by username preserving scores & updated timestamps.
+    pub async fn detailed_public_user_entries(
+        &self,
+        username: &str,
+        now: i64,
+    ) -> Result<(ViewerInfo, Vec<AniListEntryRecord>)> {
+        let query = format!(
+            r#"query($userName: String) {{
+                User(name: $userName) {{
+                    id
+                    name
+                    avatar {{ large }}
+                }}
+                MediaListCollection(userName: $userName, type: ANIME) {{
+                    lists {{
+                        status
+                        entries {{
+                            status
+                            progress
+                            score(format: POINT_100)
+                            updatedAt
+                            media {{
+                                {}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            MEDIA_FIELDS
+        );
+        let raw = self.gql(&query, serde_json::json!({ "userName": username })).await?;
+        let user_val = raw.pointer("/data/User").ok_or_else(|| {
+            AppError::Auth(format!(
+                "AniList user '{username}' not found. Please verify username spelling."
+            ))
+        })?;
+        let id = user_val.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let name = user_val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(username)
+            .to_string();
+        let avatar_url = user_val
+            .pointer("/avatar/large")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok((ViewerInfo { id, name, avatar_url }, parse_detailed_entries(&raw, now)))
+    }
+
+    /// Resolve MyAnimeList IDs into full canonical AniList `Anime` records via batched `idMal_in` queries (50/req).
+    pub async fn resolve_by_mal_ids(&self, mal_ids: &[i64], now: i64) -> Result<Vec<Anime>> {
+        let mut resolved = Vec::new();
+        for chunk in mal_ids.chunks(50) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let query = format!(
+                r#"query($malIds: [Int]) {{
+                    Page(page: 1, perPage: 50) {{
+                        media(idMal_in: $malIds, type: ANIME) {{
+                            {}
+                        }}
+                    }}
+                }}"#,
+                MEDIA_FIELDS
+            );
+            let raw = self.gql(&query, serde_json::json!({ "malIds": chunk })).await?;
+            if let Some(arr) = raw.pointer("/data/Page/media").and_then(|v| v.as_array()) {
+                for media_val in arr {
+                    if let Ok(raw_anime) = serde_json::from_value::<RawAnime>(media_val.clone()) {
+                        resolved.push(raw_anime.into_anime(now));
+                    }
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Fallback single-title search when `idMal_in` yields no direct link for an obscure title.
+    pub async fn search_candidate_for_mal(&self, title: &str, now: i64) -> Result<Option<Anime>> {
+        let query = format!(
+            r#"query($search: String) {{
+                Page(page: 1, perPage: 3) {{
+                    media(search: $search, type: ANIME) {{
+                        {}
+                    }}
+                }}
+            }}"#,
+            MEDIA_FIELDS
+        );
+        let raw = self.gql(&query, serde_json::json!({ "search": title })).await?;
+        if let Some(arr) = raw.pointer("/data/Page/media").and_then(|v| v.as_array()) {
+            for media_val in arr {
+                if let Ok(raw_anime) = serde_json::from_value::<RawAnime>(media_val.clone()) {
+                    return Ok(Some(raw_anime.into_anime(now)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch current airing status, total episodes, and next airing episode for a specific anime.
@@ -1003,6 +1175,51 @@ pub async fn fetch_streaming_episodes_with_client(
     Ok(fetch_anime_streaming_and_banner(client, id).await?.streaming_episodes)
 }
 
+fn parse_detailed_entries(raw: &serde_json::Value, now: i64) -> Vec<AniListEntryRecord> {
+    let mut records = Vec::new();
+    if let Some(lists) = raw
+        .pointer("/data/MediaListCollection/lists")
+        .and_then(|v| v.as_array())
+    {
+        for list in lists {
+            let list_status = list
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("PLANNING");
+            if let Some(entries) = list.get("entries").and_then(|v| v.as_array()) {
+                for entry in entries {
+                    let status = entry
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(list_status)
+                        .to_uppercase();
+                    let progress = entry.get("progress").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let score = entry
+                        .get("score")
+                        .and_then(|v| v.as_i64())
+                        .filter(|&s| s > 0);
+                    let updated_at = entry
+                        .get("updatedAt")
+                        .and_then(|v| v.as_i64())
+                        .filter(|&u| u > 0);
+                    if let Some(media_val) = entry.get("media") {
+                        if let Ok(raw_anime) = serde_json::from_value::<RawAnime>(media_val.clone()) {
+                            records.push(AniListEntryRecord {
+                                anime: raw_anime.into_anime(now),
+                                status,
+                                progress,
+                                score,
+                                updated_at,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    records
+}
+
 /// Resolve the MyAnimeList ID for an AniList anime ID.
 pub async fn resolve_mal_id(client: &reqwest::Client, anilist_id: i64) -> Option<i64> {
     let query = r#"query($id: Int) { Media(id: $id, type: ANIME) { idMal } }"#;
@@ -1078,6 +1295,7 @@ mod tests {
     fn raw_anime_fixture(id: i64, english: Option<&str>, romaji: &str) -> RawAnime {
         RawAnime {
             id,
+            id_mal:        None,
             title:         RawTitle {
                 english: english.map(str::to_string),
                 romaji:  Some(romaji.to_string()),
@@ -1150,6 +1368,7 @@ mod tests {
     fn test_raw_anime_empty_romaji_uses_unknown() {
         let raw = RawAnime {
             id:            99,
+            id_mal:        None,
             title:         RawTitle { english: None, romaji: None, native: None },
             description:   None,
             episodes:      None,

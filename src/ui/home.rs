@@ -5,15 +5,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 use std::collections::HashMap;
 
 use crate::{
-    db::cache::Anime,
+    config::WatchlistTarget,
+    db::{cache::Anime, user::WatchlistSource},
     services::tailored::clean_synopsis_single_line,
-    state::{AppState, CategoryRow, Screen},
+    state::{AppState, CategoryRow, Screen, WatchlistPromptMode},
     ui::components::cover::HalfblockCover,
 };
 
@@ -79,21 +80,26 @@ pub fn bento_left_width(cw_count: usize) -> u16 {
 }
 
 /// Compute centered modal bounds matching overlays so underlying Home artwork doesn't bleed through.
-fn active_modal_rect(frame_area: Rect, screen: &Screen) -> Option<Rect> {
-    let (pct_x, pct_y) = match screen {
-        Screen::UpdateModal => (64, 45),
-        Screen::RemoteModal => (64, 76),
-        Screen::CastModal => (68, 55),
-        Screen::Help => crate::ui::help::modal_pct(frame_area),
-        Screen::Setup => crate::ui::setup::modal_pct(frame_area),
-        Screen::Calendar => {
-            if frame_area.width >= 115 && frame_area.height >= 34 {
-                (94, 90)
-            } else {
-                (98, 94)
+fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
+    let (pct_x, pct_y) = if state.watchlist_target_prompt.is_some() {
+        watchlist_modal_pct(frame_area)
+    } else {
+        match state.screen {
+            Screen::UpdateModal => (64, 45),
+            Screen::RemoteModal => (64, 76),
+            Screen::CastModal => (68, 55),
+            Screen::Help => crate::ui::help::modal_pct(frame_area),
+            Screen::Setup => crate::ui::setup::modal_pct(frame_area),
+            Screen::AniListLogin => crate::ui::login::modal_pct(frame_area),
+            Screen::Calendar => {
+                if frame_area.width >= 115 && frame_area.height >= 34 {
+                    (94, 90)
+                } else {
+                    (98, 94)
+                }
             }
+            _ => return None,
         }
-        _ => return None,
     };
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -323,10 +329,21 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
     let mut used_width: u16 = 11;
 
     // Reserve space for right-side status badges
-    let user_badge = if state.auth.is_authenticated() {
-        format!("󰄬 {}", state.auth.username.as_deref().unwrap_or("AniList"))
-    } else {
-        "󰍂 Guest".to_string()
+    let user_badge = match (state.auth.has_anilist(), state.auth.has_mal()) {
+        (true, true) => {
+            let al = state.auth.anilist.username.as_deref().unwrap_or("AL");
+            let mal = state.auth.mal.username.as_deref().unwrap_or("MAL");
+            format!("󰄬 AL:{al} · MAL:{mal}")
+        }
+        (true, false) => format!(
+            "󰄬 AL:{}",
+            state.auth.anilist.username.as_deref().unwrap_or("AniList")
+        ),
+        (false, true) => format!(
+            "󰄬 MAL:{}",
+            state.auth.mal.username.as_deref().unwrap_or("MAL")
+        ),
+        (false, false) => "󰍂 Guest".to_string(),
     };
     let right_text = format!("{}  ·  ◈ {} ", user_badge, theme.name);
     let right_width = right_text.chars().count() as u16 + 2;
@@ -708,10 +725,20 @@ fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockR
     explore_right.push(DockChip {
         icon: "󰄬",
         key: "[L]",
-        label: if state.auth.is_authenticated() {
-            state.auth.username.as_deref().unwrap_or("AniList").to_string()
-        } else {
-            "Login".to_string()
+        label: match (state.auth.has_anilist(), state.auth.has_mal()) {
+            (true, true) => "AL+MAL".to_string(),
+            (true, false) => state
+                .auth
+                .anilist
+                .username
+                .as_deref()
+                .unwrap_or("AniList")
+                .to_string(),
+            (false, true) => format!(
+                "MAL:{}",
+                state.auth.mal.username.as_deref().unwrap_or("MAL")
+            ),
+            (false, false) => "Login".to_string(),
         },
         key_color: if state.auth.is_authenticated() { emerald } else { theme.primary },
         label_color: if state.auth.is_authenticated() { emerald } else { theme.text },
@@ -952,7 +979,7 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
     let cover_inner = cover_block.inner(cols[0]);
     frame.render_widget(cover_block, cols[0]);
 
-    let cover_occluded = active_modal_rect(frame.area(), &state.screen)
+    let cover_occluded = active_modal_rect(frame.area(), state)
         .is_some_and(|m| m.intersects(cover_inner));
     if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state
@@ -1359,14 +1386,21 @@ fn render_bento_split(frame: &mut Frame, area: Rect, state: &mut AppState, data:
     };
     let wl_offset = state.row_offset("watchlist");
     let wl_dots = format_pagination_dots(wl_offset, data.watchlist.len());
+    let wl_src_summary = format_watchlist_source_summary(data);
     let wl_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(wl_border))
-        .title(Span::styled(
-            format!(" 󰋜 My Watchlist ({}) ", data.watchlist.len()),
-            wl_title_style,
-        ))
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" 󰋜 My Watchlist ({}) ", data.watchlist.len()),
+                wl_title_style,
+            ),
+            Span::styled(
+                wl_src_summary,
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]))
         .title(
             Line::from(vec![
                 Span::styled(wl_dots, Style::default().fg(if wl_active { theme.primary } else { theme.text_dim })),
@@ -1381,20 +1415,289 @@ fn render_bento_split(frame: &mut Frame, area: Rect, state: &mut AppState, data:
     frame.render_widget(wl_block, cols[2]);
 
     let wl_usable_w = wl_inner.width.saturating_sub(2);
-    let (wl_vis_n, wl_card_w) = compute_row_card_metrics(wl_usable_w);
-    let wl_start = row_view_start(wl_offset, data.watchlist.len(), wl_vis_n);
-    for (i, anime) in data.watchlist.iter().skip(wl_start).take(wl_vis_n).enumerate() {
-        let x = wl_inner.x + 1 + i as u16 * (wl_card_w + CARD_GAP);
-        let rect = Rect {
-            x,
-            y: wl_inner.y,
-            width: wl_card_w,
-            height: CARD_HEIGHT.min(wl_inner.height),
+    let slots = compute_watchlist_slots(
+        wl_inner.x + 1,
+        wl_inner.y,
+        wl_usable_w,
+        wl_inner.height,
+        wl_offset,
+        data,
+    );
+    render_watchlist_slots_widgets(frame, &slots, wl_inner.height, wl_active, wl_offset, state, data);
+}
+
+/// A layout slot inside a Watchlist panel (either a source divider pillar or an anime card).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchlistRenderSlot {
+    Divider {
+        source: WatchlistSource,
+        x: u16,
+        width: u16,
+    },
+    Card {
+        anime_idx: usize,
+        source: WatchlistSource,
+        rect: Rect,
+    },
+}
+
+const WATCHLIST_DIVIDER_W: u16 = 5;
+const WATCHLIST_DIVIDER_STEP: u16 = 6; // 5-col pillar + 1-col gap
+
+fn watchlist_source_for(anime: &Anime, data: &HomeData) -> WatchlistSource {
+    data.watchlist_sources
+        .get(&anime.id)
+        .copied()
+        .unwrap_or(WatchlistSource::Local)
+}
+
+fn watchlist_source_counts(data: &HomeData) -> (usize, usize, usize, usize) {
+    let mut al = 0usize;
+    let mut mal = 0usize;
+    let mut both = 0usize;
+    let mut local = 0usize;
+    for anime in &data.watchlist {
+        match watchlist_source_for(anime, data) {
+            WatchlistSource::AniList => al += 1,
+            WatchlistSource::Mal => mal += 1,
+            WatchlistSource::Both => both += 1,
+            WatchlistSource::Local => local += 1,
+        }
+    }
+    (al, mal, both, local)
+}
+
+fn format_watchlist_source_summary(data: &HomeData) -> String {
+    if data.watchlist_sources.is_empty() {
+        return String::new();
+    }
+    let (al, mal, both, local) = watchlist_source_counts(data);
+    let mut parts = Vec::new();
+    if al > 0 {
+        parts.push(format!("✦AL:{al}"));
+    }
+    if mal > 0 {
+        parts.push(format!("◆MAL:{mal}"));
+    }
+    if both > 0 {
+        parts.push(format!("◈Both:{both}"));
+    }
+    if local > 0 {
+        parts.push(format!("•Loc:{local}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}] ", parts.join(" · "))
+    }
+}
+
+fn source_accent_color(source: WatchlistSource) -> Color {
+    match source {
+        WatchlistSource::AniList => Color::Rgb(103, 232, 249),
+        WatchlistSource::Mal => Color::Rgb(108, 160, 255),
+        WatchlistSource::Both => Color::Rgb(251, 191, 36),
+        WatchlistSource::Local => Color::Rgb(150, 155, 182),
+    }
+}
+
+/// Deterministically lay out Watchlist source dividers + cards so focused item is always visible.
+pub fn compute_watchlist_slots(
+    x_start: u16,
+    y: u16,
+    usable_w: u16,
+    height: u16,
+    offset: usize,
+    data: &HomeData,
+) -> Vec<WatchlistRenderSlot> {
+    if data.watchlist.is_empty() || usable_w < 10 {
+        return Vec::new();
+    }
+
+    let (approx_vis_n, card_w) = compute_row_card_metrics(usable_w);
+    let clamped_offset = offset.min(data.watchlist.len().saturating_sub(1));
+    let show_dividers = !data.watchlist_sources.is_empty() && usable_w >= card_w + 10;
+
+    let mut start = row_view_start(clamped_offset, data.watchlist.len(), approx_vis_n.max(1))
+        .min(clamped_offset);
+
+    loop {
+        let mut x = x_start;
+        let mut prev_src: Option<WatchlistSource> = None;
+        let mut selected_end = 0u16;
+        for idx in start..data.watchlist.len() {
+            let src = watchlist_source_for(&data.watchlist[idx], data);
+            let need_div = show_dividers && prev_src != Some(src);
+            let div_step = if need_div { WATCHLIST_DIVIDER_STEP } else { 0 };
+            if idx == clamped_offset {
+                selected_end = x + div_step + card_w;
+                break;
+            }
+            x += div_step + card_w + CARD_GAP;
+            prev_src = Some(src);
+        }
+        if selected_end <= x_start + usable_w || start >= clamped_offset {
+            break;
+        }
+        start += 1;
+    }
+
+    let mut slots = Vec::new();
+    let mut x = x_start;
+    let mut prev_src: Option<WatchlistSource> = None;
+
+    for idx in start..data.watchlist.len() {
+        let src = watchlist_source_for(&data.watchlist[idx], data);
+        let need_div = show_dividers && prev_src != Some(src);
+        let div_step = if need_div { WATCHLIST_DIVIDER_STEP } else { 0 };
+
+        if x + div_step + card_w > x_start + usable_w {
+            break;
+        }
+        if need_div {
+            slots.push(WatchlistRenderSlot::Divider {
+                source: src,
+                x,
+                width: WATCHLIST_DIVIDER_W,
+            });
+            x += WATCHLIST_DIVIDER_STEP;
+        }
+        slots.push(WatchlistRenderSlot::Card {
+            anime_idx: idx,
+            source: src,
+            rect: Rect {
+                x,
+                y,
+                width: card_w,
+                height: CARD_HEIGHT.min(height),
+            },
+        });
+        x += card_w + CARD_GAP;
+        prev_src = Some(src);
+    }
+
+    slots
+}
+
+/// Hit-test mouse clicks inside a rendered Watchlist shelf container across divider pillars.
+pub fn watchlist_card_index_at(
+    area: Rect,
+    is_bento: bool,
+    state: &AppState,
+    data: &HomeData,
+    mx: u16,
+    my: u16,
+) -> Option<usize> {
+    let (x_start, y_start, usable_w, h) = if is_bento {
+        let left_w = bento_left_width(data.continue_watching.len());
+        let wl_x = area.x + left_w + 1;
+        let wl_w = area.width.saturating_sub(left_w + 1);
+        let inner = Rect {
+            x: wl_x + 1,
+            y: area.y + 1,
+            width: wl_w.saturating_sub(2),
+            height: area.height.saturating_sub(2),
         };
-        if rect.x + rect.width <= wl_inner.x + wl_inner.width {
-            let progress = data.progress_labels.get(&anime.id).map(String::as_str);
-            let selected = wl_active && (wl_start + i == wl_offset);
-            render_card(frame, rect, anime, selected, None, progress, state);
+        (inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height)
+    } else {
+        (area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+    };
+
+    let offset = state.row_offset("watchlist");
+    for slot in compute_watchlist_slots(x_start, y_start, usable_w, h, offset, data) {
+        if let WatchlistRenderSlot::Card { anime_idx, rect, .. } = slot {
+            if mx >= rect.x && mx < rect.x + rect.width && my >= rect.y && my < rect.y + rect.height
+            {
+                return Some(anime_idx);
+            }
+        }
+    }
+    None
+}
+
+fn render_watchlist_divider(frame: &mut Frame, x: u16, y: u16, width: u16, height: u16, source: WatchlistSource) {
+    if height < 2 || width < 4 {
+        return;
+    }
+    let accent = source_accent_color(source);
+    let badge = match source {
+        WatchlistSource::AniList => "✦ AL ",
+        WatchlistSource::Mal => "◆ MAL",
+        WatchlistSource::Both => "◈BOTH",
+        WatchlistSource::Local => "• LOC",
+    };
+
+    let badge_rect = Rect {
+        x,
+        y,
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            badge,
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        badge_rect,
+    );
+
+    let line_h = height.saturating_sub(1);
+    let mut rail_lines = Vec::with_capacity(line_h as usize);
+    for r in 0..line_h {
+        let ch = if r + 1 == line_h { "  ╵  " } else { "  │  " };
+        rail_lines.push(Line::from(Span::styled(ch, Style::default().fg(accent))));
+    }
+    frame.render_widget(
+        Paragraph::new(rail_lines),
+        Rect {
+            x,
+            y: y + 1,
+            width,
+            height: line_h,
+        },
+    );
+}
+
+fn render_watchlist_slots_widgets(
+    frame: &mut Frame,
+    slots: &[WatchlistRenderSlot],
+    height: u16,
+    wl_active: bool,
+    wl_offset: usize,
+    state: &mut AppState,
+    data: &HomeData,
+) {
+    for slot in slots {
+        match slot {
+            WatchlistRenderSlot::Divider { source, x, width } => {
+                let y = slots
+                    .iter()
+                    .find_map(|s| match s {
+                        WatchlistRenderSlot::Card { rect, .. } => Some(rect.y),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                render_watchlist_divider(frame, *x, y, *width, CARD_HEIGHT.min(height), *source);
+            }
+            WatchlistRenderSlot::Card {
+                anime_idx,
+                source,
+                rect,
+            } => {
+                if let Some(anime) = data.watchlist.get(*anime_idx) {
+                    let progress = data.progress_labels.get(&anime.id).map(String::as_str);
+                    let selected = wl_active && (*anime_idx == wl_offset);
+                    let tag = if data.watchlist_sources.is_empty() {
+                        None
+                    } else {
+                        Some(*source)
+                    };
+                    render_card_with_source(frame, *rect, anime, selected, None, progress, tag, state);
+                }
+            }
         }
     }
 }
@@ -1422,7 +1725,12 @@ fn render_single_row(frame: &mut Frame, area: Rect, state: &mut AppState, row: &
         Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)
     };
 
-    let title_prefix = format!("── {} ({}) ", label, items.len());
+    let wl_tag = if *row == CategoryRow::Watchlist {
+        format_watchlist_source_summary(data)
+    } else {
+        String::new()
+    };
+    let title_prefix = format!("── {} ({}){} ", label, items.len(), wl_tag);
     let title_suffix = format!(" {} [ {}/{} ] ──", dots, (offset + 1).min(items.len()), items.len());
     let sep_len = (area.width as usize)
         .saturating_sub(title_prefix.chars().count() + title_suffix.chars().count() + 1);
@@ -1442,6 +1750,19 @@ fn render_single_row(frame: &mut Frame, area: Rect, state: &mut AppState, row: &
     frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
     let card_area = chunks[1];
+    if *row == CategoryRow::Watchlist {
+        let slots = compute_watchlist_slots(
+            card_area.x,
+            card_area.y,
+            card_area.width,
+            card_area.height,
+            offset,
+            data,
+        );
+        render_watchlist_slots_widgets(frame, &slots, card_area.height, is_active, offset, state, data);
+        return;
+    }
+
     let (visible_n, card_w) = compute_row_card_metrics(card_area.width);
     let view_start = row_view_start(offset, items.len(), visible_n);
 
@@ -1470,6 +1791,19 @@ fn render_card(
     selected: bool,
     rank: Option<usize>,
     progress: Option<&str>,
+    state: &mut AppState,
+) {
+    render_card_with_source(frame, area, anime, selected, rank, progress, None, state);
+}
+
+fn render_card_with_source(
+    frame: &mut Frame,
+    area: Rect,
+    anime: &Anime,
+    selected: bool,
+    rank: Option<usize>,
+    progress: Option<&str>,
+    source_tag: Option<WatchlistSource>,
     state: &mut AppState,
 ) {
     if area.height < 4 {
@@ -1510,6 +1844,20 @@ fn render_card(
         ));
     }
 
+    if let Some(src) = source_tag {
+        let src_color = source_accent_color(src);
+        block = block.title(
+            Line::from(vec![Span::styled(
+                format!(" [{}] ", src.pill_tag()),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(src_color)
+                    .add_modifier(Modifier::BOLD),
+            )])
+            .alignment(Alignment::Right),
+        );
+    }
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1522,7 +1870,7 @@ fn render_card(
         ])
         .split(inner);
 
-    let cover_occluded = active_modal_rect(frame.area(), &state.screen)
+    let cover_occluded = active_modal_rect(frame.area(), state)
         .is_some_and(|m| m.intersects(chunks[0]));
     if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state.cover_cache.get_mut(&anime.id) {
@@ -1700,6 +2048,7 @@ pub struct HomeData {
     pub featured: Option<Anime>,
     pub continue_watching: Vec<Anime>,
     pub watchlist: Vec<Anime>,
+    pub watchlist_sources: HashMap<i64, WatchlistSource>,
     pub progress_labels: HashMap<i64, String>,
     pub resume_next: HashMap<i64, u32>,
     pub trending: Vec<Anime>,
@@ -1714,6 +2063,7 @@ impl HomeData {
             featured: None,
             continue_watching: Vec::new(),
             watchlist: Vec::new(),
+            watchlist_sources: HashMap::new(),
             progress_labels: HashMap::new(),
             resume_next: HashMap::new(),
             trending: Vec::new(),
@@ -1731,6 +2081,226 @@ impl HomeData {
             && self.top_rated.is_empty()
             && self.seasonal.is_empty()
     }
+}
+
+/// Modal size percentages for the Watchlist Add/Remove database target picker popup.
+pub fn watchlist_modal_pct(area: Rect) -> (u16, u16) {
+    if area.width >= 100 && area.height >= 26 {
+        (60, 52)
+    } else {
+        (86, 72)
+    }
+}
+
+/// Render the centered opaque Watchlist Add/Remove Database Target Picker modal.
+pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
+    let Some(ref prompt) = state.watchlist_target_prompt else {
+        return;
+    };
+
+    let area = frame.area();
+    let theme = state.theme();
+    let (pct_x, pct_y) = watchlist_modal_pct(area);
+
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    let modal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1];
+
+    let bg = Color::Rgb(15, 16, 25);
+    let card_bg = Color::Rgb(22, 24, 38);
+    let emerald = Color::Rgb(80, 250, 123);
+    let cyan = Color::Rgb(103, 232, 249);
+    let mal_blue = Color::Rgb(108, 160, 255);
+    let amber = Color::Rgb(251, 191, 36);
+    let muted = Color::Rgb(150, 156, 185);
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(Block::default().style(Style::default().bg(bg)), modal);
+
+    let title_str = match prompt.mode {
+        WatchlistPromptMode::Add => " + ADD TO WATCHLIST DATABASES ",
+        WatchlistPromptMode::RemoveShared => " 󰅖 REMOVE FROM WATCHLIST DATABASES ",
+    };
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .style(Style::default().bg(bg))
+        .title(Span::styled(
+            title_str,
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer.inner(modal);
+    frame.render_widget(outer, modal);
+
+    if inner.width < 20 || inner.height < 10 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Anime title + tracker write readiness
+            Constraint::Min(6),    // 4 selectable targets
+            Constraint::Length(2), // Key hints footer
+        ])
+        .split(inner);
+
+    let al_cap = if state.auth.anilist.has_write_token() {
+        ("AniList ✓ Live", emerald)
+    } else if state.auth.has_anilist() {
+        ("AniList Read-Only", amber)
+    } else {
+        ("AniList Offline", muted)
+    };
+    let mal_cap = if state.auth.mal.has_write_token() {
+        ("MAL ✓ Live", emerald)
+    } else if state.auth.has_mal() {
+        ("MAL Read-Only", amber)
+    } else {
+        ("MAL Offline", muted)
+    };
+
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(" Show: ", Style::default().fg(muted)),
+            Span::styled(
+                truncate_chars(&prompt.anime.display_title(), inner.width.saturating_sub(10) as usize),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Sync: ", Style::default().fg(muted)),
+            Span::styled(al_cap.0, Style::default().fg(al_cap.1).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  ", Style::default().fg(theme.divider)),
+            Span::styled(mal_cap.0, Style::default().fg(mal_cap.1).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(header_lines)
+            .style(Style::default().bg(bg))
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let options = prompt.options_for_mode();
+    let mut rows = Vec::new();
+    for (idx, target) in options.iter().enumerate() {
+        let sel = idx == prompt.cursor;
+        let num = idx + 1;
+        let (icon, label, desc, accent) = match (prompt.mode, target) {
+            (WatchlistPromptMode::Add, WatchlistTarget::Both) => (
+                "✦+◆",
+                "Both Databases (AniList + MyAnimeList + Solus)",
+                "Writes Planning live to both websites and shows under ◈ BOTH",
+                amber,
+            ),
+            (WatchlistPromptMode::Add, WatchlistTarget::AniList) => (
+                "✦  ",
+                "AniList Database Only (+ Solus)",
+                "Writes Planning live to anilist.co and shows under ✦ ANILIST",
+                cyan,
+            ),
+            (WatchlistPromptMode::Add, WatchlistTarget::Mal) => (
+                "◆  ",
+                "MyAnimeList Database Only (+ Solus)",
+                "Writes Plan to Watch live to myanimelist.net and shows under ◆ MAL",
+                mal_blue,
+            ),
+            (WatchlistPromptMode::Add, WatchlistTarget::Local) => (
+                "•  ",
+                "Local Solus Only",
+                "Saves locally inside Solus under • LOCAL without website writes",
+                muted,
+            ),
+            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Both) => (
+                "✦+◆",
+                "Remove from BOTH Websites + Solus",
+                "Deletes live from AniList + MyAnimeList databases and Solus",
+                Color::Rgb(255, 105, 135),
+            ),
+            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Mal) => (
+                "◆  ",
+                "Remove from MyAnimeList Only",
+                "Deletes live from myanimelist.net -> keeps card under ✦ ANILIST",
+                mal_blue,
+            ),
+            (WatchlistPromptMode::RemoveShared, WatchlistTarget::AniList) => (
+                "✦  ",
+                "Remove from AniList Only",
+                "Deletes live from anilist.co -> keeps card under ◆ MAL",
+                cyan,
+            ),
+            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Local) => (
+                "•  ",
+                "Hide Locally on Solus Only",
+                "Removes from Solus Watchlist without touching remote websites",
+                muted,
+            ),
+        };
+
+        let row_bg = if sel { card_bg } else { bg };
+        rows.push(Line::from(vec![
+            Span::styled(
+                if sel { " ▶ " } else { "   " },
+                Style::default()
+                    .fg(theme.primary)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{num}] {icon} "),
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(if sel { Color::White } else { Color::Rgb(215, 220, 238) })
+                    .bg(row_bg)
+                    .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+        ]));
+        rows.push(Line::from(vec![
+            Span::styled("       ", Style::default().bg(row_bg)),
+            Span::styled(desc, Style::default().fg(muted).bg(row_bg)),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: true }), chunks[1]);
+
+    let footer = Line::from(vec![
+        Span::styled(" [1-4]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quick Pick   ", Style::default().fg(muted)),
+        Span::styled("[↑↓]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Move   ", Style::default().fg(muted)),
+        Span::styled("[Enter]", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
+        Span::styled(" Confirm & Update DB   ", Style::default().fg(muted)),
+        Span::styled("[Esc]", Style::default().fg(Color::Rgb(255, 105, 135)).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cancel", Style::default().fg(muted)),
+    ]);
+    frame.render_widget(Paragraph::new(footer).style(Style::default().bg(bg)), chunks[2]);
 }
 
 #[cfg(test)]
@@ -1774,7 +2344,7 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         for width in [148u16, 126u16, 96u16] {
             let mut state = AppState::new();
-            state.auth.username = Some("abdullah3".to_string());
+            state.auth.anilist.username = Some("abdullah3".to_string());
             let backend = TestBackend::new(width, 38);
             let mut terminal = Terminal::new(backend).unwrap();
             let area = Rect::new(0, 35, width, FOOTER_HEIGHT);
@@ -1845,5 +2415,80 @@ mod tests {
         let (vis_n2, card_w2) = compute_row_card_metrics(129);
         let used2 = vis_n2 as u16 * card_w2 + (vis_n2 as u16 - 1) * CARD_GAP;
         assert!(129 - used2 <= 4, "leftover margin {} too wide at 129 usable", 129 - used2);
+    }
+
+    #[test]
+    fn test_watchlist_renders_dividers_and_target_modal_cleanly() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut data = HomeData::empty();
+        data.continue_watching.push(Anime {
+            id: 10,
+            title_romaji: "Solo Leveling".into(),
+            ..Anime::default()
+        });
+        let al_show = Anime {
+            id: 1,
+            title_romaji: "Attack on Titan".into(),
+            ..Anime::default()
+        };
+        let mal_show = Anime {
+            id: 2,
+            title_romaji: "Vinland Saga".into(),
+            ..Anime::default()
+        };
+        let both_show = Anime {
+            id: 3,
+            title_romaji: "Frieren".into(),
+            ..Anime::default()
+        };
+        data.watchlist = vec![al_show, mal_show, both_show.clone()];
+        data.watchlist_sources.insert(1, WatchlistSource::AniList);
+        data.watchlist_sources.insert(2, WatchlistSource::Mal);
+        data.watchlist_sources.insert(3, WatchlistSource::Both);
+        data.featured = Some(both_show.clone());
+
+        let mut state = AppState::new();
+        state.auth.anilist.username = Some("al_me".into());
+        state.auth.mal.username = Some("mal_me".into());
+
+        let backend = TestBackend::new(150, 46);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, &mut state, &data))
+            .expect("home watchlist dividers should render");
+
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..46 {
+            for x in 0..150 {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        assert!(out.contains("✦ AL"), "missing AniList divider badge");
+        assert!(out.contains("◆ MAL"), "missing MAL divider badge");
+        assert!(out.contains("◈BOTH"), "missing Both divider badge");
+        assert!(out.contains("[AL]"), "missing [AL] card badge");
+        assert!(out.contains("[MAL]"), "missing [MAL] card badge");
+
+        // Now open interactive Watchlist Target Picker modal and verify render
+        state.open_watchlist_prompt(both_show, WatchlistPromptMode::Add, false);
+        terminal
+            .draw(|f| {
+                render(f, &mut state, &data);
+                render_watchlist_target_modal(f, &state);
+            })
+            .expect("target modal should render cleanly");
+        let buf2 = terminal.backend().buffer();
+        let mut modal_out = String::new();
+        for y in 0..46 {
+            for x in 0..150 {
+                modal_out.push_str(buf2[(x, y)].symbol());
+            }
+            modal_out.push('\n');
+        }
+        assert!(modal_out.contains("ADD TO WATCHLIST DATABASES"));
+        assert!(modal_out.contains("Both Databases (AniList + MyAnimeList + Solus)"));
     }
 }

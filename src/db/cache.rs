@@ -25,6 +25,8 @@ pub struct Anime {
     pub has_dub:       i64,  // 0 or 1 (SQLite has no bool)
     pub updated_at:    i64,  // unix timestamp
     pub next_airing_episode: Option<i64>,
+    #[serde(default)]
+    pub mal_id:        Option<i64>,
 }
 
 impl Anime {
@@ -148,8 +150,8 @@ where
             id, title_english, title_romaji, title_native,
             description, episodes, status, season, season_year,
             score, format, genres, cover_url, cover_blob, has_dub, updated_at,
-            next_airing_episode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            next_airing_episode, mal_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             title_english = excluded.title_english,
             title_romaji  = excluded.title_romaji,
@@ -165,7 +167,8 @@ where
             cover_url     = excluded.cover_url,
             has_dub       = excluded.has_dub,
             updated_at    = excluded.updated_at,
-            next_airing_episode = COALESCE(excluded.next_airing_episode, anime.next_airing_episode)
+            next_airing_episode = COALESCE(excluded.next_airing_episode, anime.next_airing_episode),
+            mal_id        = COALESCE(excluded.mal_id, anime.mal_id)
         "#,
     )
     .bind(anime.id)
@@ -185,9 +188,110 @@ where
     .bind(anime.has_dub)
     .bind(anime.updated_at)
     .bind(anime.next_airing_episode)
+    .bind(anime.mal_id)
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Look up cached `(mal_id -> canonical anilist_id)` mappings from both `id_crosswalk` and `anime`.
+pub async fn lookup_anilist_by_mal_ids(
+    pool: &SqlitePool,
+    mal_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, i64>> {
+    let mut map = std::collections::HashMap::new();
+    for chunk in mal_ids.chunks(200) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+
+        let sql_cross = format!(
+            "SELECT mal_id, anilist_id FROM id_crosswalk WHERE mal_id IN ({})",
+            placeholders
+        );
+        let mut q1 = sqlx::query_as::<_, (i64, i64)>(&sql_cross);
+        for &mid in chunk {
+            q1 = q1.bind(mid);
+        }
+        if let Ok(rows) = q1.fetch_all(pool).await {
+            for (mid, aid) in rows {
+                map.insert(mid, aid);
+            }
+        }
+
+        let sql_anime = format!(
+            "SELECT mal_id, id FROM anime WHERE mal_id IN ({})",
+            placeholders
+        );
+        let mut q2 = sqlx::query_as::<_, (i64, i64)>(&sql_anime);
+        for &mid in chunk {
+            q2 = q2.bind(mid);
+        }
+        if let Ok(rows) = q2.fetch_all(pool).await {
+            for (mid, aid) in rows {
+                map.entry(mid).or_insert(aid);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Persist resolved `(mal_id, anilist_id, source)` links into `id_crosswalk` and backfill `anime.mal_id`.
+pub async fn save_crosswalk_links(
+    pool: &SqlitePool,
+    links: &[(i64, i64, &str)],
+    now: i64,
+) -> Result<()> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for &(mal_id, anilist_id, source) in links {
+        sqlx::query(
+            "INSERT INTO id_crosswalk (mal_id, anilist_id, resolved_at, source)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(mal_id) DO UPDATE SET
+                 anilist_id  = excluded.anilist_id,
+                 resolved_at = excluded.resolved_at,
+                 source      = excluded.source",
+        )
+        .bind(mal_id)
+        .bind(anilist_id)
+        .bind(now)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE anime SET mal_id = COALESCE(mal_id, ?) WHERE id = ?",
+        )
+        .bind(mal_id)
+        .bind(anilist_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Resolve a cached MyAnimeList ID for a canonical AniList anime ID.
+pub async fn get_mal_id_for_anime(pool: &SqlitePool, anilist_id: i64) -> Result<Option<i64>> {
+    if let Some(mid) = sqlx::query_scalar::<_, Option<i64>>("SELECT mal_id FROM anime WHERE id = ?")
+        .bind(anilist_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+    {
+        return Ok(Some(mid));
+    }
+    let mid = sqlx::query_scalar::<_, i64>(
+        "SELECT mal_id FROM id_crosswalk WHERE anilist_id = ? LIMIT 1",
+    )
+    .bind(anilist_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(mid)
 }
 
 /// Insert or update an anime record in the cache.
@@ -339,6 +443,7 @@ mod tests {
             has_dub:       0,
             updated_at:    1_700_000_000,
             next_airing_episode: None,
+            mal_id:        None,
         }
     }
 

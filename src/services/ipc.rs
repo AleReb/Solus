@@ -52,7 +52,8 @@ pub struct IpcMonitorConfig {
     pub sock_path:       String,
     pub pool:            SqlitePool,
     pub tx:              Sender<AppMessage>,
-    pub auth_token:      Option<String>,
+    pub auth:            crate::config::AuthConfig,
+    pub trackers:        crate::config::TrackersConfig,
     pub skip_intervals:  Vec<SkipResult>,
     pub auto_skip_intro: bool,
 }
@@ -109,7 +110,8 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
         sock_path,
         pool,
         tx,
-        auth_token,
+        auth,
+        trackers,
         skip_intervals,
         auto_skip_intro,
     } = config;
@@ -204,10 +206,21 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
                             .as_secs() as i64;
 
                         let pool_clone = pool.clone();
-                        let token_clone = auth_token.clone();
+                        let mut auth_clone = auth.clone();
+                        let trackers_clone = trackers.clone();
                         tokio::spawn(async move {
                             let _ = db::user::record_watched(&pool_clone, anime_id, episode as i64, now).await;
-                            if let Some(token) = token_clone {
+                            if let Ok(Some(anime)) = db::cache::get_anime(&pool_clone, anime_id).await {
+                                let _ = crate::services::scrobble::sync_episode_watched_all(
+                                    &pool_clone,
+                                    &anime,
+                                    episode,
+                                    &mut auth_clone,
+                                    &trackers_clone,
+                                    now,
+                                )
+                                .await;
+                            } else if let Some(token) = auth_clone.anilist_token() {
                                 let client = crate::api::anilist::AniListClient::with_token(Some(token));
                                 let _ = client.save_progress(anime_id, episode).await;
                             }

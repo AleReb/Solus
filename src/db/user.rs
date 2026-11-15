@@ -1,6 +1,6 @@
 //! User data: watch history, continue watching, watchlist.
 
-use crate::config::AudioMode;
+use crate::config::{AudioMode, TrackerProvider};
 use crate::error::Result;
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
@@ -625,6 +625,217 @@ pub async fn delete_offline_episode(
     .await?;
 
     Ok(())
+}
+
+// ─── Multi-Tracker Snapshots & Watchlist Provenance ───────────────────────────
+
+/// Where a Watchlist entry originates across synced trackers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WatchlistSource {
+    AniList,
+    Mal,
+    Both,
+    Local,
+}
+
+impl WatchlistSource {
+    pub fn from_flags(in_anilist: bool, in_mal: bool) -> Self {
+        match (in_anilist, in_mal) {
+            (true, true) => Self::Both,
+            (true, false) => Self::AniList,
+            (false, true) => Self::Mal,
+            (false, false) => Self::Local,
+        }
+    }
+
+    pub fn group_order(self) -> u8 {
+        match self {
+            Self::AniList => 0,
+            Self::Mal => 1,
+            Self::Both => 2,
+            Self::Local => 3,
+        }
+    }
+
+    pub fn pill_tag(self) -> &'static str {
+        match self {
+            Self::AniList => "AL",
+            Self::Mal => "MAL",
+            Self::Both => "AL+M",
+            Self::Local => "LOC",
+        }
+    }
+
+    pub fn divider_label(self) -> &'static str {
+        match self {
+            Self::AniList => "✦ ANILIST",
+            Self::Mal => "◆ MAL",
+            Self::Both => "◈ BOTH",
+            Self::Local => "• LOCAL",
+        }
+    }
+}
+
+/// Per-provider tracker snapshot row stored in `tracker_entries`.
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
+pub struct TrackerEntryRow {
+    pub anime_id: i64,
+    pub provider: String,
+    pub status: String,
+    pub progress: i64,
+    pub score: Option<i64>,
+    pub remote_updated_at: Option<i64>,
+    pub last_synced_at: i64,
+}
+
+/// Upsert a single provider's normalized entry snapshot for a canonical AniList anime ID.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_tracker_entry(
+    pool: &SqlitePool,
+    anime_id: i64,
+    provider: TrackerProvider,
+    status: &str,
+    progress: u32,
+    score: Option<i64>,
+    remote_updated_at: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tracker_entries
+             (anime_id, provider, status, progress, score, remote_updated_at, last_synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(anime_id, provider) DO UPDATE SET
+             status            = excluded.status,
+             progress          = excluded.progress,
+             score             = COALESCE(excluded.score, tracker_entries.score),
+             remote_updated_at = COALESCE(excluded.remote_updated_at, tracker_entries.remote_updated_at),
+             last_synced_at    = excluded.last_synced_at",
+    )
+    .bind(anime_id)
+    .bind(provider.as_str())
+    .bind(status)
+    .bind(progress as i64)
+    .bind(score)
+    .bind(remote_updated_at)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a single provider's snapshot entry for an anime.
+pub async fn delete_tracker_entry(
+    pool: &SqlitePool,
+    anime_id: i64,
+    provider: TrackerProvider,
+) -> Result<()> {
+    sqlx::query("DELETE FROM tracker_entries WHERE anime_id = ? AND provider = ?")
+        .bind(anime_id)
+        .bind(provider.as_str())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Clear all snapshot rows belonging to `provider` (used on logout or clean unlink).
+pub async fn clear_provider_tracker_entries(
+    pool: &SqlitePool,
+    provider: TrackerProvider,
+) -> Result<()> {
+    sqlx::query("DELETE FROM tracker_entries WHERE provider = ?")
+        .bind(provider.as_str())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Fetch all stored tracker snapshot rows across all providers.
+pub async fn get_all_tracker_entries(pool: &SqlitePool) -> Result<Vec<TrackerEntryRow>> {
+    let rows = sqlx::query_as::<_, TrackerEntryRow>(
+        "SELECT anime_id, provider, status, progress, score, remote_updated_at, last_synced_at
+         FROM tracker_entries
+         ORDER BY anime_id ASC, provider ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch tracker snapshot rows for one specific anime.
+pub async fn get_tracker_entries_for_anime(
+    pool: &SqlitePool,
+    anime_id: i64,
+) -> Result<Vec<TrackerEntryRow>> {
+    let rows = sqlx::query_as::<_, TrackerEntryRow>(
+        "SELECT anime_id, provider, status, progress, score, remote_updated_at, last_synced_at
+         FROM tracker_entries
+         WHERE anime_id = ?
+         ORDER BY provider ASC",
+    )
+    .bind(anime_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Determine whether a Watchlist show belongs to AniList, MyAnimeList, Both, or Local only.
+pub async fn get_anime_watchlist_source(
+    pool: &SqlitePool,
+    anime_id: i64,
+) -> Result<WatchlistSource> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT provider, status FROM tracker_entries WHERE anime_id = ?",
+    )
+    .bind(anime_id)
+    .fetch_all(pool)
+    .await?;
+
+    let in_al = rows
+        .iter()
+        .any(|(p, st)| p == TrackerProvider::AniList.as_str() && st == "PLANNING");
+    let in_mal = rows
+        .iter()
+        .any(|(p, st)| p == TrackerProvider::Mal.as_str() && st == "PLANNING");
+    Ok(WatchlistSource::from_flags(in_al, in_mal))
+}
+
+/// Fetch all Watchlist anime IDs paired with their tracker provenance, grouped cleanly
+/// in deterministic `AniList -> Mal -> Both -> Local` order with zero duplicate anime IDs.
+pub async fn get_watchlist_with_sources(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, WatchlistSource)>> {
+    let rows = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT w.anime_id,
+                EXISTS(
+                    SELECT 1 FROM tracker_entries te
+                    WHERE te.anime_id = w.anime_id
+                      AND te.provider = 'anilist'
+                      AND te.status = 'PLANNING'
+                ) AS in_al,
+                EXISTS(
+                    SELECT 1 FROM tracker_entries te
+                    WHERE te.anime_id = w.anime_id
+                      AND te.provider = 'mal'
+                      AND te.status = 'PLANNING'
+                ) AS in_mal
+         FROM watchlist w
+         ORDER BY
+            CASE
+                WHEN in_al = 1 AND in_mal = 0 THEN 0
+                WHEN in_al = 0 AND in_mal = 1 THEN 1
+                WHEN in_al = 1 AND in_mal = 1 THEN 2
+                ELSE 3
+            END ASC,
+            w.added_at DESC,
+            w.anime_id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, in_al, in_mal)| (id, WatchlistSource::from_flags(in_al != 0, in_mal != 0)))
+        .collect())
 }
 
 // ─── Analytics / Personal Anime Wrapped ───────────────────────────────────────
@@ -1503,6 +1714,7 @@ mod tests {
             has_dub:       0,
             updated_at:    1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         };
         upsert_anime(&pool, &anime).await.unwrap();
         pool
@@ -1576,6 +1788,7 @@ mod tests {
                 has_dub:       0,
                 updated_at:    1_000_000,
                 next_airing_episode: None,
+                mal_id: None,
             };
             upsert_anime(&pool, &anime).await.unwrap();
         }
@@ -1684,6 +1897,7 @@ mod tests {
                 has_dub: 0,
                 updated_at: 1_000_000,
                 next_airing_episode: None,
+                mal_id: None,
             };
             upsert_anime(&pool, &anime).await.unwrap();
         }
@@ -1835,6 +2049,7 @@ mod tests {
             has_dub:       1,
             updated_at:    1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         };
         upsert_anime(&pool, &anime).await.unwrap();
 
@@ -1862,6 +2077,7 @@ mod tests {
             has_dub:       1,
             updated_at:    1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         };
         upsert_anime(&pool, &anime2).await.unwrap();
         record_watched(&pool, 100, 1, 2_000).await.unwrap();
@@ -1919,6 +2135,7 @@ mod tests {
             has_dub: 1,
             updated_at: 1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         };
         upsert_anime(&pool, &anime).await.unwrap();
 
@@ -1930,5 +2147,61 @@ mod tests {
         assert_eq!(analytics.recent_watch_log.len(), 40);
         assert_eq!(analytics.recent_watch_log.first().unwrap().episode, 40);
         assert_eq!(analytics.recent_watch_log.last().unwrap().episode, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_watchlist_with_sources_groups_cleanly_without_duplicates() {
+        let pool = init(":memory:").await.unwrap();
+        let make_anime = |id: i64, title: &str| Anime {
+            id,
+            title_romaji: title.into(),
+            title_english: Some(title.into()),
+            title_native: None,
+            description: None,
+            episodes: Some(12),
+            status: Some("FINISHED".into()),
+            season: None,
+            season_year: None,
+            score: None,
+            format: Some("TV".into()),
+            genres: "[]".into(),
+            cover_url: None,
+            cover_blob: None,
+            has_dub: 0,
+            updated_at: 100,
+            next_airing_episode: None,
+            mal_id: None,
+        };
+
+        for (id, t) in [(1, "Both Show"), (2, "AL Only"), (3, "MAL Only"), (4, "Local Only")] {
+            upsert_anime(&pool, &make_anime(id, t)).await.unwrap();
+            add_to_watchlist(&pool, id, 100 + id).await.unwrap();
+        }
+
+        upsert_tracker_entry(&pool, 1, TrackerProvider::AniList, "PLANNING", 0, None, None, 100)
+            .await
+            .unwrap();
+        upsert_tracker_entry(&pool, 1, TrackerProvider::Mal, "PLANNING", 0, None, None, 100)
+            .await
+            .unwrap();
+        upsert_tracker_entry(&pool, 2, TrackerProvider::AniList, "PLANNING", 0, None, None, 100)
+            .await
+            .unwrap();
+        upsert_tracker_entry(&pool, 3, TrackerProvider::Mal, "PLANNING", 0, None, None, 100)
+            .await
+            .unwrap();
+
+        let grouped = get_watchlist_with_sources(&pool).await.unwrap();
+        assert_eq!(
+            grouped,
+            vec![
+                (2, WatchlistSource::AniList),
+                (3, WatchlistSource::Mal),
+                (1, WatchlistSource::Both),
+                (4, WatchlistSource::Local),
+            ]
+        );
+        assert_eq!(get_anime_watchlist_source(&pool, 1).await.unwrap(), WatchlistSource::Both);
+        assert_eq!(get_anime_watchlist_source(&pool, 4).await.unwrap(), WatchlistSource::Local);
     }
 }

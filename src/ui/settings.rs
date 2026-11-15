@@ -218,10 +218,15 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::AniListSync,
             category: "❖ SYSTEM & MAINTENANCE",
-            label: "AniList Library Sync",
-            keywords: "anilist sync token account auth login backup import export",
-            badge: if state.auth.token.is_some() { "[󰄬] Connected".to_string() } else { "[ ] Offline".to_string() },
-            description: "Synchronizes Watching, Completed, and Planning lists with AniList and manages offline JSON backups.",
+            label: "Connected Trackers & Sync",
+            keywords: "anilist mal myanimelist oauth sync token account auth login backup import export",
+            badge: match (state.auth.has_anilist(), state.auth.has_mal()) {
+                (true, true) => "[󰄬] AL + MAL".to_string(),
+                (true, false) => "[󰄬] AniList".to_string(),
+                (false, true) => "[󰄬] MAL".to_string(),
+                (false, false) => "[ ] Offline".to_string(),
+            },
+            description: "Connect AniList + MyAnimeList (OAuth2, username, or XML/JSON export) with zero duplicate entries and dual live writeback.",
             kind: HubActionKind::Launch("AniListLogin"),
         },
         HubItem {
@@ -678,6 +683,46 @@ fn render_inspector_card(
                 ]),
             ];
             frame.render_widget(Paragraph::new(doctor_lines).wrap(Wrap { trim: true }), chunks[2]);
+        }
+        HubActionId::AniListSync => {
+            let ok_fg = Color::Rgb(80, 250, 123);
+            let muted_fg = Color::Rgb(150, 155, 180);
+            let al_label = if let Some(ref u) = state.auth.anilist.username {
+                format!("@{u} ({})", if state.auth.anilist.has_write_token() { "OAuth Live" } else { "Public" })
+            } else {
+                "Not connected".to_string()
+            };
+            let mal_label = if let Some(ref u) = state.auth.mal.username {
+                format!("@{u} ({})", if state.auth.mal.has_write_token() { "OAuth Live" } else { "Read/XML" })
+            } else if state.auth.mal.last_imported_file.is_some() {
+                "XML Export Loaded".to_string()
+            } else {
+                "Not connected".to_string()
+            };
+
+            let tracker_lines = vec![
+                Line::from(vec![
+                    Span::styled("  ✦ AniList: ", Style::default().fg(Color::Rgb(103, 232, 249)).add_modifier(Modifier::BOLD)),
+                    Span::styled(al_label, Style::default().fg(if state.auth.has_anilist() { ok_fg } else { muted_fg })),
+                ]),
+                Line::from(vec![
+                    Span::styled("  ◆ MyAnimeList: ", Style::default().fg(Color::Rgb(108, 160, 255)).add_modifier(Modifier::BOLD)),
+                    Span::styled(mal_label, Style::default().fg(if state.auth.has_mal() { ok_fg } else { muted_fg })),
+                ]),
+                Line::from(vec![
+                    Span::styled("  ⚖ Merge Rule: ", Style::default().fg(theme.accent)),
+                    Span::styled(state.auth.merge_policy.label(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Control: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Press [Enter] (or [L] anywhere) to open Connected Trackers & Sync Hub.",
+                        Style::default().fg(Color::Rgb(200, 205, 220)),
+                    ),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(tracker_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         _ => {
             let generic_lines = vec![

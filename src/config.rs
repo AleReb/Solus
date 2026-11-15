@@ -143,6 +143,9 @@ pub struct Config {
     pub remote:           RemoteConfig,
     #[serde(default)]
     pub cast:             CastConfig,
+    /// Dual-tracker OAuth Client IDs (AniList + MyAnimeList)
+    #[serde(default)]
+    pub trackers:         TrackersConfig,
     /// Schema revision for one-time default migrations (0 = legacy v1.0.6 defaults)
     #[serde(default)]
     pub config_version:   u32,
@@ -163,8 +166,36 @@ impl Default for Config {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            trackers:         TrackersConfig::default(),
             config_version:   1,
         }
+    }
+}
+
+/// Optional user/app OAuth2 Client IDs for tracker APIs
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrackersConfig {
+    #[serde(default)]
+    pub mal_client_id: Option<String>,
+    #[serde(default)]
+    pub anilist_client_id: Option<String>,
+}
+
+impl TrackersConfig {
+    /// Resolve MAL OAuth Client ID (env var overrides config.toml).
+    pub fn resolved_mal_client_id(&self) -> Option<String> {
+        std::env::var("SOLUS_MAL_CLIENT_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| self.mal_client_id.clone().filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Resolve AniList OAuth Client ID (env var overrides config.toml).
+    pub fn resolved_anilist_client_id(&self) -> Option<String> {
+        std::env::var("SOLUS_ANILIST_CLIENT_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| self.anilist_client_id.clone().filter(|v| !v.trim().is_empty()))
     }
 }
 
@@ -362,16 +393,164 @@ impl Config {
     }
 }
 
-/// AniList authentication data — persisted to ~/.config/ani-tui/auth.json
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AuthConfig {
+/// Supported external anime trackers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerProvider {
+    AniList,
+    Mal,
+}
+
+impl TrackerProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrackerProvider::AniList => "anilist",
+            TrackerProvider::Mal => "mal",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            TrackerProvider::AniList => "AniList",
+            TrackerProvider::Mal => "MyAnimeList",
+        }
+    }
+}
+
+/// Strategy used when AniList & MyAnimeList differ on the same canonical show
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePolicy {
+    #[default]
+    HighestProgress,
+    LatestUpdated,
+    AniListPrimary,
+    MalPrimary,
+}
+
+impl MergePolicy {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MergePolicy::HighestProgress => "Highest Progress (Smart)",
+            MergePolicy::LatestUpdated => "Latest Updated Wins",
+            MergePolicy::AniListPrimary => "AniList Priority",
+            MergePolicy::MalPrimary => "MyAnimeList Priority",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            MergePolicy::HighestProgress => MergePolicy::LatestUpdated,
+            MergePolicy::LatestUpdated => MergePolicy::AniListPrimary,
+            MergePolicy::AniListPrimary => MergePolicy::MalPrimary,
+            MergePolicy::MalPrimary => MergePolicy::HighestProgress,
+        }
+    }
+}
+
+/// Target database(s) chosen when interactively adding or removing Watchlist items
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchlistTarget {
+    Both,
+    AniList,
+    Mal,
+    Local,
+}
+
+/// Connection & token state for a single tracker provider
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrackerAccount {
+    #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
     pub user_id: Option<i64>,
+    #[serde(default)]
     pub username: Option<String>,
+    #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
     pub sync_mode: Option<String>,
+    #[serde(default)]
     pub last_imported_file: Option<String>,
+    #[serde(default)]
     pub last_sync_time: Option<i64>,
+}
+
+impl TrackerAccount {
+    pub fn is_connected(&self) -> bool {
+        self.has_write_token()
+            || self.username.as_ref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+            || self.last_imported_file.is_some()
+    }
+
+    pub fn has_write_token(&self) -> bool {
+        self.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Dual-tracker authentication & sync rules — persisted to ~/.config/solus/auth.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub anilist: TrackerAccount,
+    #[serde(default)]
+    pub mal: TrackerAccount,
+    #[serde(default)]
+    pub merge_policy: MergePolicy,
+    #[serde(default = "default_true")]
+    pub auto_scrobble_both: bool,
+    #[serde(default)]
+    pub auto_align_lagging: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            anilist: TrackerAccount::default(),
+            mal: TrackerAccount::default(),
+            merge_policy: MergePolicy::default(),
+            auto_scrobble_both: true,
+            auto_align_lagging: false,
+        }
+    }
+}
+
+/// Legacy single-provider auth schema migrated automatically on first load.
+#[derive(Deserialize)]
+struct RawAuthCompat {
+    #[serde(default)]
+    anilist: Option<TrackerAccount>,
+    #[serde(default)]
+    mal: Option<TrackerAccount>,
+    #[serde(default)]
+    merge_policy: Option<MergePolicy>,
+    #[serde(default)]
+    auto_scrobble_both: Option<bool>,
+    #[serde(default)]
+    auto_align_lagging: Option<bool>,
+    // Legacy v1 flat AniList fields
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    user_id: Option<i64>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    sync_mode: Option<String>,
+    #[serde(default)]
+    last_imported_file: Option<String>,
+    #[serde(default)]
+    last_sync_time: Option<i64>,
 }
 
 impl AuthConfig {
@@ -379,11 +558,38 @@ impl AuthConfig {
         Ok(Config::config_dir()?.join("auth.json"))
     }
 
+    pub fn from_json_str(raw: &str) -> std::result::Result<Self, serde_json::Error> {
+        let compat: RawAuthCompat = serde_json::from_str(raw)?;
+        let mut anilist = compat.anilist.unwrap_or_default();
+        if !anilist.is_connected() {
+            if compat.token.is_some()
+                || compat.username.is_some()
+                || compat.user_id.is_some()
+                || compat.last_imported_file.is_some()
+            {
+                anilist.token = compat.token;
+                anilist.user_id = compat.user_id;
+                anilist.username = compat.username;
+                anilist.avatar_url = compat.avatar_url;
+                anilist.sync_mode = compat.sync_mode;
+                anilist.last_imported_file = compat.last_imported_file;
+                anilist.last_sync_time = compat.last_sync_time;
+            }
+        }
+        Ok(Self {
+            anilist,
+            mal: compat.mal.unwrap_or_default(),
+            merge_policy: compat.merge_policy.unwrap_or_default(),
+            auto_scrobble_both: compat.auto_scrobble_both.unwrap_or(true),
+            auto_align_lagging: compat.auto_align_lagging.unwrap_or(false),
+        })
+    }
+
     pub fn load() -> Self {
         if let Ok(path) = Self::auth_path() {
             if path.exists() {
                 if let Ok(raw) = std::fs::read_to_string(path) {
-                    if let Ok(cfg) = serde_json::from_str::<AuthConfig>(&raw) {
+                    if let Ok(cfg) = Self::from_json_str(&raw) {
                         return cfg;
                     }
                 }
@@ -403,20 +609,49 @@ impl AuthConfig {
         Ok(())
     }
 
-    pub fn is_authenticated(&self) -> bool {
-        self.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
-            || self.username.as_ref().map(|u| !u.trim().is_empty()).unwrap_or(false)
-            || self.last_imported_file.is_some()
+    pub fn account(&self, provider: TrackerProvider) -> &TrackerAccount {
+        match provider {
+            TrackerProvider::AniList => &self.anilist,
+            TrackerProvider::Mal => &self.mal,
+        }
     }
 
+    pub fn account_mut(&mut self, provider: TrackerProvider) -> &mut TrackerAccount {
+        match provider {
+            TrackerProvider::AniList => &mut self.anilist,
+            TrackerProvider::Mal => &mut self.mal,
+        }
+    }
+
+    pub fn has_anilist(&self) -> bool {
+        self.anilist.is_connected()
+    }
+
+    pub fn has_mal(&self) -> bool {
+        self.mal.is_connected()
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.has_anilist() || self.has_mal()
+    }
+
+    pub fn anilist_token(&self) -> Option<String> {
+        self.anilist.token.clone().filter(|t| !t.trim().is_empty())
+    }
+
+    pub fn mal_token(&self) -> Option<String> {
+        self.mal.token.clone().filter(|t| !t.trim().is_empty())
+    }
+
+    pub fn clear_provider(&mut self, provider: TrackerProvider) -> Result<()> {
+        self.account_mut(provider).clear();
+        self.save()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear(&mut self) -> Result<()> {
-        self.token = None;
-        self.user_id = None;
-        self.username = None;
-        self.avatar_url = None;
-        self.sync_mode = None;
-        self.last_imported_file = None;
-        self.last_sync_time = None;
+        self.anilist.clear();
+        self.mal.clear();
         self.save()
     }
 }
@@ -467,6 +702,7 @@ mod tests {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            trackers:         TrackersConfig::default(),
             config_version:   1,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
@@ -498,6 +734,7 @@ mod tests {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            trackers:         TrackersConfig::default(),
             config_version:   1,
         };
 

@@ -67,8 +67,39 @@ enum AppMessage {
         vlc: bool,
         prompt_setup: bool,
     },
-    /// Watchlist changed — send fresh list to update home row immediately
-    WatchlistUpdated(Vec<db::cache::Anime>),
+    /// Watchlist changed — send fresh grouped list and provenance sources to update home row immediately
+    WatchlistUpdated(Vec<db::cache::Anime>, std::collections::HashMap<i64, db::user::WatchlistSource>),
+    /// Live Watchlist database writeback completed (`+` / `x` popup or direct delete)
+    WatchlistWritebackCompleted {
+        anime_id: i64,
+        removed_completely: bool,
+        added_to_wl: bool,
+        outcome_summary: String,
+        wl: Vec<db::cache::Anime>,
+        sources: std::collections::HashMap<i64, db::user::WatchlistSource>,
+    },
+    /// Dual-tracker sync / OAuth / username sync completed cleanly
+    TrackerSyncCompleted {
+        provider: config::TrackerProvider,
+        account: config::TrackerAccount,
+        report: services::tracker_merge::MergeReport,
+        home_data: Box<ui::home::HomeData>,
+        summary: String,
+    },
+    /// Dual-tracker sync or OAuth failed
+    TrackerSyncFailed(config::TrackerProvider, String),
+    /// Local SQLite merge audit refreshed for `[2] Merge & Conflicts`
+    MergeAuditReady(services::tracker_merge::MergeReport),
+    /// Cross-tracker parity push (`[P]`) completed
+    ParityPushCompleted {
+        summary: String,
+        report: services::tracker_merge::MergeReport,
+        home_data: Box<ui::home::HomeData>,
+    },
+    /// Official MAL `.xml` / `.xml.gz` archive import completed
+    MalXmlImportCompleted(std::result::Result<(services::tracker_merge::MergeReport, String, usize, Box<ui::home::HomeData>), String>),
+    /// Background scrobble feedback toast
+    ScrobbleSyncToast(String),
     /// Continue Watching changed — send fresh list to update home row immediately
     ContinueWatchingUpdated(Vec<db::cache::Anime>),
     /// Home banner watched-episode count for the active anime
@@ -320,11 +351,17 @@ async fn main() -> anyhow::Result<()> {
         let tx2   = tx.clone();
         let auth2 = state.auth.clone();
         tokio::spawn(async move {
-            let client = api::anilist::AniListClient::with_token(auth2.token.clone());
+            let client = api::anilist::AniListClient::with_token(auth2.anilist_token());
+            let mal_cid = cfg2.trackers.resolved_mal_client_id();
             let now    = unix_now();
             let result = services::sync::sync_all(
-                &pool2, &client, Some(&auth2),
-                cfg2.cache.trending_ttl, cfg2.cache.stable_ttl, now,
+                &pool2,
+                &client,
+                Some(&auth2),
+                mal_cid.as_deref(),
+                cfg2.cache.trending_ttl,
+                cfg2.cache.stable_ttl,
+                now,
             )
             .await;
             match result {
@@ -462,13 +499,103 @@ async fn main() -> anyhow::Result<()> {
                         state.open_setup();
                     }
                 }
-                AppMessage::WatchlistUpdated(list) => {
+                AppMessage::WatchlistUpdated(list, sources) => {
                     home_data.watchlist = list;
+                    home_data.watchlist_sources = sources;
                     let max_idx = home_data.watchlist.len().saturating_sub(1);
                     let offset  = state.row_offset("watchlist").min(max_idx);
                     state.row_offsets.insert("watchlist".to_string(), offset);
                     refresh_home_cover(&mut state, &home_data, &pool, &tx);
                     prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                }
+                AppMessage::WatchlistWritebackCompleted {
+                    anime_id,
+                    removed_completely,
+                    added_to_wl,
+                    outcome_summary,
+                    wl,
+                    sources,
+                } => {
+                    home_data.watchlist = wl;
+                    home_data.watchlist_sources = sources;
+                    let max_idx = home_data.watchlist.len().saturating_sub(1);
+                    let offset = state.row_offset("watchlist").min(max_idx);
+                    state.row_offsets.insert("watchlist".to_string(), offset);
+                    if state.active_row == state::CategoryRow::Watchlist && home_data.watchlist.is_empty() {
+                        state.active_row = next_non_empty_row(&state.active_row, &home_data, 1);
+                    }
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.in_watchlist = if added_to_wl { true } else { !removed_completely };
+                    }
+                    if added_to_wl {
+                        state.calendar_tracked_ids.insert(anime_id);
+                    } else if removed_completely && !home_data.continue_watching.iter().any(|a| a.id == anime_id) {
+                        state.calendar_tracked_ids.remove(&anime_id);
+                    }
+                    state.show_toast(outcome_summary, unix_now());
+                    refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                    prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                }
+                AppMessage::TrackerSyncCompleted {
+                    provider,
+                    account,
+                    report,
+                    home_data: new_home,
+                    summary,
+                } => {
+                    state.oauth_pending = None;
+                    state.oauth_cancel_tx = None;
+                    *state.auth.account_mut(provider) = account;
+                    let _ = state.auth.save();
+                    state.merge_report = Some(report);
+                    home_data = *new_home;
+                    state.login_status = Some(summary.clone());
+                    state.show_toast(summary, unix_now());
+                    refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                    prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                }
+                AppMessage::TrackerSyncFailed(_provider, err) => {
+                    state.oauth_pending = None;
+                    state.oauth_cancel_tx = None;
+                    state.login_status = Some(format!("! Sync error: {err}"));
+                }
+                AppMessage::MergeAuditReady(report) => {
+                    state.merge_report = Some(report);
+                }
+                AppMessage::ParityPushCompleted {
+                    summary,
+                    report,
+                    home_data: new_home,
+                } => {
+                    state.merge_report = Some(report);
+                    home_data = *new_home;
+                    state.login_status = Some(summary.clone());
+                    state.show_toast(summary, unix_now());
+                    refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                }
+                AppMessage::MalXmlImportCompleted(res) => {
+                    match res {
+                        Ok((report, filename, count, new_home)) => {
+                            let now = unix_now();
+                            state.auth.mal.sync_mode = Some("MAL XML Import".to_string());
+                            state.auth.mal.last_imported_file = Some(filename);
+                            state.auth.mal.last_sync_time = Some(now);
+                            let _ = state.auth.save();
+                            state.merge_report = Some(report);
+                            home_data = *new_home;
+                            let msg = format!("✓ Imported {count} MAL entries (0 duplicates)");
+                            state.login_status = Some(msg.clone());
+                            state.show_toast(msg, now);
+                            refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                            prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                        }
+                        Err(err) => {
+                            state.login_status = Some(format!("! MAL XML import error: {err}"));
+                        }
+                    }
+                }
+                AppMessage::ScrobbleSyncToast(msg) => {
+                    state.show_toast(msg, unix_now());
                 }
                 AppMessage::ContinueWatchingUpdated(list) => {
                     home_data.continue_watching = list;
@@ -566,51 +693,58 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::ArchiveImportCompleted(res) => {
                     match res {
                         Ok(stats) => {
-                            state.auth.sync_mode = Some("Local JSON Archive".to_string());
-                            state.auth.last_sync_time = Some(unix_now());
+                            let now = unix_now();
+                            state.auth.anilist.sync_mode = Some("Local JSON Archive".to_string());
+                            state.auth.anilist.last_sync_time = Some(now);
                             let _ = state.auth.save();
-                            state.login_status = None;
-                            state.show_toast(format!("❖ Ingested {} anime, {} episodes", stats.total_anime, stats.episodes_logged), unix_now());
+                            state.login_status = Some(format!(
+                                "✓ Ingested {} anime, {} episodes",
+                                stats.total_anime, stats.episodes_logged
+                            ));
+                            state.show_toast(format!("❖ Ingested {} anime, {} episodes", stats.total_anime, stats.episodes_logged), now);
                             state.import_stats = Some(stats);
 
                             if let Ok(cw) = services::sync::load_continue_watching(&pool).await {
                                 home_data.continue_watching = cw;
                             }
-                            if let Ok(wl) = services::sync::load_watchlist(&pool).await {
+                            if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(&pool).await {
                                 home_data.watchlist = wl;
+                                home_data.watchlist_sources = sources;
                             }
                             refresh_home_cover(&mut state, &home_data, &pool, &tx);
                             prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
                         }
                         Err(err) => {
-                            state.login_status = Some(format!("Import error: {}", err));
+                            state.login_status = Some(format!("! Import error: {}", err));
                         }
                     }
                 }
                 AppMessage::PublicSyncCompleted(res) => {
                     match res {
                         Ok((viewer, stats)) => {
-                            state.auth.username = Some(viewer.name.clone());
-                            state.auth.user_id = Some(viewer.id);
-                            state.auth.avatar_url = viewer.avatar_url.clone();
-                            state.auth.sync_mode = Some("Public Over-The-Air Sync".to_string());
-                            state.auth.last_sync_time = Some(unix_now());
+                            let now = unix_now();
+                            state.auth.anilist.username = Some(viewer.name.clone());
+                            state.auth.anilist.user_id = Some(viewer.id);
+                            state.auth.anilist.avatar_url = viewer.avatar_url.clone();
+                            state.auth.anilist.sync_mode = Some("Public Username".to_string());
+                            state.auth.anilist.last_sync_time = Some(now);
                             let _ = state.auth.save();
-                            state.login_status = None;
-                            state.show_toast(format!("❖ Synced @{}: {} anime", viewer.name, stats.total_anime), unix_now());
+                            state.login_status = Some(format!("✓ Synced AniList @{}: {} anime", viewer.name, stats.total_anime));
+                            state.show_toast(format!("❖ Synced @{}: {} anime", viewer.name, stats.total_anime), now);
                             state.import_stats = Some(stats);
 
                             if let Ok(cw) = services::sync::load_continue_watching(&pool).await {
                                 home_data.continue_watching = cw;
                             }
-                            if let Ok(wl) = services::sync::load_watchlist(&pool).await {
+                            if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(&pool).await {
                                 home_data.watchlist = wl;
+                                home_data.watchlist_sources = sources;
                             }
                             refresh_home_cover(&mut state, &home_data, &pool, &tx);
                             prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
                         }
                         Err(err) => {
-                            state.login_status = Some(format!("Sync error: {}", err));
+                            state.login_status = Some(format!("! Sync error: {}", err));
                         }
                     }
                 }
@@ -1038,7 +1172,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Screen::AniListLogin => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
-                        ui::login::render_overlay(frame, &state);
+                        ui::login::render_overlay(frame, &state, &cfg);
                     }
                     Screen::TailoredWizard => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
@@ -1072,6 +1206,9 @@ async fn main() -> anyhow::Result<()> {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::calendar::render_overlay(frame, &mut state);
                     }
+                }
+                if state.watchlist_target_prompt.is_some() {
+                    ui::home::render_watchlist_target_modal(frame, &state);
                 }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
@@ -1148,6 +1285,11 @@ async fn handle_key(
     // Ctrl+C works everywhere
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         state.should_quit = true;
+        return;
+    }
+
+    if state.watchlist_target_prompt.is_some() {
+        handle_watchlist_target_modal(key, state, home_data, pool, cfg, tx).await;
         return;
     }
 
@@ -1481,14 +1623,26 @@ async fn handle_mouse(
                                 ui::home::compute_shelf_layout(&tiers, avail_h, active_tier_idx);
 
                             let mut acc_y = 0u16;
+                            let mut tier_top_rel_y = 0u16;
+                            let mut tier_height = 0u16;
                             let clicked_tier_idx = heights.iter().position(|&h| {
                                 let in_band = rel_y >= acc_y && rel_y < acc_y + h;
+                                if in_band {
+                                    tier_top_rel_y = acc_y;
+                                    tier_height = h;
+                                }
                                 acc_y += h;
                                 in_band
                             });
 
                             if let Some(clicked_tier_idx) = clicked_tier_idx {
                                 let actual_tier_idx = start_idx + clicked_tier_idx;
+                                let tier_rect = ratatui::layout::Rect {
+                                    x: 0,
+                                    y: rows_start + tier_top_rel_y,
+                                    width: term_w,
+                                    height: tier_height,
+                                };
                                 if let Some(tier) = tiers.get(actual_tier_idx) {
                                     match tier {
                                         ui::home::ShelfTier::BentoSplit => {
@@ -1507,43 +1661,47 @@ async fn handle_mouse(
                                                     return true;
                                                 }
                                             } else if mx > left_w {
-                                                let right_x = left_w + 1;
-                                                let wl_usable_w = term_w.saturating_sub(right_x + 4);
-                                                let (vis_n, wl_card_w) = ui::home::compute_row_card_metrics(wl_usable_w);
-                                                let wl_pitch = wl_card_w + ui::home::CARD_GAP;
-                                                let inner_x = mx.saturating_sub(right_x + 2);
-                                                let col = (inner_x / wl_pitch) as usize;
-                                                let offset = state.row_offset("watchlist");
-                                                let start = ui::home::row_view_start(offset, home_data.watchlist.len(), vis_n);
-                                                let target_idx = start + col;
-                                                if let Some(anime) = home_data.watchlist.get(target_idx).cloned() {
-                                                    state.active_row = state::CategoryRow::Watchlist;
-                                                    state.row_offsets.insert("watchlist".to_string(), target_idx);
-                                                    open_detail_from_anime(state, anime, pool, tx).await;
-                                                    return true;
+                                                if let Some(target_idx) = ui::home::watchlist_card_index_at(tier_rect, true, state, home_data, mx, my) {
+                                                    if let Some(anime) = home_data.watchlist.get(target_idx).cloned() {
+                                                        state.active_row = state::CategoryRow::Watchlist;
+                                                        state.row_offsets.insert("watchlist".to_string(), target_idx);
+                                                        open_detail_from_anime(state, anime, pool, tx).await;
+                                                        return true;
+                                                    }
                                                 }
                                             }
                                         }
                                         ui::home::ShelfTier::Single(cat_row) => {
-                                            let (key, items): (&str, &[db::cache::Anime]) = match cat_row {
-                                                state::CategoryRow::ContinueWatching => ("continue_watching", &home_data.continue_watching),
-                                                state::CategoryRow::Watchlist        => ("watchlist", &home_data.watchlist),
-                                                state::CategoryRow::Trending         => ("trending", &home_data.trending),
-                                                state::CategoryRow::Popular          => ("popular", &home_data.popular),
-                                                state::CategoryRow::TopRated         => ("top_rated", &home_data.top_rated),
-                                                state::CategoryRow::Seasonal         => ("seasonal", &home_data.seasonal),
-                                            };
-                                            let (vis_n, row_card_w) = ui::home::compute_row_card_metrics(term_w);
-                                            let row_pitch = row_card_w + ui::home::CARD_GAP;
-                                            let col = (mx / row_pitch) as usize;
-                                            let offset = state.row_offset(key);
-                                            let start = ui::home::row_view_start(offset, items.len(), vis_n);
-                                            let target_idx = start + col;
-                                            if let Some(anime) = items.get(target_idx).cloned() {
-                                                state.active_row = cat_row.clone();
-                                                state.row_offsets.insert(key.to_string(), target_idx);
-                                                open_detail_from_anime(state, anime, pool, tx).await;
-                                                return true;
+                                            if *cat_row == state::CategoryRow::Watchlist {
+                                                if let Some(target_idx) = ui::home::watchlist_card_index_at(tier_rect, false, state, home_data, mx, my) {
+                                                    if let Some(anime) = home_data.watchlist.get(target_idx).cloned() {
+                                                        state.active_row = state::CategoryRow::Watchlist;
+                                                        state.row_offsets.insert("watchlist".to_string(), target_idx);
+                                                        open_detail_from_anime(state, anime, pool, tx).await;
+                                                        return true;
+                                                    }
+                                                }
+                                            } else {
+                                                let (key, items): (&str, &[db::cache::Anime]) = match cat_row {
+                                                    state::CategoryRow::ContinueWatching => ("continue_watching", &home_data.continue_watching),
+                                                    state::CategoryRow::Watchlist        => ("watchlist", &home_data.watchlist),
+                                                    state::CategoryRow::Trending         => ("trending", &home_data.trending),
+                                                    state::CategoryRow::Popular          => ("popular", &home_data.popular),
+                                                    state::CategoryRow::TopRated         => ("top_rated", &home_data.top_rated),
+                                                    state::CategoryRow::Seasonal         => ("seasonal", &home_data.seasonal),
+                                                };
+                                                let (vis_n, row_card_w) = ui::home::compute_row_card_metrics(term_w);
+                                                let row_pitch = row_card_w + ui::home::CARD_GAP;
+                                                let col = (mx / row_pitch) as usize;
+                                                let offset = state.row_offset(key);
+                                                let start = ui::home::row_view_start(offset, items.len(), vis_n);
+                                                let target_idx = start + col;
+                                                if let Some(anime) = items.get(target_idx).cloned() {
+                                                    state.active_row = cat_row.clone();
+                                                    state.row_offsets.insert(key.to_string(), target_idx);
+                                                    open_detail_from_anime(state, anime, pool, tx).await;
+                                                    return true;
+                                                }
                                             }
                                         }
                                     }
@@ -1823,7 +1981,10 @@ async fn handle_home(
         KeyCode::Char('a') | KeyCode::Char('A') => {
             trigger_analytics_fetch(state, pool.clone(), tx.clone());
         }
-        KeyCode::Char('L') => state.open_login(),
+        KeyCode::Char('L') => {
+            state.open_login();
+            spawn_merge_audit(pool, &state.auth, tx);
+        }
         KeyCode::Char('t') | KeyCode::Char('T') => {
             state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
             let theme_name = state.theme().name;
@@ -1869,13 +2030,24 @@ async fn handle_home(
                     // Persist to database asynchronously and broadcast
                     let pool2 = pool.clone();
                     let tx2 = tx.clone();
-                    let auth_token = state.auth.token.clone();
-                    let user_id = state.auth.user_id;
+                    let mut auth_clone = state.auth.clone();
+                    let trackers_cfg = cfg.trackers.clone();
                     tokio::spawn(async move {
                         let _ = db::user::remove_continue_watching(&pool2, anime_id).await;
-                        if let Some(token) = auth_token {
+                        if let Some(token) = auth_clone.anilist_token() {
                             let client = api::anilist::AniListClient::with_token(Some(token));
-                            let _ = client.delete_media_list_entry(user_id, anime_id).await;
+                            let _ = client.delete_media_list_entry(auth_clone.anilist.user_id, anime_id).await;
+                            let _ = db::user::delete_tracker_entry(&pool2, anime_id, config::TrackerProvider::AniList).await;
+                        }
+                        if auth_clone.mal.has_write_token() {
+                            let cid = trackers_cfg.resolved_mal_client_id();
+                            let _ = services::scrobble::maybe_refresh_mal_token(&mut auth_clone, cid.as_deref(), now).await;
+                            if let Some(tok) = auth_clone.mal_token() {
+                                if let Some(mid) = anime.mal_id.or(db::cache::get_mal_id_for_anime(&pool2, anime_id).await.ok().flatten()) {
+                                    let _ = api::mal::MalClient::with_token(cid.clone(), Some(tok)).delete_list_entry(mid).await;
+                                    let _ = db::user::delete_tracker_entry(&pool2, anime_id, config::TrackerProvider::Mal).await;
+                                }
+                            }
                         }
                         if let Ok(cw) = services::sync::load_continue_watching(&pool2).await {
                             let _ = tx2.send(AppMessage::ContinueWatchingUpdated(cw)).await;
@@ -1884,35 +2056,7 @@ async fn handle_home(
                 }
             } else if state.active_row == state::CategoryRow::Watchlist {
                 if let Some(anime) = active_anime(state, home_data) {
-                    let now = unix_now();
-                    let anime_id = anime.id;
-                    let title = anime.display_title().to_string();
-
-                    home_data.watchlist.retain(|a| a.id != anime_id);
-                    let max_idx = home_data.watchlist.len().saturating_sub(1);
-                    let offset = state.row_offset("watchlist").min(max_idx);
-                    state.row_offsets.insert("watchlist".to_string(), offset);
-
-                    if home_data.watchlist.is_empty() {
-                        state.active_row = next_non_empty_row(&state.active_row, home_data, 1);
-                    }
-                    refresh_home_cover(state, home_data, pool, tx);
-                    state.show_toast(format!("󰅖 Removed \"{}\" from Watchlist", title), now);
-
-                    let pool2 = pool.clone();
-                    let tx2 = tx.clone();
-                    let auth_token = state.auth.token.clone();
-                    let user_id = state.auth.user_id;
-                    tokio::spawn(async move {
-                        let _ = db::user::remove_from_watchlist(&pool2, anime_id).await;
-                        if let Some(token) = auth_token {
-                            let client = api::anilist::AniListClient::with_token(Some(token));
-                            let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                        }
-                        if let Ok(wl) = services::sync::load_watchlist(&pool2).await {
-                            let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                        }
-                    });
+                    trigger_watchlist_remove_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
                 }
             } else if state.now_playing.is_some() {
                 state.stop_player();
@@ -1934,38 +2078,11 @@ async fn handle_home(
         // Toggle watchlist for the highlighted card directly from Home
         KeyCode::Char('+') => {
             if let Some(anime) = active_anime(state, home_data) {
-                let now   = unix_now();
-                let anime_id = anime.id;
-                let in_wl = db::user::is_in_watchlist(pool, anime_id).await.unwrap_or(false);
-                let auth_token = state.auth.token.clone();
-                let user_id = state.auth.user_id;
-
+                let in_wl = db::user::is_in_watchlist(pool, anime.id).await.unwrap_or(false);
                 if in_wl {
-                    if db::user::remove_from_watchlist(pool, anime_id).await.is_ok() {
-                        state.show_toast("Removed from watchlist", now);
-                        let pool2 = pool.clone();
-                        let tx2   = tx.clone();
-                        tokio::spawn(async move {
-                            if let Some(token) = auth_token {
-                                let client = api::anilist::AniListClient::with_token(Some(token));
-                                let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                            }
-                            let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                            let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                        });
-                    }
-                } else if db::user::add_to_watchlist(pool, anime_id, now).await.is_ok() {
-                    state.show_toast("Added to watchlist", now);
-                    let pool2 = pool.clone();
-                    let tx2   = tx.clone();
-                    tokio::spawn(async move {
-                        if let Some(token) = auth_token {
-                            let client = api::anilist::AniListClient::with_token(Some(token));
-                            let _ = client.save_planning_entry(anime_id).await;
-                        }
-                        let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                        let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                    });
+                    trigger_watchlist_remove_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
+                } else {
+                    trigger_watchlist_add_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
                 }
             }
         }
@@ -1978,11 +2095,17 @@ async fn handle_home(
             let tx2   = tx.clone();
             let auth2 = state.auth.clone();
             tokio::spawn(async move {
-                let client = api::anilist::AniListClient::with_token(auth2.token.clone());
+                let client = api::anilist::AniListClient::with_token(auth2.anilist_token());
+                let mal_cid = cfg2.trackers.resolved_mal_client_id();
                 let now    = unix_now();
                 let result = services::sync::sync_all(
-                    &pool2, &client, Some(&auth2),
-                    cfg2.cache.trending_ttl, cfg2.cache.stable_ttl, now,
+                    &pool2,
+                    &client,
+                    Some(&auth2),
+                    mal_cid.as_deref(),
+                    cfg2.cache.trending_ttl,
+                    cfg2.cache.stable_ttl,
+                    now,
                 )
                 .await;
                 match result {
@@ -2699,10 +2822,11 @@ async fn handle_detail(
 
         // Toggle Watched status for the highlighted episode
         KeyCode::Char('w') | KeyCode::Char('W') => {
-            if let (Some(ref anime), Some(ep)) = (&state.selected_anime, state.selected_episode) {
-                let anime_id = anime.id;
+            if let (Some(anime_clone), Some(ep)) = (state.selected_anime.clone(), state.selected_episode) {
+                let anime_id = anime_clone.id;
                 let is_watched = state.watched_episodes.contains(&ep);
                 let pool2 = pool.clone();
+                let tx2 = tx.clone();
                 let now = unix_now();
                 if is_watched {
                     state.watched_episodes.remove(&ep);
@@ -2717,8 +2841,24 @@ async fn handle_detail(
                 } else {
                     state.watched_episodes.insert(ep);
                     state.show_toast(format!("󰄬 Episode {} marked watched", ep), now);
+                    let mut auth_clone = state.auth.clone();
+                    let trackers_cfg = cfg.trackers.clone();
                     tokio::spawn(async move {
                         let _ = db::user::record_watched(&pool2, anime_id, ep as i64, now).await;
+                        if auth_clone.is_authenticated() {
+                            let outcome = services::scrobble::sync_episode_watched_all(
+                                &pool2,
+                                &anime_clone,
+                                ep,
+                                &mut auth_clone,
+                                &trackers_cfg,
+                                now,
+                            )
+                            .await;
+                            if outcome.anilist_synced || outcome.mal_synced || !outcome.warnings.is_empty() {
+                                let _ = tx2.send(AppMessage::ScrobbleSyncToast(outcome.summary)).await;
+                            }
+                        }
                     });
                 }
             }
@@ -2767,60 +2907,34 @@ async fn handle_detail(
 
                 let pool2 = pool.clone();
                 let tx2 = tx.clone();
-                let auth_token = state.auth.token.clone();
-                let user_id = state.auth.user_id;
+                let mut auth_clone = state.auth.clone();
+                let trackers_cfg = cfg.trackers.clone();
                 tokio::spawn(async move {
                     let _ = db::user::remove_continue_watching(&pool2, anime_id).await;
-                    let _ = db::user::remove_from_watchlist(&pool2, anime_id).await;
-                    if let Some(token) = auth_token {
-                        let client = api::anilist::AniListClient::with_token(Some(token));
-                        let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                    }
+                    let _ = services::scrobble::remove_watchlist_from_target(
+                        &pool2,
+                        &anime,
+                        config::WatchlistTarget::Both,
+                        &mut auth_clone,
+                        &trackers_cfg,
+                        now,
+                    )
+                    .await;
                     if let Ok(cw) = services::sync::load_continue_watching(&pool2).await {
                         let _ = tx2.send(AppMessage::ContinueWatchingUpdated(cw)).await;
                     }
-                    if let Ok(wl) = services::sync::load_watchlist(&pool2).await {
-                        let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                    }
+                    broadcast_watchlist(&pool2, &tx2).await;
                 });
             }
         }
 
-        // Watchlist toggle — updates home row immediately via WatchlistUpdated
+        // Watchlist toggle — updates live across databases via interactive Target Picker
         KeyCode::Char('+') => {
             if let Some(anime) = state.selected_anime.clone() {
-                let anime_id = anime.id;
-                let now = unix_now();
-                let auth_token = state.auth.token.clone();
-                let user_id = state.auth.user_id;
                 if state.in_watchlist {
-                    if db::user::remove_from_watchlist(pool, anime_id).await.is_ok() {
-                        state.in_watchlist = false;
-                        state.show_toast("Removed from watchlist", now);
-                        let pool2 = pool.clone();
-                        let tx2   = tx.clone();
-                        tokio::spawn(async move {
-                            if let Some(token) = auth_token {
-                                let client = api::anilist::AniListClient::with_token(Some(token));
-                                let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                            }
-                            let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                            let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                        });
-                    }
-                } else if db::user::add_to_watchlist(pool, anime_id, now).await.is_ok() {
-                    state.in_watchlist = true;
-                    state.show_toast("Added to watchlist", now);
-                    let pool2 = pool.clone();
-                    let tx2   = tx.clone();
-                    tokio::spawn(async move {
-                        if let Some(token) = auth_token {
-                            let client = api::anilist::AniListClient::with_token(Some(token));
-                            let _ = client.save_planning_entry(anime_id).await;
-                        }
-                        let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                        let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                    });
+                    trigger_watchlist_remove_flow(anime, true, None, state, pool, cfg, tx).await;
+                } else {
+                    trigger_watchlist_add_flow(anime, true, None, state, pool, cfg, tx).await;
                 }
             }
         }
@@ -3480,6 +3594,7 @@ async fn execute_hub_action(
         }
         AniListSync => {
             state.open_login();
+            spawn_merge_audit(pool, &state.auth, tx);
         }
     }
 }
@@ -3549,188 +3664,1159 @@ fn handle_setup(
     }
 }
 
-async fn handle_login(
-    key:        event::KeyEvent,
-    state:      &mut AppState,
-    _home_data: &mut ui::home::HomeData,
-    pool:       &sqlx::SqlitePool,
-    _cfg:       &config::Config,
-    tx:         &tokio::sync::mpsc::Sender<AppMessage>,
+async fn broadcast_watchlist(pool: &sqlx::SqlitePool, tx: &tokio::sync::mpsc::Sender<AppMessage>) {
+    if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(pool).await {
+        let _ = tx.send(AppMessage::WatchlistUpdated(wl, sources)).await;
+    }
+}
+
+fn spawn_merge_audit(
+    pool: &sqlx::SqlitePool,
+    auth: &config::AuthConfig,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
-    // If import stats modal is showing, Enter or Esc dismisses it and returns to Home
-    if state.import_stats.is_some() {
-        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-            state.import_stats = None;
-            state.go_back();
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = auth.merge_policy;
+    tokio::spawn(async move {
+        if let Ok(report) = services::tracker_merge::build_merge_audit(&pool2, policy).await {
+            let _ = tx2.send(AppMessage::MergeAuditReady(report)).await;
+        }
+    });
+}
+
+async fn trigger_watchlist_add_flow(
+    anime: db::cache::Anime,
+    from_detail: bool,
+    home_data_opt: Option<&mut ui::home::HomeData>,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    _cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let _ = db::cache::upsert_anime(pool, &anime).await;
+    if state.auth.is_authenticated() {
+        state.open_watchlist_prompt(anime, state::WatchlistPromptMode::Add, from_detail);
+        return;
+    }
+
+    let now = unix_now();
+    if db::user::add_to_watchlist(pool, anime.id, now).await.is_ok() {
+        if from_detail {
+            state.in_watchlist = true;
+        }
+        if state.screen == Screen::Calendar {
+            state.calendar_tracked_ids.insert(anime.id);
+        }
+        state.show_toast("Added to Solus Watchlist (Local)", now);
+        if let Some(hd) = home_data_opt {
+            if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(pool).await {
+                hd.watchlist = wl;
+                hd.watchlist_sources = sources;
+            }
+        } else {
+            let pool2 = pool.clone();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                broadcast_watchlist(&pool2, &tx2).await;
+            });
+        }
+    }
+}
+
+async fn trigger_watchlist_remove_flow(
+    anime: db::cache::Anime,
+    from_detail: bool,
+    home_data_opt: Option<&mut ui::home::HomeData>,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let source = home_data_opt
+        .as_ref()
+        .and_then(|hd| hd.watchlist_sources.get(&anime.id).copied())
+        .unwrap_or(
+            db::user::get_anime_watchlist_source(pool, anime.id)
+                .await
+                .unwrap_or(db::user::WatchlistSource::Local),
+        );
+
+    if source == db::user::WatchlistSource::Both {
+        state.open_watchlist_prompt(anime, state::WatchlistPromptMode::RemoveShared, from_detail);
+        return;
+    }
+
+    let target = match source {
+        db::user::WatchlistSource::AniList => config::WatchlistTarget::AniList,
+        db::user::WatchlistSource::Mal => config::WatchlistTarget::Mal,
+        db::user::WatchlistSource::Both => config::WatchlistTarget::Both,
+        db::user::WatchlistSource::Local => config::WatchlistTarget::Local,
+    };
+
+    let now = unix_now();
+    let title = anime.display_title().to_string();
+    if let Some(hd) = home_data_opt {
+        hd.watchlist.retain(|a| a.id != anime.id);
+        hd.watchlist_sources.remove(&anime.id);
+        let max_idx = hd.watchlist.len().saturating_sub(1);
+        let offset = state.row_offset("watchlist").min(max_idx);
+        state.row_offsets.insert("watchlist".to_string(), offset);
+        if hd.watchlist.is_empty() && state.active_row == state::CategoryRow::Watchlist {
+            state.active_row = next_non_empty_row(&state.active_row, hd, 1);
+        }
+        refresh_home_cover(state, hd, pool, tx);
+    }
+    if from_detail {
+        state.in_watchlist = false;
+    }
+    state.show_toast(
+        format!("Removing \"{}\" ({})...", title, source.divider_label()),
+        now,
+    );
+
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let mut auth_clone = state.auth.clone();
+    let trackers_cfg = cfg.trackers.clone();
+    tokio::spawn(async move {
+        let outcome = services::scrobble::remove_watchlist_from_target(
+            &pool2,
+            &anime,
+            target,
+            &mut auth_clone,
+            &trackers_cfg,
+            now,
+        )
+        .await
+        .unwrap_or_default();
+        let (wl, sources) = services::sync::load_watchlist_with_sources(&pool2)
+            .await
+            .unwrap_or_default();
+        let still_in_wl = db::user::is_in_watchlist(&pool2, anime.id).await.unwrap_or(false);
+        let _ = tx2
+            .send(AppMessage::WatchlistWritebackCompleted {
+                anime_id: anime.id,
+                removed_completely: !still_in_wl,
+                added_to_wl: false,
+                outcome_summary: outcome.summary,
+                wl,
+                sources,
+            })
+            .await;
+    });
+}
+
+async fn commit_watchlist_target(
+    prompt: state::WatchlistTargetPrompt,
+    target: config::WatchlistTarget,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let now = unix_now();
+    let anime = prompt.anime;
+    let is_add = prompt.mode == state::WatchlistPromptMode::Add;
+    let target_label = match target {
+        config::WatchlistTarget::Both => "Both (AniList + MAL)",
+        config::WatchlistTarget::AniList => "AniList",
+        config::WatchlistTarget::Mal => "MyAnimeList",
+        config::WatchlistTarget::Local => "Local Solus",
+    };
+
+    if is_add {
+        if prompt.from_detail {
+            state.in_watchlist = true;
+        }
+        state.show_toast(format!("Adding \"{}\" to {target_label}...", anime.display_title()), now);
+    } else {
+        state.show_toast(format!("Updating {target_label} database..."), now);
+    }
+
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let mut auth_clone = state.auth.clone();
+    let trackers_cfg = cfg.trackers.clone();
+    tokio::spawn(async move {
+        let outcome = if is_add {
+            services::scrobble::add_watchlist_to_target(
+                &pool2,
+                &anime,
+                target,
+                &mut auth_clone,
+                &trackers_cfg,
+                now,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            services::scrobble::remove_watchlist_from_target(
+                &pool2,
+                &anime,
+                target,
+                &mut auth_clone,
+                &trackers_cfg,
+                now,
+            )
+            .await
+            .unwrap_or_default()
+        };
+
+        let (wl, sources) = services::sync::load_watchlist_with_sources(&pool2)
+            .await
+            .unwrap_or_default();
+        let still_in_wl = db::user::is_in_watchlist(&pool2, anime.id).await.unwrap_or(false);
+        let _ = tx2
+            .send(AppMessage::WatchlistWritebackCompleted {
+                anime_id: anime.id,
+                removed_completely: !still_in_wl,
+                added_to_wl: is_add,
+                outcome_summary: outcome.summary,
+                wl,
+                sources,
+            })
+            .await;
+    });
+}
+
+async fn handle_watchlist_target_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    _home_data: &mut ui::home::HomeData,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.watchlist_target_prompt = None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(ref mut p) = state.watchlist_target_prompt {
+                p.cursor = if p.cursor == 0 { 3 } else { p.cursor - 1 };
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(ref mut p) = state.watchlist_target_prompt {
+                p.cursor = (p.cursor + 1) % 4;
+            }
+        }
+        KeyCode::Char('1') => {
+            if let Some(p) = state.watchlist_target_prompt.take() {
+                let target = p.options_for_mode()[0];
+                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+            }
+        }
+        KeyCode::Char('2') => {
+            if let Some(p) = state.watchlist_target_prompt.take() {
+                let target = p.options_for_mode()[1];
+                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+            }
+        }
+        KeyCode::Char('3') => {
+            if let Some(p) = state.watchlist_target_prompt.take() {
+                let target = p.options_for_mode()[2];
+                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+            }
+        }
+        KeyCode::Char('4') => {
+            if let Some(p) = state.watchlist_target_prompt.take() {
+                let target = p.options_for_mode()[3];
+                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(p) = state.watchlist_target_prompt.take() {
+                let target = p.selected_target();
+                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn spawn_provider_oauth(
+    provider: config::TrackerProvider,
+    client_id: String,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    state.cancel_pending_oauth();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    state.oauth_cancel_tx = Some(cancel_tx);
+    state.oauth_pending = Some(provider);
+
+    let nonce = services::oauth::generate_state_nonce();
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = state.auth.merge_policy;
+    let existing = state.auth.account(provider).clone();
+
+    match provider {
+        config::TrackerProvider::AniList => {
+            let auth_url = services::oauth::build_anilist_authorize_url(&client_id);
+            let _ = services::oauth::open_browser(&auth_url);
+            state.login_status = Some(
+                "Opened AniList sign-in in browser. Complete authorization to enable live sync.".into(),
+            );
+            tokio::spawn(async move {
+                let res: std::result::Result<(config::TrackerAccount, services::tracker_merge::MergeReport, ui::home::HomeData, String), String> =
+                    async {
+                        let oauth = services::oauth::await_anilist_browser_oauth(cancel_rx)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let viewer = services::oauth::verify_anilist_token(&oauth.access_token)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let now = unix_now();
+                        let client = api::anilist::AniListClient::with_token(Some(oauth.access_token.clone()));
+                        let entries = client
+                            .detailed_user_entries(viewer.user_id, now)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let snaps = services::tracker_merge::anilist_records_to_snapshots(&entries);
+                        let report = services::tracker_merge::merge_and_reconcile(
+                            &pool2,
+                            &[config::TrackerProvider::AniList],
+                            &snaps,
+                            policy,
+                            vec![],
+                            now,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let home = services::sync::load_cached_home_data(&pool2)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let account = config::TrackerAccount {
+                            token: Some(oauth.access_token),
+                            refresh_token: None,
+                            expires_at: None,
+                            user_id: Some(viewer.user_id),
+                            username: Some(viewer.username.clone()),
+                            avatar_url: viewer.avatar_url,
+                            sync_mode: Some("OAuth2 Live".into()),
+                            last_imported_file: existing.last_imported_file,
+                            last_sync_time: Some(now),
+                        };
+                        let msg = format!("✓ AniList OAuth connected (@{}, {} entries)", viewer.username, entries.len());
+                        Ok((account, report, home, msg))
+                    }
+                    .await;
+
+                match res {
+                    Ok((account, report, home, summary)) => {
+                        let _ = tx2
+                            .send(AppMessage::TrackerSyncCompleted {
+                                provider: config::TrackerProvider::AniList,
+                                account,
+                                report,
+                                home_data: Box::new(home),
+                                summary,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx2
+                            .send(AppMessage::TrackerSyncFailed(config::TrackerProvider::AniList, e))
+                            .await;
+                    }
+                }
+            });
+        }
+        config::TrackerProvider::Mal => {
+            let verifier = services::oauth::generate_pkce_verifier();
+            let auth_url = services::oauth::build_mal_authorize_url(&client_id, &verifier, &nonce);
+            let _ = services::oauth::open_browser(&auth_url);
+            state.login_status = Some(
+                "Opened MyAnimeList OAuth2 in browser. Authorize Solus to enable live MAL sync.".into(),
+            );
+            tokio::spawn(async move {
+                let res: std::result::Result<(config::TrackerAccount, services::tracker_merge::MergeReport, ui::home::HomeData, String), String> =
+                    async {
+                        let tokens = services::oauth::await_mal_browser_oauth(
+                            client_id.clone(),
+                            verifier,
+                            nonce,
+                            cancel_rx,
+                            unix_now,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let now = unix_now();
+                        let mc = api::mal::MalClient::with_token(Some(client_id.clone()), Some(tokens.access_token.clone()));
+                        let me = mc.fetch_me().await.map_err(|e| e.to_string())?;
+                        let mal_entries = mc
+                            .fetch_user_animelist("@me")
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let al_public = api::anilist::AniListClient::new();
+                        let (snaps, unresolved) =
+                            services::tracker_merge::resolve_mal_entries_to_canonical(
+                                &pool2,
+                                &al_public,
+                                &mal_entries,
+                                now,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let report = services::tracker_merge::merge_and_reconcile(
+                            &pool2,
+                            &[config::TrackerProvider::Mal],
+                            &snaps,
+                            policy,
+                            unresolved,
+                            now,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let home = services::sync::load_cached_home_data(&pool2)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let account = config::TrackerAccount {
+                            token: Some(tokens.access_token),
+                            refresh_token: tokens.refresh_token,
+                            expires_at: tokens.expires_at,
+                            user_id: Some(me.id),
+                            username: Some(me.name.clone()),
+                            avatar_url: me.picture,
+                            sync_mode: Some("OAuth2 Live".into()),
+                            last_imported_file: existing.last_imported_file,
+                            last_sync_time: Some(now),
+                        };
+                        let msg = format!("✓ MyAnimeList OAuth connected (@{}, {} entries)", me.name, mal_entries.len());
+                        Ok((account, report, home, msg))
+                    }
+                    .await;
+
+                match res {
+                    Ok((account, report, home, summary)) => {
+                        let _ = tx2
+                            .send(AppMessage::TrackerSyncCompleted {
+                                provider: config::TrackerProvider::Mal,
+                                account,
+                                report,
+                                home_data: Box::new(home),
+                                summary,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx2
+                            .send(AppMessage::TrackerSyncFailed(config::TrackerProvider::Mal, e))
+                            .await;
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn spawn_provider_username_sync(
+    provider: config::TrackerProvider,
+    username: String,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = state.auth.merge_policy;
+    let mal_cid = cfg.trackers.resolved_mal_client_id();
+    let existing = state.auth.account(provider).clone();
+
+    state.login_status = Some(format!(
+        "Pulling public {} list for @{}...",
+        provider.display_name(),
+        username
+    ));
+
+    tokio::spawn(async move {
+        let now = unix_now();
+        let res: std::result::Result<(config::TrackerAccount, services::tracker_merge::MergeReport, ui::home::HomeData, String), String> =
+            match provider {
+                config::TrackerProvider::AniList => async {
+                    let al = api::anilist::AniListClient::new();
+                    let (viewer, entries) = al
+                        .detailed_public_user_entries(&username, now)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let snaps = services::tracker_merge::anilist_records_to_snapshots(&entries);
+                    let report = services::tracker_merge::merge_and_reconcile(
+                        &pool2,
+                        &[config::TrackerProvider::AniList],
+                        &snaps,
+                        policy,
+                        vec![],
+                        now,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let home = services::sync::load_cached_home_data(&pool2)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let account = config::TrackerAccount {
+                        token: existing.token,
+                        refresh_token: existing.refresh_token,
+                        expires_at: existing.expires_at,
+                        user_id: Some(viewer.id),
+                        username: Some(viewer.name.clone()),
+                        avatar_url: viewer.avatar_url,
+                        sync_mode: Some("Public Username".into()),
+                        last_imported_file: existing.last_imported_file,
+                        last_sync_time: Some(now),
+                    };
+                    let msg = format!("✓ Synced AniList @{} ({} entries)", viewer.name, entries.len());
+                    Ok((account, report, home, msg))
+                }
+                .await,
+                config::TrackerProvider::Mal => async {
+                    let mc = api::mal::MalClient::new(mal_cid.clone(), None);
+                    let mal_entries = mc
+                        .fetch_user_animelist(&username)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let al_public = api::anilist::AniListClient::new();
+                    let (snaps, unresolved) =
+                        services::tracker_merge::resolve_mal_entries_to_canonical(
+                            &pool2,
+                            &al_public,
+                            &mal_entries,
+                            now,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let report = services::tracker_merge::merge_and_reconcile(
+                        &pool2,
+                        &[config::TrackerProvider::Mal],
+                        &snaps,
+                        policy,
+                        unresolved,
+                        now,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let home = services::sync::load_cached_home_data(&pool2)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let account = config::TrackerAccount {
+                        token: existing.token,
+                        refresh_token: existing.refresh_token,
+                        expires_at: existing.expires_at,
+                        user_id: existing.user_id,
+                        username: Some(username.clone()),
+                        avatar_url: existing.avatar_url,
+                        sync_mode: Some("Public Username".into()),
+                        last_imported_file: existing.last_imported_file,
+                        last_sync_time: Some(now),
+                    };
+                    let msg = format!("✓ Synced MyAnimeList @{} ({} entries, 0 duplicates)", username, mal_entries.len());
+                    Ok((account, report, home, msg))
+                }
+                .await,
+            };
+
+        match res {
+            Ok((account, report, home, summary)) => {
+                let _ = tx2
+                    .send(AppMessage::TrackerSyncCompleted {
+                        provider,
+                        account,
+                        report,
+                        home_data: Box::new(home),
+                        summary,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx2.send(AppMessage::TrackerSyncFailed(provider, e)).await;
+            }
+        }
+    });
+}
+
+fn spawn_provider_token_sync(
+    provider: config::TrackerProvider,
+    token: String,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = state.auth.merge_policy;
+    let mal_cid = cfg.trackers.resolved_mal_client_id();
+    let existing = state.auth.account(provider).clone();
+
+    state.login_status = Some(format!(
+        "Verifying {} access token & syncing...",
+        provider.display_name()
+    ));
+
+    tokio::spawn(async move {
+        let now = unix_now();
+        let res: std::result::Result<(config::TrackerAccount, services::tracker_merge::MergeReport, ui::home::HomeData, String), String> =
+            match provider {
+                config::TrackerProvider::AniList => async {
+                    let viewer = services::oauth::verify_anilist_token(&token)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let client = api::anilist::AniListClient::with_token(Some(token.clone()));
+                    let entries = client
+                        .detailed_user_entries(viewer.user_id, now)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let snaps = services::tracker_merge::anilist_records_to_snapshots(&entries);
+                    let report = services::tracker_merge::merge_and_reconcile(
+                        &pool2,
+                        &[config::TrackerProvider::AniList],
+                        &snaps,
+                        policy,
+                        vec![],
+                        now,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let home = services::sync::load_cached_home_data(&pool2)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let account = config::TrackerAccount {
+                        token: Some(token),
+                        refresh_token: None,
+                        expires_at: None,
+                        user_id: Some(viewer.user_id),
+                        username: Some(viewer.username.clone()),
+                        avatar_url: viewer.avatar_url,
+                        sync_mode: Some("OAuth2 Token".into()),
+                        last_imported_file: existing.last_imported_file,
+                        last_sync_time: Some(now),
+                    };
+                    let msg = format!("✓ Connected AniList @{} via Token ({} entries)", viewer.username, entries.len());
+                    Ok((account, report, home, msg))
+                }
+                .await,
+                config::TrackerProvider::Mal => async {
+                    let mc = api::mal::MalClient::with_token(mal_cid.clone(), Some(token.clone()));
+                    let me = mc.fetch_me().await.map_err(|e| e.to_string())?;
+                    let mal_entries = mc
+                        .fetch_user_animelist("@me")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let al_public = api::anilist::AniListClient::new();
+                    let (snaps, unresolved) =
+                        services::tracker_merge::resolve_mal_entries_to_canonical(
+                            &pool2,
+                            &al_public,
+                            &mal_entries,
+                            now,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let report = services::tracker_merge::merge_and_reconcile(
+                        &pool2,
+                        &[config::TrackerProvider::Mal],
+                        &snaps,
+                        policy,
+                        unresolved,
+                        now,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let home = services::sync::load_cached_home_data(&pool2)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let account = config::TrackerAccount {
+                        token: Some(token),
+                        refresh_token: existing.refresh_token,
+                        expires_at: existing.expires_at,
+                        user_id: Some(me.id),
+                        username: Some(me.name.clone()),
+                        avatar_url: me.picture,
+                        sync_mode: Some("OAuth2 Token".into()),
+                        last_imported_file: existing.last_imported_file,
+                        last_sync_time: Some(now),
+                    };
+                    let msg = format!("✓ Connected MAL @{} via Token ({} entries)", me.name, mal_entries.len());
+                    Ok((account, report, home, msg))
+                }
+                .await,
+            };
+
+        match res {
+            Ok((account, report, home, summary)) => {
+                let _ = tx2
+                    .send(AppMessage::TrackerSyncCompleted {
+                        provider,
+                        account,
+                        report,
+                        home_data: Box::new(home),
+                        summary,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx2.send(AppMessage::TrackerSyncFailed(provider, e)).await;
+            }
+        }
+    });
+}
+
+fn spawn_reconcile_policy_only(
+    pool: &sqlx::SqlitePool,
+    auth: &config::AuthConfig,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = auth.merge_policy;
+    tokio::spawn(async move {
+        let now = unix_now();
+        if let Ok(report) =
+            services::tracker_merge::merge_and_reconcile(&pool2, &[], &[], policy, vec![], now).await
+        {
+            if let Ok(home) = services::sync::load_cached_home_data(&pool2).await {
+                let _ = tx2
+                    .send(AppMessage::ParityPushCompleted {
+                        summary: format!("✓ Applied Merge Rule: {}", policy.label()),
+                        report,
+                        home_data: Box::new(home),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn spawn_parity_push(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let diffs = state
+        .merge_report
+        .as_ref()
+        .map(|r| r.conflict_diffs.clone())
+        .unwrap_or_default();
+    if diffs.is_empty() {
+        state.login_status = Some("✓ Zero lagging diffs to push.".into());
+        return;
+    }
+
+    state.login_status = Some(format!("Pushing {} parity update(s) to websites...", diffs.len()));
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let mut auth2 = state.auth.clone();
+    let trackers2 = cfg.trackers.clone();
+    tokio::spawn(async move {
+        let now = unix_now();
+        let outcome =
+            services::scrobble::push_parity_diffs(&pool2, &diffs, &mut auth2, &trackers2, now).await;
+        let report = services::tracker_merge::merge_and_reconcile(
+            &pool2,
+            &[],
+            &[],
+            auth2.merge_policy,
+            vec![],
+            now,
+        )
+        .await
+        .unwrap_or_default();
+        let home = services::sync::load_cached_home_data(&pool2)
+            .await
+            .unwrap_or_else(|_| ui::home::HomeData::empty());
+        let _ = tx2
+            .send(AppMessage::ParityPushCompleted {
+                summary: outcome.summary,
+                report,
+                home_data: Box::new(home),
+            })
+            .await;
+    });
+}
+
+fn spawn_refresh_all_connected(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if !state.auth.has_anilist() && !state.auth.has_mal() {
+        state.login_status = Some("Connect AniList or MyAnimeList first.".into());
+        return;
+    }
+
+    state.login_status = Some("Refreshing connected tracker snapshots...".into());
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let mut auth2 = state.auth.clone();
+    let trackers2 = cfg.trackers.clone();
+    let cfg_ttl_tr = cfg.cache.trending_ttl;
+    let cfg_ttl_st = cfg.cache.stable_ttl;
+    tokio::spawn(async move {
+        let now = unix_now();
+        let mal_cid = trackers2.resolved_mal_client_id();
+        let _ = services::scrobble::maybe_refresh_mal_token(&mut auth2, mal_cid.as_deref(), now).await;
+        let client = api::anilist::AniListClient::with_token(auth2.anilist_token());
+        match services::sync::sync_all(
+            &pool2,
+            &client,
+            Some(&auth2),
+            mal_cid.as_deref(),
+            cfg_ttl_tr,
+            cfg_ttl_st,
+            now,
+        )
+        .await
+        {
+            Ok(home) => {
+                let report =
+                    services::tracker_merge::build_merge_audit(&pool2, auth2.merge_policy)
+                        .await
+                        .unwrap_or_default();
+                let _ = tx2
+                    .send(AppMessage::ParityPushCompleted {
+                        summary: format!(
+                            "✓ Refreshed lists: {} unique shows (0 duplicates)",
+                            report.unified_unique_count
+                        ),
+                        report,
+                        home_data: Box::new(home),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx2
+                    .send(AppMessage::TrackerSyncFailed(
+                        config::TrackerProvider::AniList,
+                        e.to_string(),
+                    ))
+                    .await;
+            }
+        }
+    });
+}
+
+async fn handle_login(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    _home_data: &mut ui::home::HomeData,
+    pool: &sqlx::SqlitePool,
+    cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    // 1. Waiting on browser OAuth2 loopback callback
+    if let Some(pending_provider) = state.oauth_pending {
+        match key.code {
+            KeyCode::Esc => {
+                state.cancel_pending_oauth();
+                state.login_status = Some("Browser OAuth2 cancelled.".into());
+            }
+            KeyCode::Char('t') => {
+                state.cancel_pending_oauth();
+                state.account_input_mode = state::AccountInputMode::ManualToken(pending_provider);
+                state.account_text_input.clear();
+                state.login_status = None;
+            }
+            _ => {}
         }
         return;
     }
 
-    match key.code {
-        KeyCode::Esc => state.go_back(),
+    // 2. Typing Mode (explicit isolation so shortcut letters never hijack username/token typing)
+    if state.account_input_mode != state::AccountInputMode::None {
+        match key.code {
+            KeyCode::Esc => {
+                state.account_input_mode = state::AccountInputMode::None;
+                state.account_text_input.clear();
+            }
+            KeyCode::Backspace => {
+                state.account_text_input.pop();
+            }
+            KeyCode::Char(c) => {
+                state.account_text_input.push(c);
+            }
+            KeyCode::Enter => {
+                let input = state.account_text_input.trim().to_string();
+                let mode = state.account_input_mode;
+                if input.is_empty() {
+                    state.login_status = Some("! Input cannot be empty.".into());
+                    return;
+                }
+                state.account_input_mode = state::AccountInputMode::None;
+                state.account_text_input.clear();
+                match mode {
+                    state::AccountInputMode::PublicUsername(provider) => {
+                        spawn_provider_username_sync(provider, input, state, pool, cfg, tx);
+                    }
+                    state::AccountInputMode::ManualToken(provider) => {
+                        spawn_provider_token_sync(provider, input, state, pool, cfg, tx);
+                    }
+                    state::AccountInputMode::ClientId(provider) => {
+                        match provider {
+                            config::TrackerProvider::AniList => {
+                                cfg.trackers.anilist_client_id = Some(input);
+                            }
+                            config::TrackerProvider::Mal => {
+                                cfg.trackers.mal_client_id = Some(input);
+                            }
+                        }
+                        if let Err(e) = cfg.save() {
+                            state.login_status = Some(format!("! Failed saving Client ID: {e}"));
+                        } else {
+                            state.login_status = Some(format!(
+                                "✓ Saved {} OAuth Client ID! Press [o] to launch Browser OAuth.",
+                                provider.display_name()
+                            ));
+                        }
+                    }
+                    state::AccountInputMode::None => {}
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
 
-        // Tab switching via 1/2/3 when input is empty
-        KeyCode::Char('1') if state.login_token_input.is_empty() => {
+    // 3. Navigation Mode across [1] Live Trackers, [2] Merge & Conflicts, [3] Archives & Vault
+    match key.code {
+        KeyCode::Esc => {
+            state.cancel_pending_oauth();
+            state.go_back();
+        }
+        KeyCode::Char('1') => {
             state.account_sync_tab = 0;
             state.login_status = None;
         }
-        KeyCode::Char('2') if state.login_token_input.is_empty() => {
+        KeyCode::Char('2') => {
             state.account_sync_tab = 1;
             state.login_status = None;
+            spawn_merge_audit(pool, &state.auth, tx);
         }
-        KeyCode::Char('3') if state.login_token_input.is_empty() => {
+        KeyCode::Char('3') => {
             state.account_sync_tab = 2;
             state.login_status = None;
-        }
-
-        // Tab 0: Cycle / auto-fill detected files
-        KeyCode::Tab if state.account_sync_tab == 0 => {
-            if !state.detected_export_files.is_empty() {
-                let idx = state.detected_file_cursor % state.detected_export_files.len();
-                let path = &state.detected_export_files[idx];
-                state.login_token_input = path.display().to_string();
-                state.detected_file_cursor = (state.detected_file_cursor + 1) % state.detected_export_files.len();
+            state.detected_export_files = services::importer::detect_export_files();
+            if state.detected_file_cursor >= state.detected_export_files.len() {
+                state.detected_file_cursor = 0;
             }
         }
-
-        // Disconnect account if authenticated and input is empty
-        KeyCode::Char('x') if state.login_token_input.is_empty() && state.auth.is_authenticated() => {
-            let _ = state.auth.clear();
-            state.login_status = Some("Library unlinked. Local database retained.".to_string());
-            state.show_toast("Library unlinked", unix_now());
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+            if state.account_sync_tab == 0 =>
+        {
+            state.account_focus_provider = match state.account_focus_provider {
+                config::TrackerProvider::AniList => config::TrackerProvider::Mal,
+                config::TrackerProvider::Mal => config::TrackerProvider::AniList,
+            };
         }
-
-        // Re-sync shortcut if authenticated via username
-        KeyCode::Char('r') if state.login_token_input.is_empty() && state.auth.is_authenticated() => {
-            if let Some(ref username) = state.auth.username.clone() {
-                state.login_status = Some(format!("Re-syncing library for @{}...", username));
-                let pool2 = pool.clone();
-                let tx2 = tx.clone();
-                let u = username.clone();
-                tokio::spawn(async move {
-                    let client = api::anilist::AniListClient::new();
-                    let now = unix_now();
-                    let res = match client.public_user_collection(&u, now).await {
-                        Ok((viewer, coll)) => {
-                            let entries = services::importer::collection_to_entries(coll);
-                            match services::importer::import_entries_to_db(&pool2, &entries, now).await {
-                                Ok(stats) => Ok((viewer, stats)),
-                                Err(e) => Err(e.to_string()),
-                            }
-                        }
-                        Err(e) => Err(e.to_string()),
+        KeyCode::Char('m') => {
+            state.auth.merge_policy = state.auth.merge_policy.next();
+            let _ = state.auth.save();
+            spawn_reconcile_policy_only(pool, &state.auth, tx);
+        }
+        KeyCode::Char('a') => {
+            state.auth.auto_scrobble_both = !state.auth.auto_scrobble_both;
+            let _ = state.auth.save();
+            state.login_status = Some(if state.auth.auto_scrobble_both {
+                "✓ Auto-scrobble enabled for BOTH AniList + MyAnimeList.".into()
+            } else {
+                "Auto-scrobble set to Primary Tracker Only.".into()
+            });
+        }
+        KeyCode::Char('r') => {
+            spawn_refresh_all_connected(state, pool, cfg, tx);
+        }
+        _ => match state.account_sync_tab {
+            0 => match key.code {
+                KeyCode::Char('o') => {
+                    let provider = state.account_focus_provider;
+                    let cid_opt = match provider {
+                        config::TrackerProvider::AniList => cfg.trackers.resolved_anilist_client_id(),
+                        config::TrackerProvider::Mal => cfg.trackers.resolved_mal_client_id(),
                     };
-                    let _ = tx2.send(AppMessage::PublicSyncCompleted(res)).await;
-                });
-            }
-        }
-
-        KeyCode::Backspace => {
-            state.login_token_input.pop();
-        }
-
-        KeyCode::Enter => {
-            match state.account_sync_tab {
-                // Tab 0: Local JSON archive ingestion
-                0 => {
-                    let mut input = state.login_token_input.trim().to_string();
-                    if input.is_empty() && !state.detected_export_files.is_empty() {
-                        input = state.detected_export_files[0].display().to_string();
-                    }
-                    if input.is_empty() {
-                        state.login_status = Some("Please specify a JSON file path or press [Tab] to select a detected file.".to_string());
-                        return;
-                    }
-
-                    // Strip accidental wrapping quotes from file drag-and-drop
-                    let clean_input = input.trim_matches('\'').trim_matches('"').trim();
-                    let resolved_path = if let Some(stripped) = clean_input.strip_prefix("~/") {
-                        if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
-                            home.join(stripped)
-                        } else {
-                            std::path::PathBuf::from(clean_input)
-                        }
+                    if let Some(cid) = cid_opt {
+                        spawn_provider_oauth(provider, cid, state, pool, tx);
                     } else {
-                        std::path::PathBuf::from(clean_input)
+                        state.account_input_mode = state::AccountInputMode::ClientId(provider);
+                        state.account_text_input.clear();
+                        state.login_status = Some(format!(
+                            "Set {} Client ID once to enable 1-click browser OAuth (or [t] Token / [u] Username).",
+                            provider.display_name()
+                        ));
+                    }
+                }
+                KeyCode::Char('u') => {
+                    let p = state.account_focus_provider;
+                    state.account_text_input = state
+                        .auth
+                        .account(p)
+                        .username
+                        .clone()
+                        .unwrap_or_default();
+                    state.account_input_mode = state::AccountInputMode::PublicUsername(p);
+                }
+                KeyCode::Char('t') => {
+                    let p = state.account_focus_provider;
+                    state.account_text_input.clear();
+                    state.account_input_mode = state::AccountInputMode::ManualToken(p);
+                }
+                KeyCode::Char('k') => {
+                    let p = state.account_focus_provider;
+                    state.account_text_input = match p {
+                        config::TrackerProvider::AniList => cfg.trackers.resolved_anilist_client_id().unwrap_or_default(),
+                        config::TrackerProvider::Mal => cfg.trackers.resolved_mal_client_id().unwrap_or_default(),
                     };
-
-                    if !resolved_path.exists() {
-                        state.login_status = Some(format!("Archive not found: {}", resolved_path.display()));
-                        return;
-                    }
-
-                    state.login_status = Some("Parsing and hydrating database from archive...".to_string());
-                    let pool2 = pool.clone();
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move {
-                        let res = match std::fs::read_to_string(&resolved_path) {
-                            Ok(content) => match services::importer::parse_anime_export_json(&content) {
-                                Ok(entries) => {
-                                    let now = unix_now();
-                                    services::importer::import_entries_to_db(&pool2, &entries, now)
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                }
-                                Err(e) => Err(e.to_string()),
-                            },
-                            Err(e) => Err(format!("Failed to read file: {e}")),
-                        };
-                        let _ = tx2.send(AppMessage::ArchiveImportCompleted(res)).await;
-                    });
+                    state.account_input_mode = state::AccountInputMode::ClientId(p);
                 }
-
-                // Tab 1: Public Username live sync
-                1 => {
-                    let username = state.login_token_input.trim().to_string();
-                    if username.is_empty() {
-                        state.login_status = Some("Please enter an AniList username.".to_string());
-                        return;
+                KeyCode::Char('x') => {
+                    let p = state.account_focus_provider;
+                    if state.auth.account(p).is_connected() {
+                        let _ = state.auth.clear_provider(p);
+                        let _ = state.auth.save();
+                        let _ = db::user::clear_provider_tracker_entries(pool, p).await;
+                        spawn_reconcile_policy_only(pool, &state.auth, tx);
+                        state.login_status = Some(format!(
+                            "Unlinked {} (other tracker & local vault preserved).",
+                            p.display_name()
+                        ));
+                        state.show_toast(format!("Unlinked {}", p.display_name()), unix_now());
                     }
-
-                    state.login_status = Some(format!("Connecting to AniList public API for @{}...", username));
-                    let pool2 = pool.clone();
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move {
-                        let client = api::anilist::AniListClient::new();
-                        let now = unix_now();
-                        let res = match client.public_user_collection(&username, now).await {
-                            Ok((viewer, coll)) => {
-                                let entries = services::importer::collection_to_entries(coll);
-                                match services::importer::import_entries_to_db(&pool2, &entries, now).await {
-                                    Ok(stats) => Ok((viewer, stats)),
-                                    Err(e) => Err(e.to_string()),
-                                }
-                            }
-                            Err(e) => Err(e.to_string()),
-                        };
-                        let _ = tx2.send(AppMessage::PublicSyncCompleted(res)).await;
-                    });
                 }
-
-                // Tab 2: Export backup
-                _ => {
-                    state.login_status = Some("Generating Solus JSON backup archive...".to_string());
+                _ => {}
+            },
+            1 => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if state.merge_diff_cursor > 0 {
+                        state.merge_diff_cursor -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = state
+                        .merge_report
+                        .as_ref()
+                        .map(|r| r.conflict_diffs.len())
+                        .unwrap_or(0);
+                    if state.merge_diff_cursor + 1 < len {
+                        state.merge_diff_cursor += 1;
+                    }
+                }
+                KeyCode::Char('P') => {
+                    spawn_parity_push(state, pool, cfg, tx);
+                }
+                _ => {}
+            },
+            _ => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if state.detected_file_cursor > 0 {
+                        state.detected_file_cursor -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.detected_file_cursor + 1 < state.detected_export_files.len() {
+                        state.detected_file_cursor += 1;
+                    }
+                }
+                KeyCode::Char('s') => {
+                    state.detected_export_files = services::importer::detect_export_files();
+                    state.detected_file_cursor = 0;
+                    state.login_status = Some(format!(
+                        "Scanned Downloads: {} file(s) found.",
+                        state.detected_export_files.len()
+                    ));
+                }
+                KeyCode::Char('e') => {
+                    state.login_status = Some("Generating Solus backup JSON...".into());
                     let pool2 = pool.clone();
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
-                        let dest = match config::Config::config_dir() {
-                            Ok(d) => d.join("solus_backup.json"),
-                            Err(_) => std::path::PathBuf::from("solus_backup.json"),
-                        };
+                        let dest = directories::UserDirs::new()
+                            .and_then(|u| u.download_dir().map(|d| d.join("solus_backup.json")))
+                            .or_else(|| config::Config::config_dir().ok().map(|d| d.join("solus_backup.json")))
+                            .unwrap_or_else(|| std::path::PathBuf::from("solus_backup.json"));
                         let res = services::importer::export_library_to_json(&pool2, &dest)
                             .await
                             .map_err(|e| e.to_string());
                         let _ = tx2.send(AppMessage::BackupExportCompleted(res)).await;
                     });
                 }
-            }
-        }
+                KeyCode::Enter => {
+                    let Some(path) = state.detected_export_files.get(state.detected_file_cursor).cloned() else {
+                        state.login_status = Some("No export file selected.".into());
+                        return;
+                    };
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("export")
+                        .to_string();
+                    let lower = name.to_lowercase();
+                    let pool2 = pool.clone();
+                    let tx2 = tx.clone();
+                    let policy = state.auth.merge_policy;
 
-        KeyCode::Char(c) => {
-            state.login_token_input.push(c);
-        }
-
-        _ => {}
+                    if lower.ends_with(".xml") || lower.ends_with(".xml.gz") {
+                        state.login_status = Some(format!("Resolving & importing MAL XML ({name})..."));
+                        tokio::spawn(async move {
+                            let res: std::result::Result<(services::tracker_merge::MergeReport, String, usize, Box<ui::home::HomeData>), String> =
+                                async {
+                                    let entries = services::importer::parse_mal_xml_file(&path)
+                                        .map_err(|e| e.to_string())?;
+                                    let count = entries.len();
+                                    let now = unix_now();
+                                    let al = api::anilist::AniListClient::new();
+                                    let (snaps, unresolved) =
+                                        services::tracker_merge::resolve_mal_entries_to_canonical(
+                                            &pool2,
+                                            &al,
+                                            &entries,
+                                            now,
+                                        )
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    let report = services::tracker_merge::merge_and_reconcile(
+                                        &pool2,
+                                        &[config::TrackerProvider::Mal],
+                                        &snaps,
+                                        policy,
+                                        unresolved,
+                                        now,
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                    let home = services::sync::load_cached_home_data(&pool2)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    Ok((report, name, count, Box::new(home)))
+                                }
+                                .await;
+                            let _ = tx2.send(AppMessage::MalXmlImportCompleted(res)).await;
+                        });
+                    } else {
+                        state.login_status = Some(format!("Importing JSON archive ({name})..."));
+                        tokio::spawn(async move {
+                            let res = match std::fs::read_to_string(&path) {
+                                Ok(content) => match services::importer::parse_anime_export_json(&content) {
+                                    Ok(entries) => {
+                                        let now = unix_now();
+                                        services::importer::import_entries_to_db(&pool2, &entries, now)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    }
+                                    Err(e) => Err(e.to_string()),
+                                },
+                                Err(e) => Err(format!("Failed to read file: {e}")),
+                            };
+                            let _ = tx2.send(AppMessage::ArchiveImportCompleted(res)).await;
+                        });
+                    }
+                }
+                _ => {}
+            },
+        },
     }
 }
 
@@ -3990,7 +5076,7 @@ fn spawn_calendar_week_fetch(
         state.is_loading_calendar = true;
     }
     let bounds = services::calendar::compute_week_bounds(now, tz_offset_secs, week_offset);
-    let auth_token = state.auth.token.clone();
+    let auth_token = state.auth.anilist_token();
     tokio::spawn(async move {
         let client = api::anilist::AniListClient::with_token(auth_token);
         match client
@@ -4126,7 +5212,7 @@ fn switch_calendar_week(
 async fn handle_calendar(
     key: event::KeyEvent,
     state: &mut AppState,
-    home_data: &ui::home::HomeData,
+    _home_data: &ui::home::HomeData,
     pool: &sqlx::SqlitePool,
     cfg: &config::Config,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
@@ -4260,38 +5346,13 @@ async fn handle_calendar(
         }
         KeyCode::Char('+') => {
             if let Some(entry) = focused_calendar_entry(state) {
-                let anime_id = entry.anime().id;
-                let now = unix_now();
-                let auth_token = state.auth.token.clone();
-                let user_id = state.auth.user_id;
-                let removed = if db::user::is_in_watchlist(pool, anime_id).await.unwrap_or(false) {
-                    let _ = db::user::remove_from_watchlist(pool, anime_id).await;
-                    if !home_data.continue_watching.iter().any(|a| a.id == anime_id) {
-                        state.calendar_tracked_ids.remove(&anime_id);
-                    }
-                    state.show_toast("Removed from watchlist", now);
-                    true
+                let anime = entry.anime().clone();
+                let in_wl = db::user::is_in_watchlist(pool, anime.id).await.unwrap_or(false);
+                if in_wl {
+                    trigger_watchlist_remove_flow(anime, false, None, state, pool, cfg, tx).await;
                 } else {
-                    let _ = db::cache::upsert_anime(pool, entry.anime()).await;
-                    let _ = db::user::add_to_watchlist(pool, anime_id, now).await;
-                    state.calendar_tracked_ids.insert(anime_id);
-                    state.show_toast("Added to watchlist", now);
-                    false
-                };
-                let pool2 = pool.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    if let Some(token) = auth_token {
-                        let client = api::anilist::AniListClient::with_token(Some(token));
-                        if removed {
-                            let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                        } else {
-                            let _ = client.save_planning_entry(anime_id).await;
-                        }
-                    }
-                    let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                    let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                });
+                    trigger_watchlist_add_flow(anime, false, None, state, pool, cfg, tx).await;
+                }
             }
         }
         _ => {}
@@ -4705,33 +5766,12 @@ async fn handle_tailored_results(
         }
         KeyCode::Char('+') => {
             if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor).cloned() {
-                let anime_id = focused.anime.id;
-                let now = unix_now();
-                let auth_token = state.auth.token.clone();
-                let user_id = state.auth.user_id;
-                let removed = if db::user::is_in_watchlist(pool, anime_id).await.unwrap_or(false) {
-                    let _ = db::user::remove_from_watchlist(pool, anime_id).await;
-                    state.show_toast("Removed from watchlist", now);
-                    true
+                let in_wl = db::user::is_in_watchlist(pool, focused.anime.id).await.unwrap_or(false);
+                if in_wl {
+                    trigger_watchlist_remove_flow(focused.anime, false, None, state, pool, cfg, tx).await;
                 } else {
-                    let _ = db::user::add_to_watchlist(pool, anime_id, now).await;
-                    state.show_toast("Added to watchlist", now);
-                    false
-                };
-                let pool2 = pool.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    if let Some(token) = auth_token {
-                        let client = api::anilist::AniListClient::with_token(Some(token));
-                        if removed {
-                            let _ = client.delete_media_list_entry(user_id, anime_id).await;
-                        } else {
-                            let _ = client.save_planning_entry(anime_id).await;
-                        }
-                    }
-                    let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
-                    let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
-                });
+                    trigger_watchlist_add_flow(focused.anime, false, None, state, pool, cfg, tx).await;
+                }
             }
         }
         _ => {}
@@ -4967,7 +6007,8 @@ async fn start_playback(
         sock_path,
         pool: pool.clone(),
         tx: tx.clone(),
-        auth_token: state.auth.token.clone(),
+        auth: state.auth.clone(),
+        trackers: cfg.trackers.clone(),
         skip_intervals,
         auto_skip_intro: cfg.auto_skip_intro,
     };

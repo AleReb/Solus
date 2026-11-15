@@ -107,16 +107,30 @@ pub async fn load_continue_watching(pool: &SqlitePool) -> Result<Vec<cache::Anim
     Ok(result)
 }
 
-/// Resolve Watchlist IDs into full Anime structs (max 20, most recently added first).
-pub async fn load_watchlist(pool: &SqlitePool) -> Result<Vec<cache::Anime>> {
-    let ids = user::get_watchlist(pool).await?;
-    let mut result = Vec::new();
-    for id in ids.iter().take(20) {
-        if let Some(anime) = cache::get_anime(pool, *id).await? {
+/// Resolve Watchlist IDs into full Anime structs paired with per-show tracker provenance.
+pub async fn load_watchlist_with_sources(
+    pool: &SqlitePool,
+) -> Result<(Vec<cache::Anime>, HashMap<i64, user::WatchlistSource>)> {
+    let id_sources = user::get_watchlist_with_sources(pool).await?;
+    let mut result = Vec::with_capacity(id_sources.len());
+    let mut sources = HashMap::with_capacity(id_sources.len());
+    let mut seen = HashSet::with_capacity(id_sources.len());
+    for (id, source) in id_sources {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(anime) = cache::get_anime(pool, id).await? {
+            sources.insert(id, source);
             result.push(anime);
         }
     }
-    Ok(result)
+    Ok((result, sources))
+}
+
+/// Resolve Watchlist IDs into full Anime structs grouped cleanly without duplicates.
+pub async fn load_watchlist(pool: &SqlitePool) -> Result<Vec<cache::Anime>> {
+    let (list, _) = load_watchlist_with_sources(pool).await?;
+    Ok(list)
 }
 
 fn collect_candidate_pool(
@@ -371,14 +385,14 @@ pub async fn load_more_like_this(
 /// Load HomeData directly from the local SQLite cache without any network requests.
 /// Runs in < 15ms to allow instant (<50ms) cold launch.
 pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
-    let (trending, popular, top_rated, seasonal, continue_entries, continue_watching, watchlist) = tokio::join!(
+    let (trending, popular, top_rated, seasonal, continue_entries, continue_watching, watchlist_pack) = tokio::join!(
         cache::get_category(pool, meta::TRENDING),
         cache::get_category(pool, meta::POPULAR),
         cache::get_category(pool, meta::TOP_RATED),
         cache::get_category(pool, meta::SEASONAL),
         user::get_continue_watching(pool),
         load_continue_watching(pool),
-        load_watchlist(pool),
+        load_watchlist_with_sources(pool),
     );
 
     let trending          = trending.unwrap_or_default();
@@ -387,7 +401,7 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     let seasonal          = seasonal.unwrap_or_default();
     let continue_entries  = continue_entries.unwrap_or_default();
     let continue_watching = continue_watching.unwrap_or_default();
-    let watchlist         = watchlist.unwrap_or_default();
+    let (watchlist, watchlist_sources) = watchlist_pack.unwrap_or_default();
     let featured          = trending.first().cloned();
     let resume_next: HashMap<i64, u32> = continue_entries
         .into_iter()
@@ -450,6 +464,7 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
         featured,
         continue_watching,
         watchlist,
+        watchlist_sources,
         progress_labels,
         resume_next,
         trending,
@@ -459,34 +474,102 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     })
 }
 
-/// Sync every category (respecting TTLs) and return a fully populated HomeData.
+/// Sync every category (respecting TTLs) + connected trackers (AniList + MAL) and return unified HomeData.
 /// Called in background on startup and again when the user explicitly refreshes.
 pub async fn sync_all(
     pool:             &SqlitePool,
     client:           &AniListClient,
     auth:             Option<&crate::config::AuthConfig>,
+    mal_client_id:    Option<&str>,
     trending_ttl:     u64,
     stable_ttl:       u64,
     now:              i64,
 ) -> Result<HomeData> {
-    // If authenticated with AniList, batch sync user watching list & planning list into DB atomically
-    if let Some(auth_cfg) = auth {
-        if auth_cfg.is_authenticated() {
-            let uid = match auth_cfg.user_id {
-                Some(id) => Some(id),
-                None => client.viewer().await.ok().map(|v| v.id),
+    if let Some(auth_ref) = auth {
+        let mut auth_cfg = auth_ref.clone();
+        let _ = crate::services::scrobble::maybe_refresh_mal_token(&mut auth_cfg, mal_client_id, now).await;
+
+        let mut replaced_providers = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut unresolved_mal = Vec::new();
+
+        // 1) Pull AniList (authenticated viewer OR public username read-only)
+        if auth_cfg.has_anilist() {
+            let al_res = if auth_cfg.anilist.token.is_some() {
+                let uid = match auth_cfg.anilist.user_id {
+                    Some(id) => Some(id),
+                    None => client.viewer().await.ok().map(|v| v.id),
+                };
+                if let Some(user_id) = uid {
+                    Some(client.detailed_user_entries(user_id, now).await)
+                } else {
+                    None
+                }
+            } else if let Some(uname) = auth_cfg.anilist.username.as_deref() {
+                Some(
+                    AniListClient::new()
+                        .detailed_public_user_entries(uname, now)
+                        .await
+                        .map(|(_, entries)| entries),
+                )
+            } else {
+                None
             };
-            if let Some(user_id) = uid {
-                let dismissed_wl = user::get_dismissed_ids(pool, "watchlist").await.unwrap_or_default();
-                let dismissed_cw = user::get_dismissed_ids(pool, "continue_watching").await.unwrap_or_default();
-                if let Ok(coll) = client.user_collection(user_id, now).await {
-                    let _ = user::batch_sync_user_collection(pool, &coll, &dismissed_cw, &dismissed_wl, now).await;
+
+            if let Some(Ok(entries)) = al_res {
+                replaced_providers.push(crate::config::TrackerProvider::AniList);
+                snapshots.extend(crate::services::tracker_merge::anilist_records_to_snapshots(&entries));
+            }
+        }
+
+        // 2) Pull MyAnimeList (OAuth2 Bearer OR public username / Jikan fallback)
+        if auth_cfg.has_mal() {
+            let mal_cid_owned = mal_client_id.map(str::to_string);
+            let mal_client = if let Some(tok) = auth_cfg.mal_token() {
+                Some((
+                    crate::api::mal::MalClient::with_token(mal_cid_owned, Some(tok)),
+                    "@me".to_string(),
+                ))
+            } else if let Some(uname) = auth_cfg.mal.username.as_ref().filter(|s| !s.trim().is_empty()) {
+                Some((crate::api::mal::MalClient::new(mal_cid_owned, None), uname.clone()))
+            } else {
+                None
+            };
+
+            if let Some((mc, target_user)) = mal_client {
+                if let Ok(mal_entries) = mc.fetch_user_animelist(&target_user).await {
+                    let public_al = AniListClient::new();
+                    if let Ok((mal_snaps, unresolved)) =
+                        crate::services::tracker_merge::resolve_mal_entries_to_canonical(
+                            pool,
+                            &public_al,
+                            &mal_entries,
+                            now,
+                        )
+                        .await
+                    {
+                        replaced_providers.push(crate::config::TrackerProvider::Mal);
+                        snapshots.extend(mal_snaps);
+                        unresolved_mal = unresolved;
+                    }
                 }
             }
         }
+
+        if !replaced_providers.is_empty() {
+            let _ = crate::services::tracker_merge::merge_and_reconcile(
+                pool,
+                &replaced_providers,
+                &snapshots,
+                auth_cfg.merge_policy,
+                unresolved_mal,
+                now,
+            )
+            .await;
+        }
     }
 
-    // Run all syncs concurrently — each category checks TTL, updates SQLite, and marks synced
+    // Run all catalog syncs concurrently — each category checks TTL, updates SQLite, and marks synced
     let _ = tokio::join!(
         sync_category(pool, client, meta::TRENDING,  trending_ttl, now),
         sync_category(pool, client, meta::POPULAR,   stable_ttl,   now),
@@ -590,6 +673,7 @@ mod tests {
             has_dub:       0,
             updated_at:    now,
             next_airing_episode: None,
+            mal_id: None,
         };
         upsert_anime(&pool, &anime).await.unwrap();
         cache::upsert_category(&pool, meta::TRENDING, &[1], now).await.unwrap();
@@ -623,6 +707,7 @@ mod tests {
             has_dub:       0,
             updated_at:    1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         }
     }
 
@@ -645,6 +730,7 @@ mod tests {
             has_dub:       0,
             updated_at:    1_000_000,
             next_airing_episode: None,
+            mal_id: None,
         }
     }
 

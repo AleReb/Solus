@@ -19,6 +19,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ImportedAnimeEntry {
     pub id: i64,
+    pub mal_id: Option<i64>,
     pub title_romaji: String,
     pub title_english: Option<String>,
     pub title_native: Option<String>,
@@ -38,6 +39,7 @@ impl ImportedAnimeEntry {
         let genres = anime.genre_list();
         Self {
             id: anime.id,
+            mal_id: anime.mal_id,
             title_romaji: anime.title_romaji,
             title_english: anime.title_english,
             title_native: anime.title_native,
@@ -98,14 +100,21 @@ pub fn detect_export_files() -> Vec<PathBuf> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
+                    let fname_lower = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                    if ext.eq_ignore_ascii_case("json") {
-                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                        if name.contains("animelist")
-                            || name.contains("anilist")
-                            || name.contains("anime_list")
-                            || name.contains("mal_export")
-                            || name.contains("solus_backup")
+                    let is_mal_xml = ext.eq_ignore_ascii_case("xml")
+                        || fname_lower.ends_with(".xml.gz");
+                    if ext.eq_ignore_ascii_case("json") || is_mal_xml {
+                        if fname_lower.contains("animelist")
+                            || fname_lower.contains("anilist")
+                            || fname_lower.contains("anime_list")
+                            || fname_lower.contains("mal_export")
+                            || fname_lower.contains("solus_backup")
+                            || is_mal_xml
                         {
                             detected.push(path);
                         }
@@ -227,8 +236,14 @@ fn parse_single_anilist_entry(entry: &serde_json::Value, fallback_status: &str) 
         .and_then(|c| c.as_str())
         .map(|s| s.to_string());
 
+    let mal_id = media
+        .get("idMal")
+        .or_else(|| entry.get("mal_id"))
+        .and_then(|i| i.as_i64());
+
     Some(ImportedAnimeEntry {
         id,
+        mal_id,
         title_romaji,
         title_english,
         title_native,
@@ -259,8 +274,14 @@ fn parse_flat_entry(entry: &serde_json::Value) -> Option<ImportedAnimeEntry> {
     let total_episodes = entry.get("total_episodes").or_else(|| entry.get("episodes")).and_then(|e| e.as_i64());
     let score = entry.get("score").and_then(|s| s.as_i64());
 
+    let mal_id = entry
+        .get("mal_id")
+        .or_else(|| entry.get("idMal"))
+        .and_then(|i| i.as_i64());
+
     Some(ImportedAnimeEntry {
         id,
+        mal_id,
         title_romaji,
         title_english,
         title_native: None,
@@ -307,6 +328,7 @@ pub async fn import_entries_to_db(
             has_dub: 0,
             updated_at: now,
             next_airing_episode: None,
+            mal_id: entry.mal_id,
         };
 
         let _ = cache::upsert_anime(pool, &anime).await;
@@ -373,6 +395,7 @@ pub async fn export_library_to_json(pool: &SqlitePool, dest_path: &Path) -> Resu
         if let Ok(Some(anime)) = cache::get_anime(pool, id).await {
             export_items.push(serde_json::json!({
                 "id": anime.id,
+                "mal_id": anime.mal_id,
                 "title_romaji": anime.title_romaji,
                 "title_english": anime.title_english,
                 "status": "PLANNING",
@@ -388,6 +411,7 @@ pub async fn export_library_to_json(pool: &SqlitePool, dest_path: &Path) -> Resu
         if let Ok(Some(anime)) = cache::get_anime(pool, entry.anime_id).await {
             export_items.push(serde_json::json!({
                 "id": anime.id,
+                "mal_id": anime.mal_id,
                 "title_romaji": anime.title_romaji,
                 "title_english": anime.title_english,
                 "status": "CURRENT",
@@ -408,6 +432,117 @@ pub async fn export_library_to_json(pool: &SqlitePool, dest_path: &Path) -> Resu
     std::fs::write(dest_path, content)?;
 
     Ok(count)
+}
+
+fn decode_xml_entities(input: &str) -> String {
+    let trimmed = input.trim();
+    let unwrapped = if let Some(rest) = trimmed.strip_prefix("<![CDATA[") {
+        rest.strip_suffix("]]>").unwrap_or(rest)
+    } else {
+        trimmed
+    };
+    unwrapped
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#039;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
+}
+
+fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    Some(decode_xml_entities(&block[start..end]))
+}
+
+/// Parse an official MyAnimeList `.xml` string export into normalized `MalListEntry` items.
+pub fn parse_mal_xml_str(xml: &str) -> Result<Vec<crate::api::mal::MalListEntry>, AppError> {
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = xml[cursor..].find("<anime>") {
+        let block_start = cursor + rel_start + "<anime>".len();
+        let Some(rel_end) = xml[block_start..].find("</anime>") else {
+            break;
+        };
+        let block_end = block_start + rel_end;
+        let block = &xml[block_start..block_end];
+        cursor = block_end + "</anime>".len();
+
+        let mal_id = extract_xml_tag(block, "series_animedb_id")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if mal_id <= 0 {
+            continue;
+        }
+        let title = extract_xml_tag(block, "series_title")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("MAL #{mal_id}"));
+        let total_episodes = extract_xml_tag(block, "series_episodes")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&n| n > 0);
+        let watched_episodes = extract_xml_tag(block, "my_watched_episodes")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let score = extract_xml_tag(block, "my_score")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&n| n > 0);
+        let status = extract_xml_tag(block, "my_status").unwrap_or_else(|| "Plan to Watch".into());
+
+        entries.push(crate::api::mal::MalListEntry {
+            mal_id,
+            title,
+            title_english: None,
+            status: crate::api::mal::normalize_mal_status(&status).to_string(),
+            progress: watched_episodes,
+            total_episodes,
+            score: score.map(|s| (s * 10).clamp(0, 100)),
+            format: None,
+            season: None,
+            season_year: None,
+            genres: Vec::new(),
+            updated_at: None,
+            cover_url: None,
+        });
+    }
+
+    if entries.is_empty() && !xml.contains("<myanimelist") {
+        return Err(AppError::Parse(
+            "File is not a recognized MyAnimeList XML export.".into(),
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// Read a MyAnimeList `.xml` or `.xml.gz` export file and parse all entries.
+pub fn parse_mal_xml_file(path: &Path) -> Result<Vec<crate::api::mal::MalListEntry>, AppError> {
+    use std::io::Read;
+    let bytes = std::fs::read(path)?;
+    let is_gz = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gz"))
+        .unwrap_or(false)
+        || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b);
+
+    let xml = if is_gz {
+        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut out = String::new();
+        decoder.read_to_string(&mut out).map_err(|e| {
+            AppError::Parse(format!("Failed to decompress MAL .xml.gz export: {e}"))
+        })?;
+        out
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
+    parse_mal_xml_str(&xml)
 }
 
 #[cfg(test)]
@@ -486,5 +621,50 @@ mod tests {
         assert_eq!(entries[0].title_romaji, "Sousou no Frieren");
         assert_eq!(entries[0].status, "COMPLETED");
         assert_eq!(entries[0].progress, 28);
+    }
+
+    #[test]
+    fn test_parse_mal_xml_and_gzip_export() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <myanimelist>
+            <anime>
+                <series_animedb_id>52991</series_animedb_id>
+                <series_title><![CDATA[Sousou no Frieren & Beyond]]></series_title>
+                <series_episodes>28</series_episodes>
+                <my_watched_episodes>14</my_watched_episodes>
+                <my_score>10</my_score>
+                <my_status>Watching</my_status>
+            </anime>
+            <anime>
+                <series_animedb_id>9253</series_animedb_id>
+                <series_title>Steins;Gate</series_title>
+                <series_episodes>24</series_episodes>
+                <my_watched_episodes>0</my_watched_episodes>
+                <my_score>0</my_score>
+                <my_status>Plan to Watch</my_status>
+            </anime>
+        </myanimelist>"#;
+
+        let parsed = parse_mal_xml_str(xml).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].mal_id, 52991);
+        assert_eq!(parsed[0].title, "Sousou no Frieren & Beyond");
+        assert_eq!(parsed[0].progress, 14);
+        assert_eq!(parsed[0].score, Some(100));
+        assert_eq!(parsed[1].mal_id, 9253);
+        assert_eq!(parsed[1].score, None);
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(xml.as_bytes()).unwrap();
+        let gz_bytes = enc.finish().unwrap();
+        let tmp = std::env::temp_dir().join("solus_mal_test_export.xml.gz");
+        std::fs::write(&tmp, gz_bytes).unwrap();
+        let parsed_gz = parse_mal_xml_file(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(parsed_gz.len(), 2);
+        assert_eq!(parsed_gz[0].mal_id, 52991);
     }
 }
