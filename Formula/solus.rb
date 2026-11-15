@@ -1,13 +1,16 @@
 class Solus < Formula
-  desc "High-definition terminal anime theatre, discovery crucible, and AniList companion"
+  desc "High-definition terminal anime theatre, discovery crucible, and AniList/MAL companion"
   homepage "https://github.com/abdullah-binmadhi/Solus"
-  version "1.0.6"
+  version "1.0.7-rolling"
 
   if Hardware::CPU.arm?
-    url "https://github.com/abdullah-binmadhi/Solus/releases/download/v1.0.6/solus-macos-aarch64"
+    url "https://github.com/abdullah-binmadhi/Solus/releases/download/v1.0.7-rolling/solus-macos-aarch64"
   else
-    url "https://github.com/abdullah-binmadhi/Solus/releases/download/v1.0.6/solus-macos-x86_64"
+    url "https://github.com/abdullah-binmadhi/Solus/releases/download/v1.0.7-rolling/solus-macos-x86_64"
   end
+
+  depends_on "ani-cli"
+  depends_on "mpv"
 
   def install
     bin.install Dir["solus-macos-*"].first => "solus"
