@@ -1026,7 +1026,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Screen::Help => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
-                        ui::help::render_overlay(frame);
+                        ui::help::render_overlay(frame, &state);
                     }
                     Screen::Settings => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
@@ -1172,9 +1172,9 @@ async fn handle_key(
         Screen::PlaybackOptions => handle_playback_options(key, state, pool, cfg, tx).await,
         Screen::Playback => handle_playback(key, state, pool, cfg, tx).await,
         Screen::Search   => handle_search(key, state, pool, tx).await,
-        Screen::Help     => { state.go_back(); }
+        Screen::Help     => handle_help(key, state),
         Screen::Settings => handle_settings(key, state, pool, cfg, tx).await,
-        Screen::Setup    => handle_setup(key, state).await,
+        Screen::Setup    => handle_setup(key, state, cfg),
         Screen::AniListLogin => handle_login(key, state, home_data, pool, cfg, tx).await,
         Screen::TailoredWizard => handle_tailored_wizard(key, state),
         Screen::TailoredSummary => handle_tailored_summary(key, state, pool, tx).await,
@@ -1442,7 +1442,6 @@ async fn handle_mouse(
                             Wizard => KeyCode::Char('w'),
                             Analytics => KeyCode::Char('a'),
                             Remote => KeyCode::Char('m'),
-                            Doctor => KeyCode::Char('!'),
                             Theme => KeyCode::Char('T'),
                             Login => KeyCode::Char('L'),
                             StopPlayback => KeyCode::Char('X'),
@@ -3485,15 +3484,65 @@ async fn execute_hub_action(
     }
 }
 
-async fn handle_setup(
+fn handle_help(
     key: event::KeyEvent,
     state: &mut AppState,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => state.go_back(),
+        KeyCode::Char('s') => state.open_settings(),
+        KeyCode::Char('!') => state.open_setup(),
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
+            let name = state.theme().name;
+            state.show_toast(format!("Theme: {}", name), unix_now());
+        }
+        _ => {}
+    }
+}
+
+fn handle_setup(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    cfg: &mut config::Config,
 ) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => state.go_back(),
         KeyCode::Char('r') => {
             refresh_dependency_status(state);
             state.show_toast("Dependency check refreshed", unix_now());
+        }
+        KeyCode::Char('p')
+        | KeyCode::Right
+        | KeyCode::Char('l')
+        | KeyCode::Left
+        | KeyCode::Char('h') => {
+            let players = ui::setup::supported_players();
+            let cur = players.iter().position(|&p| p == cfg.player).unwrap_or(0) as isize;
+            let step = if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+                -1
+            } else {
+                1
+            };
+            let next_idx = (cur + step).rem_euclid(players.len() as isize) as usize;
+            let next = players[next_idx];
+            cfg.player = next;
+            if let Some(pos) = state.playback_players.iter().position(|p| *p == next) {
+                state.playback_player_cursor = pos;
+            }
+            let _ = cfg.save();
+            let msg = if ui::setup::player_installed(next, state) {
+                format!("Player switched to {}", next.as_str())
+            } else {
+                format!("Player set to {} (binary missing in PATH)", next.as_str())
+            };
+            state.show_toast(msg, unix_now());
+        }
+        KeyCode::Char('u') => {
+            state.toggle_anime4k();
+            cfg.anime4k_mode = state.anime4k_mode;
+            let _ = cfg.save();
+            state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
         }
         KeyCode::Char('s') => state.open_settings(),
         _ => {}

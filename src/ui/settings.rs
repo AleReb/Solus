@@ -608,6 +608,77 @@ fn render_inspector_card(
             ];
             frame.render_widget(Paragraph::new(update_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
+        HubActionId::HealthDoctor => {
+            let ok_fg = Color::Rgb(80, 250, 123);
+            let bad_fg = Color::Rgb(255, 95, 95);
+            let status_span = |label: &str, ok: bool| -> Vec<Span<'static>> {
+                vec![
+                    Span::styled(
+                        format!("{:<8}", label),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if ok { "[READY]  " } else { "[ABSENT] " },
+                        Style::default()
+                            .fg(if ok { ok_fg } else { bad_fg })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]
+            };
+
+            let mut row1 = vec![Span::raw("  ")];
+            row1.extend(status_span("ani-cli", state.has_ani_cli));
+            row1.extend(status_span("mpv", state.has_mpv));
+
+            let mut row2 = vec![Span::raw("  ")];
+            if cfg!(target_os = "macos") {
+                row2.extend(status_span("iina", state.has_iina));
+            }
+            row2.extend(status_span("vlc", state.has_vlc));
+
+            let install_cmd = if cfg!(target_os = "macos") {
+                "brew install ani-cli mpv"
+            } else {
+                "sudo pacman -S ani-cli mpv   # or apt install mpv vlc"
+            };
+
+            let doctor_lines = vec![
+                Line::from(Span::styled(
+                    "  Binary Probe & Runtime Pipeline:",
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(row1),
+                Line::from(row2),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Engine: ", Style::default().fg(Color::Rgb(150, 155, 180))),
+                    Span::styled(
+                        cfg.player.as_str().to_uppercase(),
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  •  Anime4K: ", Style::default().fg(Color::Rgb(150, 155, 180))),
+                    Span::styled(
+                        state.anime4k_mode.as_str(),
+                        Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  •  ", Style::default().fg(Color::Rgb(150, 155, 180))),
+                    Span::styled(cfg.quality.as_str(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Quick Install: ", Style::default().fg(Color::Rgb(150, 155, 180))),
+                    Span::styled(install_cmd, Style::default().fg(theme.accent)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Control: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Press [Enter] to open Interactive System Doctor.",
+                        Style::default().fg(Color::Rgb(200, 205, 220)),
+                    ),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(doctor_lines).wrap(Wrap { trim: true }), chunks[2]);
+        }
         _ => {
             let generic_lines = vec![
                 Line::from(vec![

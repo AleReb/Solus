@@ -41,7 +41,6 @@ pub enum HomeFooterAction {
     Wizard,
     Analytics,
     Remote,
-    Doctor,
     Theme,
     Login,
     StopPlayback,
@@ -85,6 +84,8 @@ fn active_modal_rect(frame_area: Rect, screen: &Screen) -> Option<Rect> {
         Screen::UpdateModal => (64, 45),
         Screen::RemoteModal => (64, 76),
         Screen::CastModal => (68, 55),
+        Screen::Help => crate::ui::help::modal_pct(frame_area),
+        Screen::Setup => crate::ui::setup::modal_pct(frame_area),
         Screen::Calendar => {
             if frame_area.width >= 115 && frame_area.height >= 34 {
                 (94, 90)
@@ -642,16 +643,6 @@ fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockR
             priority: 5,
             bg: None,
             action: Some(HomeFooterAction::Remote),
-        },
-        DockChip {
-            icon: "",
-            key: "[!]",
-            label: "Health".to_string(),
-            key_color: theme.text_dim,
-            label_color: theme.text_dim,
-            priority: 6,
-            bg: None,
-            action: Some(HomeFooterAction::Doctor),
         },
     ];
 
