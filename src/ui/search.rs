@@ -179,7 +179,9 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .split(inner);
 
     if state.has_image_support() {
-        if let Some(cover) = state.detail_cache.get_mut(&anime.id).or_else(|| state.banner_cache.get_mut(&anime.id)).or_else(|| state.cover_cache.get_mut(&anime.id)) {
+        if let Some(cover) =
+            state.resolve_cover_protocol(anime.id, cols[0].width, cols[0].height, 0.15, false)
+        {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));
             frame.render_stateful_widget(image_widget, cols[0], cover);

@@ -930,6 +930,7 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
         // ── RIGHT COLUMN: Selected Anime Details, Artwork & Storytelling ───────
         if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor) {
             let anime = focused.anime.clone();
+            let match_percentage = focused.match_percentage;
             let right_inner = cols[1];
 
             let right_sections = Layout::default()
@@ -959,10 +960,13 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
             frame.render_widget(cover_block, top_cols[0]);
 
             if state.has_image_support() {
-                if let Some(cover) = state.detail_cache.get_mut(&anime.id)
-                    .or_else(|| state.banner_cache.get_mut(&anime.id))
-                    .or_else(|| state.cover_cache.get_mut(&anime.id))
-                {
+                if let Some(cover) = state.resolve_cover_protocol(
+                    anime.id,
+                    cover_inner.width,
+                    cover_inner.height,
+                    0.15,
+                    false,
+                ) {
                     let image_widget = ratatui_image::StatefulImage::new(None)
                         .resize(ratatui_image::Resize::Fit(None));
                     frame.render_stateful_widget(image_widget, cover_inner, cover);
@@ -1005,7 +1009,7 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
                 meta_lines.push(Line::from(Span::styled(format!("  {}", sub), Style::default().fg(Color::Rgb(140, 140, 160)))));
             }
 
-            let match_badge = format!(" [{}% TASTE MATCH] ", focused.match_percentage);
+            let match_badge = format!(" [{}% TASTE MATCH] ", match_percentage);
             meta_lines.push(Line::from(""));
             meta_lines.push(Line::from(vec![
                 Span::styled(match_badge, Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),

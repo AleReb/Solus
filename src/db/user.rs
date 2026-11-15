@@ -1391,8 +1391,7 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
                 strftime('%m-%d %H:%M', h.watched_at, 'unixepoch', 'localtime') as fmt_time
          FROM history h
          JOIN anime a ON h.anime_id = a.id
-         ORDER BY h.watched_at DESC
-         LIMIT 25",
+         ORDER BY h.watched_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -1897,5 +1896,39 @@ mod tests {
         assert_eq!(analytics.watchlist_queue[0].title, "Monster");
         assert_eq!(analytics.watchlist_queue[0].remaining_episodes, Some(73));
         assert_eq!(analytics.recent_watch_log.len(), 14);
+    }
+
+    #[tokio::test]
+    async fn test_compute_user_analytics_returns_all_watch_logs_past_25() {
+        let pool = init(":memory:").await.unwrap();
+        let anime = Anime {
+            id: 505,
+            title_romaji: "Black Clover".into(),
+            title_english: Some("Black Clover".into()),
+            title_native: None,
+            description: None,
+            episodes: Some(170),
+            status: Some("FINISHED".into()),
+            season: Some("FALL".into()),
+            season_year: Some(2017),
+            score: Some(82),
+            format: Some("TV".into()),
+            genres: "[\"Action\",\"Fantasy\"]".into(),
+            cover_url: None,
+            cover_blob: None,
+            has_dub: 1,
+            updated_at: 1_000_000,
+            next_airing_episode: None,
+        };
+        upsert_anime(&pool, &anime).await.unwrap();
+
+        for ep in 1..=40i64 {
+            record_watched(&pool, 505, ep, 1_700_000_000 + ep * 1_500).await.unwrap();
+        }
+
+        let analytics = compute_user_analytics(&pool).await.unwrap();
+        assert_eq!(analytics.recent_watch_log.len(), 40);
+        assert_eq!(analytics.recent_watch_log.first().unwrap().episode, 40);
+        assert_eq!(analytics.recent_watch_log.last().unwrap().episode, 1);
     }
 }

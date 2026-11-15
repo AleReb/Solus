@@ -639,7 +639,7 @@ fn render_overview_bento(
             ])
             .split(cols[2]);
         render_podium_spotlight_card(frame, right_rows[0], data, state, theme);
-        render_rotation_horizon_card(frame, right_rows[1], data, state.analytics_list_scroll, theme);
+        render_rotation_horizon_card(frame, right_rows[1], data, state, theme);
         render_milestones_diagnostics_card(frame, right_rows[2], data, state, theme);
     } else if area.width >= 92 {
         let cols = Layout::default()
@@ -672,7 +672,7 @@ fn render_overview_bento(
             .split(cols[1]);
         render_podium_spotlight_card(frame, right_rows[0], data, state, theme);
         render_thermal_heatmap_card(frame, right_rows[1], data, theme);
-        render_rotation_horizon_card(frame, right_rows[2], data, state.analytics_list_scroll, theme);
+        render_rotation_horizon_card(frame, right_rows[2], data, state, theme);
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -1780,10 +1780,8 @@ fn render_podium_spotlight_card(
         frame.render_widget(art_frame, top_cols[0]);
 
         let rendered_image = if state.has_image_support() {
-            if let Some(proto) = state
-                .detail_cache
-                .get_mut(&show.id)
-                .or_else(|| state.cover_cache.get_mut(&show.id))
+            if let Some(proto) =
+                state.resolve_cover_protocol(show.id, art_inner.width, art_inner.height, 0.16, false)
             {
                 let img = StatefulImage::new(None).resize(Resize::Fit(None));
                 frame.render_stateful_widget(img, art_inner, proto);
@@ -1907,7 +1905,7 @@ fn render_rotation_horizon_card(
     frame: &mut Frame,
     area: Rect,
     data: &UserAnalytics,
-    list_scroll: usize,
+    state: &mut AppState,
     theme: &ThemePalette,
 ) {
     let title = if data.top_shows.len() < 3 && !data.watchlist_queue.is_empty() {
@@ -1915,16 +1913,19 @@ fn render_rotation_horizon_card(
     } else {
         "❖ ROTATION & WATCHLIST HORIZON"
     };
-    let block = styled_box(title, theme.accent, theme.border_idle);
+    let mut block = styled_box(title, theme.accent, theme.border_idle);
     let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    let w = inner.width as usize;
-    let h = inner.height as usize;
-    if w < 18 || h < 3 {
+    let inner_w = inner.width as usize;
+    let inner_h = inner.height as usize;
+    if inner_w < 18 || inner_h < 3 {
+        frame.render_widget(block, area);
+        state.analytics_list_max_scroll = Some(0);
         return;
     }
 
+    // Reserve rightmost column for vertical scrollbar indicator when logs overflow.
+    let w = inner_w.saturating_sub(1);
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     // Show active watched series #2.. (or #1 summary if only 1 show and queue below)
@@ -1998,27 +1999,82 @@ fn render_rotation_horizon_card(
         )));
     }
 
-    // Chronological watch feed below
+    // Chronological watch feed below (all watch logs, scrollable via ↑/↓, PgUp/PgDn, wheel)
     if !data.recent_watch_log.is_empty() {
-        let hdr_txt = "── RECENTLY LOGGED ";
+        let hdr_txt = format!("── RECENTLY LOGGED ({}) ", data.recent_watch_log.len());
         let pad_dashes = "─".repeat(w.saturating_sub(hdr_txt.chars().count()));
         lines.push(Line::from(Span::styled(
             trunc_chars(&format!("{}{}", hdr_txt, pad_dashes), w),
             Style::default().fg(theme.primary),
         )));
         for entry in &data.recent_watch_log {
-            let title_b = w.saturating_sub(22);
+            let ep_tag = format!("E{:02} ", entry.episode);
+            let time_w = entry.formatted_time.chars().count() + 2;
+            let title_b = w.saturating_sub(time_w + ep_tag.chars().count());
             lines.push(Line::from(vec![
                 Span::styled(format!(" {} ", entry.formatted_time), Style::default().fg(Color::Rgb(105, 110, 135))),
-                Span::styled(format!("E{:02} ", entry.episode), Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+                Span::styled(ep_tag, Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
                 Span::styled(trunc_chars(&entry.title, title_b), Style::default().fg(theme.text)),
             ]));
         }
     }
 
-    let max_skip = lines.len().saturating_sub(h);
-    let visible: Vec<Line<'_>> = lines.into_iter().skip(list_scroll.min(max_skip)).take(h).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    let total_lines = lines.len();
+    let max_skip = total_lines.saturating_sub(inner_h);
+    state.analytics_list_scroll = state.analytics_list_scroll.min(max_skip);
+    state.analytics_list_max_scroll = Some(max_skip);
+    let scroll = state.analytics_list_scroll;
+
+    if max_skip > 0 {
+        let badge = if scroll == 0 {
+            format!(" [↑/↓] Scroll (+{} lines) ", max_skip)
+        } else if scroll >= max_skip {
+            format!(" [↑/↓] {}/{} (End) ", scroll, max_skip)
+        } else {
+            format!(" [↑/↓] {}/{} (+{} below) ", scroll, max_skip, max_skip - scroll)
+        };
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                badge,
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+
+    frame.render_widget(block, area);
+
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width.saturating_sub(1),
+        height: inner.height,
+    };
+    let visible: Vec<Line<'_>> = lines.into_iter().skip(scroll).take(inner_h).collect();
+    frame.render_widget(Paragraph::new(visible), text_area);
+
+    if max_skip > 0 && inner.width > 1 {
+        let sb_x = inner.x + inner.width - 1;
+        let thumb_h = ((inner_h * inner_h) / total_lines.max(1)).clamp(1, inner_h);
+        let thumb_top = (scroll * inner_h.saturating_sub(thumb_h)) / max_skip.max(1);
+        let sb_lines: Vec<Line<'_>> = (0..inner_h)
+            .map(|row| {
+                let in_thumb = row >= thumb_top && row < thumb_top + thumb_h;
+                if in_thumb {
+                    Line::from(Span::styled("┃", Style::default().fg(theme.accent)))
+                } else {
+                    Line::from(Span::styled("│", Style::default().fg(Color::Rgb(42, 46, 62))))
+                }
+            })
+            .collect();
+        let sb_rect = Rect {
+            x: sb_x,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        frame.render_widget(Paragraph::new(sb_lines), sb_rect);
+    }
 }
 
 // ── Chart 3C: Auto-Tiered Milestones & Live Runtime Diagnostics ──────────────
@@ -2398,5 +2454,76 @@ mod tests {
         let mut state = AppState::new();
         state.analytics_data = Some(UserAnalytics::default());
         assert!(terminal.draw(|f| render(f, &mut state)).is_ok());
+    }
+
+    #[test]
+    fn test_analytics_spotlight_thumbnail_fills_full_frame() {
+        let mut state = AppState::new();
+        let mut picker = ratatui_image::picker::Picker::new((12, 24));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
+        state.picker = Some(picker);
+        state.analytics_data = Some(sample_rich_analytics());
+
+        // Seed raw portrait poster for #1 show (Steins;Gate id = 1)
+        state
+            .cover_raw_cache
+            .insert(1, image::DynamicImage::new_rgb8(460, 650));
+
+        let backend = TestBackend::new(165, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut state)).unwrap();
+
+        let (key, proto) = state
+            .fitted_cover_cache
+            .iter_mut()
+            .find(|((id, _, _), _)| *id == 1)
+            .expect("Analytics spotlight should create an exact-fit cover protocol");
+        // In 165x50 desktop layout: art_w = 12 (inner 10) x right_rows[0] height 10 -> inner 4
+        assert_eq!((key.1, key.2), (10, 4));
+        assert!(
+            proto.needs_resize(&Resize::Fit(None), Rect::new(0, 0, key.1, key.2)).is_none(),
+            "Spotlight thumbnail should fill 100% of frame {:?} with zero deadspace",
+            key
+        );
+    }
+
+    #[test]
+    fn test_analytics_recently_logged_scrolls_through_all_logs() {
+        let mut state = AppState::new();
+        let mut a = sample_rich_analytics();
+        a.recent_watch_log = (1..=40)
+            .rev()
+            .map(|ep| RecentWatchEntry {
+                anime_id: 1,
+                title: format!("Steins Gate Ep{}", ep),
+                episode: ep,
+                watched_at: 1_700_000_000 + ep as i64 * 100,
+                formatted_time: "11-14 21:00".to_string(),
+            })
+            .collect();
+        state.analytics_data = Some(a);
+
+        let backend = TestBackend::new(154, 42);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Render at scroll=0 -> should show total count (40), newest entry E40, and scroll bounds > 0
+        terminal.draw(|f| render(f, &mut state)).unwrap();
+        let top_text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(top_text.contains("RECENTLY LOGGED (40)"));
+        assert!(top_text.contains("Scroll (+"));
+        let max_s = state.analytics_list_max_scroll.expect("max scroll must be measured");
+        assert!(max_s > 25, "expected substantial overflow for 40 logs, got {}", max_s);
+
+        // Scrolling down past the end clamps cleanly to max_scroll and brings E01 (oldest log) into view
+        state.scroll_analytics_list(999);
+        assert_eq!(state.analytics_list_scroll, max_s);
+        terminal.draw(|f| render(f, &mut state)).unwrap();
+        let bot_text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(bot_text.contains("E01 Steins Gate Ep1"), "oldest log E01 missing at bottom:\n{}", bot_text);
+        assert!(bot_text.contains("(End)"));
+
+        // Immediate scroll up decrements by 1 without overshoot lag
+        state.scroll_analytics_list(-1);
+        assert_eq!(state.analytics_list_scroll, max_s - 1);
     }
 }

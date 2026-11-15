@@ -261,6 +261,12 @@ pub struct AppState {
     /// Separate detail/search protocol cache (retains portrait orientation)
     pub detail_cache:     HashMap<i64, Box<dyn StatefulProtocol>>,
 
+    /// Uncropped source cover images keyed by anime ID for exact per-frame aspect fitting
+    pub cover_raw_cache:  HashMap<i64, image::DynamicImage>,
+
+    /// Per-frame exact-aspect cover protocols keyed by `(anime_id, cols, rows)`
+    pub fitted_cover_cache: HashMap<(i64, u16, u16), Box<dyn StatefulProtocol>>,
+
     /// In-flight cover downloads
     pub loading_covers:   HashSet<i64>,
 
@@ -438,6 +444,9 @@ pub struct AppState {
     /// Scroll offset inside Analytics watchlist/recent log feed
     pub analytics_list_scroll: usize,
 
+    /// Measured maximum scroll offset of the Analytics horizon/recent-logs panel (None until rendered)
+    pub analytics_list_max_scroll: Option<usize>,
+
     /// Metadata for an available application update if one was detected
     pub available_update: Option<crate::services::updater::UpdateInfo>,
 
@@ -542,6 +551,8 @@ impl AppState {
             cover_cache:      HashMap::new(),
             banner_cache:     HashMap::new(),
             detail_cache:     HashMap::new(),
+            cover_raw_cache:  HashMap::new(),
+            fitted_cover_cache: HashMap::new(),
             loading_covers:   HashSet::new(),
             cover_anime_id:   None,
             cover_failed_anime_id: None,
@@ -604,6 +615,7 @@ impl AppState {
             analytics_data:   None,
             analytics_podium_idx: 0,
             analytics_list_scroll: 0,
+            analytics_list_max_scroll: None,
             available_update: None,
             is_checking_update: false,
             is_updating:      false,
@@ -659,6 +671,62 @@ impl AppState {
             self.screen = Screen::TasteAnalytics;
         }
         self.analytics_list_scroll = 0;
+        self.analytics_list_max_scroll = None;
+    }
+
+    /// Adjust the Analytics horizon/recent-logs scroll offset, clamping cleanly when layout bounds are known.
+    pub fn scroll_analytics_list(&mut self, delta: isize) {
+        let next = if delta >= 0 {
+            self.analytics_list_scroll.saturating_add(delta as usize)
+        } else {
+            self.analytics_list_scroll.saturating_sub(delta.unsigned_abs())
+        };
+        self.analytics_list_scroll = match self.analytics_list_max_scroll {
+            Some(max_s) => next.min(max_s),
+            None => next,
+        };
+    }
+
+    /// Return a cached `StatefulProtocol` scaled cleanly to `cols x rows` from `cover_raw_cache`
+    /// (falling back to `detail_cache` and optionally `cover_cache` when raw art isn't ready yet),
+    /// preserving Kitty graphic IDs across renders and filling 100% of the target rect.
+    pub fn resolve_cover_protocol(
+        &mut self,
+        anime_id: i64,
+        cols: u16,
+        rows: u16,
+        upper_bias: f32,
+        allow_card_fallback: bool,
+    ) -> Option<&mut Box<dyn StatefulProtocol>> {
+        if cols > 0 && rows > 0 {
+            if let Some(picker) = self.picker {
+                let key = (anime_id, cols, rows);
+                if !self.fitted_cover_cache.contains_key(&key) {
+                    if let Some(raw) = self.cover_raw_cache.get(&anime_id) {
+                        let fitted = crate::ui::components::cover::scale_to_frame_cover(
+                            raw.clone(),
+                            cols,
+                            rows,
+                            picker.font_size,
+                            upper_bias,
+                        );
+                        let proto =
+                            crate::ui::components::cover::build_stateful_protocol(picker, fitted);
+                        self.fitted_cover_cache.insert(key, proto);
+                    }
+                }
+                if let Some(proto) = self.fitted_cover_cache.get_mut(&key) {
+                    return Some(proto);
+                }
+            }
+        }
+        if let Some(proto) = self.detail_cache.get_mut(&anime_id) {
+            return Some(proto);
+        }
+        if allow_card_fallback {
+            return self.cover_cache.get_mut(&anime_id);
+        }
+        None
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).

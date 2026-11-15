@@ -6,6 +6,8 @@ mod services;
 mod state;
 mod ui;
 
+pub use ui::components::cover::{build_stateful_protocol, scale_to_frame_cover};
+
 use anyhow::Context;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -50,6 +52,7 @@ enum AppMessage {
         anime_id: i64,
         card_proto: Box<dyn ratatui_image::protocol::StatefulProtocol>,
         banner_proto: Box<dyn ratatui_image::protocol::StatefulProtocol>,
+        raw_img: image::DynamicImage,
     },
     /// Home preload item failed to download or decode
     PreloadCoverFailed {
@@ -401,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AppMessage::CoverReady(anime_id, img) => {
                     state.loading_covers.remove(&anime_id);
+                    state.cover_raw_cache.entry(anime_id).or_insert_with(|| img.clone());
                     let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
                     let card_img = prepare_card_cover_with_font(img.clone(), font_size);
                     let portrait_img = prepare_portrait_cover_with_font(img.clone(), font_size);
@@ -430,10 +434,11 @@ async fn main() -> anyhow::Result<()> {
                         state.show_toast("Cover image unavailable", unix_now());
                     }
                 }
-                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto } => {
+                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto, raw_img } => {
                     state.loading_covers.remove(&anime_id);
                     state.cover_cache.entry(anime_id).or_insert(card_proto);
                     state.banner_cache.entry(anime_id).or_insert(banner_proto);
+                    state.cover_raw_cache.entry(anime_id).or_insert(raw_img);
                     if state.cover_anime_id == Some(anime_id) {
                         state.cover_failed_anime_id = None;
                     }
@@ -804,27 +809,16 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         state.analytics_podium_idx = 0;
                     }
+                    state.analytics_list_max_scroll = None;
                     let cover_ids: Vec<i64> = analytics
                         .top_shows
                         .iter()
-                        .take(6)
+                        .take(12)
                         .map(|s| s.id)
-                        .filter(|id| !state.detail_cache.contains_key(id) && state.loading_covers.insert(*id))
                         .collect();
                     state.analytics_data = Some(analytics);
                     for id in cover_ids {
-                        let pool_c = pool.clone();
-                        let tx_c = tx.clone();
-                        tokio::spawn(async move {
-                            if let Ok(Some(anime)) = db::cache::get_anime(&pool_c, id).await {
-                                match download_cover_image(&anime, &pool_c).await {
-                                    Some(img) => { let _ = tx_c.send(AppMessage::CoverReady(id, img)).await; }
-                                    None => { let _ = tx_c.send(AppMessage::CoverFailed(id)).await; }
-                                }
-                            } else {
-                                let _ = tx_c.send(AppMessage::CoverFailed(id)).await;
-                            }
-                        });
+                        trigger_cover_fetch_by_id(&mut state, id, &pool, &tx);
                     }
                 }
                 AppMessage::UpdateCheckResult(update_opt) => {
@@ -1358,6 +1352,10 @@ async fn handle_mouse(
                     }
                     true
                 }
+                Screen::TasteAnalytics => {
+                    state.scroll_analytics_list(2);
+                    true
+                }
                 _ => false,
             }
         }
@@ -1401,6 +1399,10 @@ async fn handle_mouse(
                     if let Some(a) = state.search_results.get(state.search_cursor) {
                         state.cover_anime_id = Some(a.id);
                     }
+                    true
+                }
+                Screen::TasteAnalytics => {
+                    state.scroll_analytics_list(-2);
                     true
                 }
                 _ => false,
@@ -2051,6 +2053,7 @@ async fn open_detail_from_anime(
     };
     if let Some(blob) = cached_blob {
         if let Ok(dyn_img) = image::load_from_memory(&blob) {
+            state.cover_raw_cache.entry(anime_id).or_insert_with(|| dyn_img.clone());
             let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
             let card_img = prepare_card_cover_with_font(dyn_img.clone(), font_size);
             let portrait_img = prepare_portrait_cover_with_font(dyn_img.clone(), font_size);
@@ -2225,26 +2228,28 @@ fn cover_download_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(12))
 }
 
-/// Build a `StatefulProtocol` safely across UI and background worker threads without Kitty ID collisions.
-fn build_stateful_protocol(
-    mut picker: ratatui_image::picker::Picker,
-    img: image::DynamicImage,
-) -> Box<dyn ratatui_image::protocol::StatefulProtocol> {
-    static NEXT_KITTY_IMAGE_ID: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(100_000);
-    if picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty {
-        let id = NEXT_KITTY_IMAGE_ID
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .max(1);
-        let source = ratatui_image::protocol::ImageSource::new(img, picker.font_size);
-        Box::new(ratatui_image::protocol::kitty::StatefulKitty::new(
-            source,
-            id,
-            picker.is_tmux,
-        ))
-    } else {
-        picker.new_resize_protocol(img)
+/// Spawn a background cover fetch from SQLite/HTTP by `anime_id` when raw artwork is missing.
+fn trigger_cover_fetch_by_id(
+    state: &mut AppState,
+    anime_id: i64,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if state.cover_raw_cache.contains_key(&anime_id) || !state.loading_covers.insert(anime_id) {
+        return;
     }
+    let pool_c = pool.clone();
+    let tx_c = tx.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(anime)) = db::cache::get_anime(&pool_c, anime_id).await {
+            match download_cover_image(&anime, &pool_c).await {
+                Some(img) => { let _ = tx_c.send(AppMessage::CoverReady(anime_id, img)).await; }
+                None => { let _ = tx_c.send(AppMessage::CoverFailed(anime_id)).await; }
+            }
+        } else {
+            let _ = tx_c.send(AppMessage::CoverFailed(anime_id)).await;
+        }
+    });
 }
 
 /// Standard inner image cell dimensions (`20 x 6`) for pre-encoding card & hero covers off-thread.
@@ -3696,25 +3701,49 @@ async fn handle_analytics(
             }
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            if let Some(ref data) = state.analytics_data {
-                if !data.top_shows.is_empty() {
+            let next_id = state.analytics_data.as_ref().and_then(|data| {
+                if data.top_shows.is_empty() {
+                    None
+                } else {
                     let len = data.top_shows.len();
                     state.analytics_podium_idx = (state.analytics_podium_idx + len - 1) % len;
+                    data.top_shows.get(state.analytics_podium_idx).map(|s| s.id)
                 }
+            });
+            if let Some(id) = next_id {
+                trigger_cover_fetch_by_id(state, id, pool, tx);
             }
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if let Some(ref data) = state.analytics_data {
-                if !data.top_shows.is_empty() {
+            let next_id = state.analytics_data.as_ref().and_then(|data| {
+                if data.top_shows.is_empty() {
+                    None
+                } else {
                     state.analytics_podium_idx = (state.analytics_podium_idx + 1) % data.top_shows.len();
+                    data.top_shows.get(state.analytics_podium_idx).map(|s| s.id)
                 }
+            });
+            if let Some(id) = next_id {
+                trigger_cover_fetch_by_id(state, id, pool, tx);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            state.analytics_list_scroll = state.analytics_list_scroll.saturating_add(1);
+            state.scroll_analytics_list(1);
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            state.analytics_list_scroll = state.analytics_list_scroll.saturating_sub(1);
+            state.scroll_analytics_list(-1);
+        }
+        KeyCode::PageDown | KeyCode::Char('J') => {
+            state.scroll_analytics_list(5);
+        }
+        KeyCode::PageUp | KeyCode::Char('K') => {
+            state.scroll_analytics_list(-5);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.analytics_list_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            state.analytics_list_scroll = state.analytics_list_max_scroll.unwrap_or(usize::MAX);
         }
         KeyCode::Enter => {
             let target_id = state
@@ -4003,18 +4032,16 @@ fn prefetch_calendar_covers(
         if state.cover_failed_anime_id != Some(fid) {
             state.cover_failed_anime_id = None;
         }
-        if !state.detail_cache.contains_key(&fid)
-            && !state.cover_cache.contains_key(&fid)
+        if !state.cover_raw_cache.contains_key(&fid)
             && !state.loading_covers.contains(&fid)
         {
             state.loading_covers.insert(fid);
             trigger_cover_download(focused.anime().clone(), pool.clone(), tx.clone());
         }
     }
-    for entry in entries.iter().take(8) {
+    for entry in entries.iter().take(16) {
         let id = entry.anime().id;
-        if !state.detail_cache.contains_key(&id)
-            && !state.cover_cache.contains_key(&id)
+        if !state.cover_raw_cache.contains_key(&id)
             && !state.loading_covers.contains(&id)
         {
             state.loading_covers.insert(id);
@@ -4943,58 +4970,6 @@ async fn start_playback(
 
 // ─── Cover image download ─────────────────────────────────────────────────────
 
-/// Dynamically scales and center/upper-biased crops an image so its physical pixel aspect ratio
-/// exactly matches the character cell area (target_cols x target_rows) for the detected font size.
-/// By ensuring the pixel dimensions are an exact integer multiple of (target_cols * font_w, target_rows * font_h),
-/// ratatui-image's internal ratio calculation (wratio == hratio) matches identically down to the lowest bit,
-/// guaranteeing 100% frame fill with 0% deadspace across all platforms, fonts, and terminal emulators.
-pub fn scale_to_frame_cover(
-    img: image::DynamicImage,
-    target_cols: u16,
-    target_rows: u16,
-    font_size: (u16, u16),
-    upper_bias: f32,
-) -> image::DynamicImage {
-    let (w, h) = (img.width(), img.height());
-    if w == 0 || h == 0 || target_cols == 0 || target_rows == 0 {
-        return img;
-    }
-
-    let font_w = (font_size.0 as u32).max(1);
-    let font_h = (font_size.1 as u32).max(1);
-
-    let base_pw = target_cols as u32 * font_w;
-    let base_ph = target_rows as u32 * font_h;
-
-    // Scale to high-res crisp multiplier (target_w >= 1000px) so ratatui-image has full fidelity
-    let multiplier = (1280 / base_pw).clamp(2, 16);
-    let target_w = base_pw * multiplier;
-    let target_h = base_ph * multiplier;
-    let target_aspect = target_w as f32 / target_h as f32;
-
-    let current_aspect = w as f32 / h as f32;
-
-    if current_aspect < target_aspect {
-        // Source is taller/narrower than frame -> scale width to target_w, crop excess height with upper bias
-        let scale = target_w as f32 / w as f32;
-        let scaled_h = ((h as f32 * scale).round() as u32).max(target_h);
-        let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::Triangle);
-
-        let excess_h = scaled.height().saturating_sub(target_h);
-        let top = ((excess_h as f32) * upper_bias).round() as u32;
-        scaled.crop_imm(0, top.min(excess_h), target_w, target_h)
-    } else {
-        // Source is wider than frame -> scale height to target_h, center-crop excess width
-        let scale = target_h as f32 / h as f32;
-        let scaled_w = ((w as f32 * scale).round() as u32).max(target_w);
-        let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::Triangle);
-
-        let excess_w = scaled.width().saturating_sub(target_w);
-        let left = excess_w / 2;
-        scaled.crop_imm(left, 0, target_w, target_h)
-    }
-}
-
 pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
     scale_to_frame_cover(img, 20, 6, (12, 24), 0.22)
 }
@@ -5102,26 +5077,27 @@ fn trigger_home_cover_preload(
 
         let encoded = tokio::task::spawn_blocking(move || {
             let img = image::load_from_memory(&bytes).ok()?;
-            let card_img = prepare_card_cover_with_font(img, picker.font_size);
+            let card_img = prepare_card_cover_with_font(img.clone(), picker.font_size);
             let card_area = home_card_preencode_area();
             let mut card_proto = build_stateful_protocol(picker, card_img.clone());
             let mut banner_proto = build_stateful_protocol(picker, card_img);
             card_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
             banner_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
-            Some((card_proto, banner_proto))
+            Some((card_proto, banner_proto, img))
         })
         .await
         .ok()
         .flatten();
 
         match encoded {
-            Some((card_proto, banner_proto)) => {
+            Some((card_proto, banner_proto, raw_img)) => {
                 let _ = tx
                     .send(AppMessage::PreloadCoverReady {
                         gen,
                         anime_id,
                         card_proto,
                         banner_proto,
+                        raw_img,
                     })
                     .await;
             }
@@ -5618,10 +5594,11 @@ mod tests {
                 .expect("timed out waiting for preload cover")
                 .expect("channel closed");
             match msg {
-                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto } => {
+                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto, raw_img } => {
                     state.loading_covers.remove(&anime_id);
                     state.cover_cache.entry(anime_id).or_insert(card_proto);
                     state.banner_cache.entry(anime_id).or_insert(banner_proto);
+                    state.cover_raw_cache.entry(anime_id).or_insert(raw_img);
                     if let Some(g) = gen {
                         state.advance_preload(g);
                     }
@@ -5635,6 +5612,7 @@ mod tests {
         for id in 1..=8 {
             assert!(state.cover_cache.contains_key(&id));
             assert!(state.banner_cache.contains_key(&id));
+            assert!(state.cover_raw_cache.contains_key(&id));
             // Pre-encoded Iterm2 protocol needs no additional resize at standard card dimensions.
             let card_area = home_card_preencode_area();
             assert!(

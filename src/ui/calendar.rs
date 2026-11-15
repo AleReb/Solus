@@ -658,6 +658,7 @@ fn render_inspector_pane(
     let anime = entry.anime().clone();
     let emerald = Color::Rgb(80, 250, 123);
     let top_h = if area.height >= 22 { 14 } else { 11 };
+    let cover_w = if top_h >= 14 { 19 } else { 15 };
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -670,10 +671,10 @@ fn render_inspector_pane(
     let hero_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),  // Left margin
-            Constraint::Length(19), // Portrait poster frame (19x14, inner 17x12)
-            Constraint::Length(2),  // Clean gutter
-            Constraint::Min(0),     // Word-wrapped metadata stack
+            Constraint::Length(1),       // Left margin
+            Constraint::Length(cover_w), // Portrait poster frame (19x14 -> 17x12, or 15x11 -> 13x9)
+            Constraint::Length(2),       // Clean gutter
+            Constraint::Min(0),          // Word-wrapped metadata stack
         ])
         .split(right_chunks[0]);
 
@@ -685,11 +686,8 @@ fn render_inspector_pane(
     frame.render_widget(cover_block, hero_cols[1]);
 
     if state.has_image_support() {
-        if let Some(cover) = state
-            .detail_cache
-            .get_mut(&anime.id)
-            .or_else(|| state.banner_cache.get_mut(&anime.id))
-            .or_else(|| state.cover_cache.get_mut(&anime.id))
+        if let Some(cover) =
+            state.resolve_cover_protocol(anime.id, cover_inner.width, cover_inner.height, 0.15, false)
         {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));
@@ -1194,5 +1192,51 @@ mod tests {
             assert!(line.chars().count() <= 22);
         }
         assert_eq!(lines[0], "Reincarnated as a");
+    }
+
+    #[test]
+    fn test_calendar_renders_full_portrait_not_home_half_crop() {
+        let mut state = seed_calendar_state();
+        let mut picker = ratatui_image::picker::Picker::new((12, 24));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
+        state.picker = Some(picker);
+
+        // Simulate Home preload having inserted a wide 20x6 card crop into cover_cache & banner_cache
+        // while the uncropped portrait image lives in cover_raw_cache.
+        let wide_crop = crate::ui::components::cover::scale_to_frame_cover(
+            image::DynamicImage::new_rgb8(460, 650),
+            20,
+            6,
+            (12, 24),
+            0.22,
+        );
+        state.cover_cache.insert(
+            42,
+            crate::ui::components::cover::build_stateful_protocol(picker, wide_crop.clone()),
+        );
+        state.banner_cache.insert(
+            42,
+            crate::ui::components::cover::build_stateful_protocol(picker, wide_crop),
+        );
+        state
+            .cover_raw_cache
+            .insert(42, image::DynamicImage::new_rgb8(460, 650));
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_overlay(f, &mut state)).unwrap();
+
+        let (key, proto) = state
+            .fitted_cover_cache
+            .iter_mut()
+            .find(|((id, _, _), _)| *id == 42)
+            .expect("Calendar should build an exact-fit portrait cover protocol from cover_raw_cache");
+        let expected_area = Rect::new(0, 0, key.1, key.2);
+        assert!(key.2 >= 9 && key.1 >= 13, "unexpected calendar cover inner size: {:?}", key);
+        assert!(
+            proto.needs_resize(&ratatui_image::Resize::Fit(None), expected_area).is_none(),
+            "Calendar poster should fill 100% of cover_inner ({:?})",
+            key
+        );
     }
 }

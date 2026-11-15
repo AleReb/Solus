@@ -9,6 +9,76 @@ use ratatui::{
     style::{Color, Style},
     widgets::Widget,
 };
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
+
+/// Dynamically scales and center/upper-biased crops an image so its physical pixel aspect ratio
+/// exactly matches the character cell area (`target_cols x target_rows`) for the detected font size.
+/// By ensuring pixel dimensions are an exact integer multiple of `(target_cols * font_w, target_rows * font_h)`,
+/// `ratatui-image`'s ratio calculation matches identically, guaranteeing 100% frame fill with 0% deadspace.
+pub fn scale_to_frame_cover(
+    img: image::DynamicImage,
+    target_cols: u16,
+    target_rows: u16,
+    font_size: (u16, u16),
+    upper_bias: f32,
+) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 || target_cols == 0 || target_rows == 0 {
+        return img;
+    }
+
+    let font_w = (font_size.0 as u32).max(1);
+    let font_h = (font_size.1 as u32).max(1);
+
+    let base_pw = target_cols as u32 * font_w;
+    let base_ph = target_rows as u32 * font_h;
+
+    let multiplier = (1280 / base_pw).clamp(2, 16);
+    let target_w = base_pw * multiplier;
+    let target_h = base_ph * multiplier;
+    let target_aspect = target_w as f32 / target_h as f32;
+    let current_aspect = w as f32 / h as f32;
+
+    if current_aspect < target_aspect {
+        let scale = target_w as f32 / w as f32;
+        let scaled_h = ((h as f32 * scale).round() as u32).max(target_h);
+        let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::Triangle);
+
+        let excess_h = scaled.height().saturating_sub(target_h);
+        let top = ((excess_h as f32) * upper_bias).round() as u32;
+        scaled.crop_imm(0, top.min(excess_h), target_w, target_h)
+    } else {
+        let scale = target_h as f32 / h as f32;
+        let scaled_w = ((w as f32 * scale).round() as u32).max(target_w);
+        let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::Triangle);
+
+        let excess_w = scaled.width().saturating_sub(target_w);
+        let left = excess_w / 2;
+        scaled.crop_imm(left, 0, target_w, target_h)
+    }
+}
+
+/// Build a `StatefulProtocol` safely across UI and background worker threads without Kitty ID collisions.
+pub fn build_stateful_protocol(
+    mut picker: Picker,
+    img: image::DynamicImage,
+) -> Box<dyn StatefulProtocol> {
+    static NEXT_KITTY_IMAGE_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(100_000);
+    if picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty {
+        let id = NEXT_KITTY_IMAGE_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let source = ratatui_image::protocol::ImageSource::new(img, picker.font_size);
+        Box::new(ratatui_image::protocol::kitty::StatefulKitty::new(
+            source,
+            id,
+            picker.is_tmux,
+        ))
+    } else {
+        picker.new_resize_protocol(img)
+    }
+}
 
 // ─── Color generation ─────────────────────────────────────────────────────────
 
