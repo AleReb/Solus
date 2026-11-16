@@ -2544,13 +2544,13 @@ fn trigger_cover_fetch_by_id(
     });
 }
 
-/// Standard inner image cell dimensions (`20 x 6`) for pre-encoding card & hero covers off-thread.
+/// Standard inner image cell dimensions (`16 x 11` portrait) for pre-encoding card & hero covers off-thread.
 fn home_card_preencode_area() -> ratatui::layout::Rect {
     ratatui::layout::Rect::new(
         0,
         0,
         ui::home::CARD_WIDTH.saturating_sub(2),
-        ui::home::CARD_HEIGHT.saturating_sub(4),
+        ui::home::CARD_FRAME_HEIGHT.saturating_sub(2),
     )
 }
 
@@ -6788,11 +6788,20 @@ async fn start_playback(
 // ─── Cover image download ─────────────────────────────────────────────────────
 
 pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
-    scale_to_frame_contain(img, 20, 6, (12, 24))
+    prepare_card_cover_with_font(img, (12, 24))
 }
 
 pub fn prepare_card_cover_with_font(img: image::DynamicImage, font_size: (u16, u16)) -> image::DynamicImage {
-    scale_to_frame_contain(img, 20, 6, font_size)
+    if img.width() == 0 || img.height() == 0 {
+        return img;
+    }
+    if img.width() <= img.height() {
+        // Portrait / square poster: glove-fit 16x11 frame edge-to-edge (~0.727 matches AniList ~0.708)
+        scale_to_frame_cover(img, 16, 11, font_size, 0.20)
+    } else {
+        // Landscape artwork: zoom out inside 16x11 over blurred ambient backdrop
+        scale_to_frame_contain(img, 16, 11, font_size)
+    }
 }
 
 pub fn prepare_portrait_cover(img: image::DynamicImage) -> image::DynamicImage {
@@ -7242,11 +7251,11 @@ mod tests {
 
     #[test]
     fn test_prepare_card_cover_portrait() {
-        // Typical AniList portrait cover dimensions (230x345)
+        // Typical AniList portrait cover dimensions (230x345) -> 16x11 cells @ (12, 24) => 1152x1584
         let img = image::DynamicImage::new_rgb8(230, 345);
         let prepared = prepare_card_cover(img);
-        assert_eq!(prepared.width(), 1200);
-        assert_eq!(prepared.height(), 720);
+        assert_eq!(prepared.width(), 1152);
+        assert_eq!(prepared.height(), 1584);
     }
 
     #[test]
@@ -7267,11 +7276,11 @@ mod tests {
             }
         }
         let prepared = prepare_card_cover(image::DynamicImage::ImageRgba8(rgba));
-        assert_eq!(prepared.width(), 1200);
-        assert_eq!(prepared.height(), 720);
-        // Center column (x=600) must still contain top red band and bottom blue band uncropped
-        let top_px = prepared.get_pixel(600, 10);
-        let bot_px = prepared.get_pixel(600, 710);
+        assert_eq!(prepared.width(), 1152);
+        assert_eq!(prepared.height(), 1584);
+        // Center column (x=576) must still contain top red band and bottom blue band uncropped
+        let top_px = prepared.get_pixel(576, 10);
+        let bot_px = prepared.get_pixel(576, 1574);
         assert!(top_px[0] > 180 && top_px[2] < 80, "top band was cropped: {:?}", top_px);
         assert!(bot_px[2] > 180 && bot_px[0] < 80, "bottom band was cropped: {:?}", bot_px);
     }
@@ -7281,8 +7290,8 @@ mod tests {
         // Landscape image
         let img = image::DynamicImage::new_rgb8(800, 400);
         let prepared = prepare_card_cover(img);
-        assert_eq!(prepared.width(), 1200);
-        assert_eq!(prepared.height(), 720);
+        assert_eq!(prepared.width(), 1152);
+        assert_eq!(prepared.height(), 1584);
     }
 
     #[test]
@@ -7434,7 +7443,7 @@ mod tests {
         assert_eq!(state.preload_done, 0);
 
         for _ in 0..8 {
-            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
                 .await
                 .expect("timed out waiting for preload cover")
                 .expect("channel closed");

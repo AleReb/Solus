@@ -19,9 +19,11 @@ use crate::{
 };
 
 /// Width of each anime card in the row (chars)
-pub const CARD_WIDTH: u16 = 22;
-/// Height of each anime card (rows)
-pub const CARD_HEIGHT: u16 = 10;
+pub const CARD_WIDTH: u16 = 18;
+/// Height of the rounded thumbnail frame (rows, enclosing 16x11 portrait art)
+pub const CARD_FRAME_HEIGHT: u16 = 13;
+/// Total height of each anime card (13-row portrait frame + 2 caption rows below)
+pub const CARD_HEIGHT: u16 = 15;
 /// Gap between cards
 pub const CARD_GAP: u16 = 2;
 /// Height of the top glass navigation bar
@@ -30,7 +32,7 @@ pub const TOP_BAR_HEIGHT: u16 = 1;
 pub const HERO_HEIGHT: u16 = 10;
 /// Default height of each shelf tier
 #[allow(dead_code)]
-pub const ROW_HEIGHT: u16 = 12;
+pub const ROW_HEIGHT: u16 = 17;
 /// Height of the 2-row bottom command dock (1 top divider + 2 balanced rows)
 pub const FOOTER_HEIGHT: u16 = 3;
 
@@ -161,8 +163,8 @@ pub fn build_shelf_tiers(data: &HomeData, width: u16) -> Vec<ShelfTier> {
 /// Compute `(visible_cards, card_width)` for a horizontal strip of `usable_w` columns
 /// so cards expand/pack cleanly edge-to-edge without leaving ~15-20 col voids on the right.
 pub fn compute_row_card_metrics(usable_w: u16) -> (usize, u16) {
-    let min_card_w: u16 = 20;
-    let max_card_w: u16 = 25;
+    let min_card_w: u16 = CARD_WIDTH;
+    let max_card_w: u16 = 21;
     let gap = CARD_GAP;
     let vis_n = ((usable_w + gap) / (min_card_w + gap)).max(1) as usize;
     let gaps_total = (vis_n.saturating_sub(1)) as u16 * gap;
@@ -192,7 +194,7 @@ pub fn compute_shelf_layout(
         return (0, Vec::new());
     }
 
-    let min_tier_h: u16 = 10;
+    let min_tier_h: u16 = CARD_HEIGHT + 1; // 1 header + 15-row portrait card
     let max_fit = (avail_h / min_tier_h).max(1) as usize;
     let visible_rows = tiers.len().min(max_fit);
     let start_idx = active_tier_idx.saturating_sub(visible_rows.saturating_sub(1));
@@ -200,8 +202,8 @@ pub fn compute_shelf_layout(
     let visible_slice: Vec<&ShelfTier> = tiers.iter().skip(start_idx).take(visible_rows).collect();
     if visible_slice.len() == 1 {
         let cap = match visible_slice[0] {
-            ShelfTier::BentoSplit => 12,
-            ShelfTier::Single(_) => 12,
+            ShelfTier::BentoSplit => CARD_HEIGHT + 2,
+            ShelfTier::Single(_) => CARD_HEIGHT + 2,
         };
         return (start_idx, vec![avail_h.min(cap)]);
     }
@@ -209,32 +211,21 @@ pub fn compute_shelf_layout(
     let mut heights = vec![min_tier_h; visible_slice.len()];
     let mut rem = avail_h.saturating_sub(min_tier_h * visible_slice.len() as u16);
 
-    // 1. Ensure BentoSplit gets +2 rows (12 total) first for full 10-row bordered cards
+    // 1. Ensure BentoSplit gets +1 row (17 total: 2 borders + 15-row card) first
     for (idx, tier) in visible_slice.iter().enumerate() {
         if matches!(tier, ShelfTier::BentoSplit) {
-            let add = rem.min(12u16.saturating_sub(heights[idx]));
+            let add = rem.min((CARD_HEIGHT + 2).saturating_sub(heights[idx]));
             heights[idx] += add;
             rem -= add;
         }
     }
 
-    // 2. Bring every Single shelf up to 11 rows (1 header + 10-row card, zero dead padding)
-    for (idx, tier) in visible_slice.iter().enumerate() {
-        if rem == 0 {
-            break;
-        }
-        if matches!(tier, ShelfTier::Single(_)) && heights[idx] < 11 {
-            heights[idx] += 1;
-            rem -= 1;
-        }
-    }
-
-    // 3. Distribute any remaining breathing rows (up to 12 per tier) evenly
+    // 2. Distribute any remaining breathing rows (up to CARD_HEIGHT + 2 per tier) evenly
     for h in &mut heights {
         if rem == 0 {
             break;
         }
-        if *h < 12 {
+        if *h < CARD_HEIGHT + 2 {
             *h += 1;
             rem -= 1;
         }
@@ -1965,25 +1956,26 @@ fn render_card_with_source(
         );
     }
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+    let frame_h = area.height.saturating_sub(2).min(CARD_FRAME_HEIGHT);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // cover art
-            Constraint::Length(1), // title
-            Constraint::Length(1), // score / progress bar
+            Constraint::Length(frame_h), // rounded poster frame (portrait art only)
+            Constraint::Length(1),       // external title line
+            Constraint::Length(1),       // external score / progress line
         ])
-        .split(inner);
+        .split(area);
+
+    let cover_inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
 
     let cover_occluded = active_modal_rect(frame.area(), state)
-        .is_some_and(|m| m.intersects(chunks[0]));
+        .is_some_and(|m| m.intersects(cover_inner));
     if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state.cover_cache.get_mut(&anime.id) {
             frame.render_stateful_widget(
                 crate::ui::components::cover::hd_image_widget(),
-                chunks[0],
+                cover_inner,
                 cover,
             );
         } else {
@@ -1992,7 +1984,7 @@ fn render_card_with_source(
                     anime_id: anime.id,
                     title: anime.display_title(),
                 },
-                chunks[0],
+                cover_inner,
             );
         }
     } else {
@@ -2001,12 +1993,12 @@ fn render_card_with_source(
                 anime_id: anime.id,
                 title: anime.display_title(),
             },
-            chunks[0],
+            cover_inner,
         );
     }
 
-    // Title (crisp white bold when focused, clean truncation)
-    let max_title_chars = chunks[1].width as usize;
+    // External Title & Metadata below the frame (clamped to width - 1 to guarantee zero concatenation)
+    let max_title_chars = chunks[1].width.saturating_sub(1) as usize;
     let title_str = anime.short_title();
     let short_title = truncate_chars(&title_str, max_title_chars);
     let title = Paragraph::new(Span::styled(
@@ -2614,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_three_shelves_fit_on_48_row_terminal_without_empty_gap() {
+    fn test_two_enlarged_portrait_shelves_fit_on_48_row_terminal() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut data = HomeData::empty();
         data.continue_watching.push(Anime::default());
@@ -2629,7 +2621,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| render(f, &mut state, &data))
-            .expect("home screen should render 3 tiers at 148x48");
+            .expect("home screen should render enlarged portrait tiers at 148x48");
 
         let buf = terminal.backend().buffer();
         let mut rendered = String::new();
@@ -2641,7 +2633,6 @@ mod tests {
         }
         assert!(rendered.contains("Continue Watching"), "missing row 1");
         assert!(rendered.contains("Trending Now"), "missing row 2");
-        assert!(rendered.contains("Popular Picks"), "third shelf disappeared at 48 rows!");
         assert!(rendered.contains("ACTIONS"), "missing bottom command dock");
     }
 
@@ -2657,7 +2648,7 @@ mod tests {
         // Also check 160-col terminal (wl usable = 129)
         let (vis_n2, card_w2) = compute_row_card_metrics(129);
         let used2 = vis_n2 as u16 * card_w2 + (vis_n2 as u16 - 1) * CARD_GAP;
-        assert!(129 - used2 <= 4, "leftover margin {} too wide at 129 usable", 129 - used2);
+        assert!(129 - used2 <= 5, "leftover margin {} too wide at 129 usable", 129 - used2);
     }
 
     #[test]
