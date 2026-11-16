@@ -662,6 +662,14 @@ async fn apply_audio_track_selection(
     if let Some(aid) = track.mpv_aid {
         let cmd = serde_json::json!({ "command": ["set_property", "aid", aid] });
         if send_mpv_json_command(sock_path, cmd).await {
+            // Force mpv to flush and re-buffer the newly selected HLS audio rendition at the
+            // exact current playback position so audio never cuts out until a manual seek.
+            let _ = send_mpv_json_command(
+                sock_path,
+                serde_json::json!({ "command": ["seek", 0.0, "relative+exact"] }),
+            )
+            .await;
+
             let osd = format!("✦ Audio: {}", track.label);
             let _ = send_mpv_json_command(
                 sock_path,
@@ -2106,9 +2114,12 @@ mod tests {
         ] {
             handle_remote_action(&req_for(audio_id), r"\\.\pipe\solus-mpv", &state, None).await;
             let cmd_line = rx.recv().await.unwrap();
+            let seek_line = rx.recv().await.unwrap();
             let _osd_line = rx.recv().await.unwrap();
             let parsed: serde_json::Value = serde_json::from_str(cmd_line.trim()).unwrap();
             assert_eq!(parsed["command"], serde_json::json!(["set_property", "aid", expected_aid]));
+            let parsed_seek: serde_json::Value = serde_json::from_str(seek_line.trim()).unwrap();
+            assert_eq!(parsed_seek["command"], serde_json::json!(["seek", 0.0, "relative+exact"]));
 
             let st = state.read().await;
             assert_eq!(st.audio_mode, expected_mode);
