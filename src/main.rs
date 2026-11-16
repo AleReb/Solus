@@ -1302,6 +1302,9 @@ async fn main() -> anyhow::Result<()> {
                 if state.watchlist_target_prompt.is_some() {
                     ui::home::render_watchlist_target_modal(frame, &state);
                 }
+                if state.exit_confirm_open {
+                    ui::home::render_exit_confirm_modal(frame, &state);
+                }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
                     ui::help::render_toast(frame, msg);
@@ -1380,6 +1383,11 @@ async fn handle_key(
         return;
     }
 
+    if state.exit_confirm_open {
+        handle_exit_confirm_modal(key, state);
+        return;
+    }
+
     if state.watchlist_target_prompt.is_some() {
         handle_watchlist_target_modal(key, state, home_data, pool, cfg, tx).await;
         return;
@@ -1392,7 +1400,7 @@ async fn handle_key(
                 refresh_home_cover(state, home_data, pool, tx);
             }
             KeyCode::Char('q') => {
-                state.should_quit = true;
+                state.open_exit_confirm();
             }
             _ => {}
         }
@@ -1420,6 +1428,36 @@ async fn handle_key(
         Screen::UpdateModal => handle_update_modal(key, state, tx).await,
         Screen::Calendar => handle_calendar(key, state, home_data, pool, cfg, tx).await,
         Screen::ProfileModal => handle_profile_modal(key, state, home_data, pool, cfg, tx).await,
+    }
+}
+
+fn handle_exit_confirm_modal(key: event::KeyEvent, state: &mut AppState) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+            state.close_exit_confirm();
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            state.exit_confirm_open = false;
+            state.should_quit = true;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            state.exit_confirm_cursor = 0;
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            state.exit_confirm_cursor = 1;
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Tab | KeyCode::BackTab => {
+            state.exit_confirm_cursor = 1 - (state.exit_confirm_cursor % 2);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if state.exit_confirm_cursor == 1 {
+                state.exit_confirm_open = false;
+                state.should_quit = true;
+            } else {
+                state.close_exit_confirm();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1527,10 +1565,34 @@ async fn handle_mouse(
     let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
     let term_area = ratatui::layout::Rect::new(0, 0, term_w, term_h);
 
-    // Right-click always acts as Back / Esc
+    // Right-click always acts as Back / Esc (or closes exit confirmation modal)
     if matches!(mouse.kind, event::MouseEventKind::Down(event::MouseButton::Right)) {
-        state.go_back();
+        if state.exit_confirm_open {
+            state.close_exit_confirm();
+        } else {
+            state.go_back();
+        }
         return true;
+    }
+
+    if state.exit_confirm_open {
+        if matches!(mouse.kind, event::MouseEventKind::Down(event::MouseButton::Left)) {
+            let (mx, my) = (mouse.column, mouse.row);
+            let modal = ui::home::exit_confirm_modal_rect(term_area);
+            if mx < modal.x || mx >= modal.right() || my < modal.y || my >= modal.bottom() {
+                state.close_exit_confirm();
+            } else {
+                let mid_x = modal.x + modal.width / 2;
+                if mx < mid_x {
+                    state.close_exit_confirm();
+                } else {
+                    state.exit_confirm_open = false;
+                    state.should_quit = true;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     match mouse.kind {
@@ -2001,7 +2063,7 @@ async fn handle_home(
     tx:        &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => state.open_exit_confirm(),
 
         // Row navigation — skip rows with no content so the cursor never
         // lands on an invisible row where Enter would do nothing.

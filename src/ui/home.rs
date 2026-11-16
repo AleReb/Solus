@@ -2398,6 +2398,140 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(Paragraph::new(footer).style(Style::default().bg(bg)), chunks[2]);
 }
 
+/// Compute the centered modal rectangle for the Exit Confirmation popup.
+pub fn exit_confirm_modal_rect(area: Rect) -> Rect {
+    let w = area.width.min(54).max(34.min(area.width));
+    let h = area.height.min(11).max(7.min(area.height));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
+/// Render the centered Exit Confirmation popup when `state.exit_confirm_open` is true.
+pub fn render_exit_confirm_modal(frame: &mut Frame, state: &AppState) {
+    if !state.exit_confirm_open {
+        return;
+    }
+
+    let modal = exit_confirm_modal_rect(frame.area());
+    let theme = state.theme();
+    let bg = Color::Rgb(15, 16, 25);
+    let card_bg = Color::Rgb(24, 27, 42);
+    let emerald = Color::Rgb(80, 250, 123);
+    let crimson = Color::Rgb(230, 57, 70);
+    let amber = Color::Rgb(251, 191, 36);
+    let muted = Color::Rgb(150, 156, 185);
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(Block::default().style(Style::default().bg(bg)), modal);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .style(Style::default().bg(bg))
+        .title(Span::styled(
+            " ◈ EXIT SOLUS? ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer.inner(modal);
+    frame.render_widget(outer, modal);
+
+    if inner.width < 16 || inner.height < 5 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),    // Prompt message & active-session warning
+            Constraint::Length(2), // Action buttons
+            Constraint::Length(1), // Key hints
+        ])
+        .split(inner);
+
+    let mut prompt_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Are you sure you want to close Solus?",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if state.now_playing.is_some() {
+        prompt_lines.push(Line::from(Span::styled(
+            "✦ Playback is active — exiting will stop the player.",
+            Style::default().fg(amber),
+        )));
+    } else if state.active_download.is_some() {
+        prompt_lines.push(Line::from(Span::styled(
+            "✦ Offline download is in progress — exiting will cancel it.",
+            Style::default().fg(amber),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(prompt_lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(bg))
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let cancel_selected = state.exit_confirm_cursor == 0;
+    let exit_selected = state.exit_confirm_cursor == 1;
+
+    let cancel_style = if cancel_selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(emerald)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(205, 210, 228)).bg(card_bg)
+    };
+    let exit_style = if exit_selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(crimson)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(205, 210, 228)).bg(card_bg)
+    };
+
+    let buttons = Line::from(vec![
+        Span::styled("  [ Cancel · Stay ]  ", cancel_style),
+        Span::styled("   ", Style::default().bg(bg)),
+        Span::styled("  [ Exit Solus ]  ", exit_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(buttons)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(bg)),
+        chunks[1],
+    );
+
+    let hints = Line::from(vec![
+        Span::styled("[←/→]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Select  ", Style::default().fg(muted)),
+        Span::styled("[Enter]", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
+        Span::styled(" Confirm  ", Style::default().fg(muted)),
+        Span::styled("[Y]", Style::default().fg(crimson).add_modifier(Modifier::BOLD)),
+        Span::styled(" Exit  ", Style::default().fg(muted)),
+        Span::styled("[N/Esc]", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cancel", Style::default().fg(muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(hints)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(bg)),
+        chunks[2],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2650,5 +2784,34 @@ mod tests {
         assert!(row0.contains("✦ Brother [P]  ·  "));
         assert!(!row0.contains("[P]Guest"));
         assert!(!row0.contains("SOLUSTrending"));
+    }
+
+    #[test]
+    fn test_exit_confirm_modal_renders_cleanly_with_and_without_playback() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = AppState::new();
+        state.open_exit_confirm();
+        state.now_playing = Some("Frieren — Episode 1".to_string());
+
+        for (w, h) in [(100u16, 30u16), (60u16, 20u16)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render_exit_confirm_modal(f, &state))
+                .unwrap();
+
+            let buf = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..h {
+                for x in 0..w {
+                    text.push_str(buf[(x, y)].symbol());
+                }
+            }
+            assert!(text.contains("EXIT SOLUS?"));
+            assert!(text.contains("Cancel · Stay"));
+            assert!(text.contains("Exit Solus"));
+            assert!(text.contains("Playback is active"));
+        }
     }
 }

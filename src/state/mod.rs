@@ -391,6 +391,10 @@ pub struct AppState {
     /// Whether the app should quit on next tick
     pub should_quit:      bool,
 
+    /// Exit confirmation popup modal state (guards against accidental `q` / `Esc` presses)
+    pub exit_confirm_open:   bool,
+    pub exit_confirm_cursor: usize,
+
     /// Detail screen: set of watched episode numbers for the current anime
     pub watched_episodes: HashSet<u32>,
 
@@ -676,6 +680,8 @@ impl AppState {
             preload_done:     0,
             preload_generation: 0,
             should_quit:      false,
+            exit_confirm_open: false,
+            exit_confirm_cursor: 0,
             watched_episodes: HashSet::new(),
             last_played:      None,
             last_played_anime_id: None,
@@ -912,6 +918,18 @@ impl AppState {
                 Screen::Home
             }
         };
+    }
+
+    /// Open the exit confirmation popup defaulting to Cancel so double-taps stay safe.
+    pub fn open_exit_confirm(&mut self) {
+        self.exit_confirm_open = true;
+        self.exit_confirm_cursor = 0;
+    }
+
+    /// Dismiss the exit confirmation popup and remain in Solus.
+    pub fn close_exit_confirm(&mut self) {
+        self.exit_confirm_open = false;
+        self.exit_confirm_cursor = 0;
     }
 
     /// Open the detail screen for a given anime.
@@ -1455,6 +1473,20 @@ mod tests {
         let mut state = AppState::new();
         state.go_back();
         assert!(state.should_quit);
+    }
+
+    #[test]
+    fn test_open_and_close_exit_confirm_defaults_to_cancel() {
+        let mut state = AppState::new();
+        assert!(!state.exit_confirm_open);
+        state.open_exit_confirm();
+        assert!(state.exit_confirm_open);
+        assert_eq!(state.exit_confirm_cursor, 0);
+        assert!(!state.should_quit);
+        state.close_exit_confirm();
+        assert!(!state.exit_confirm_open);
+        assert_eq!(state.exit_confirm_cursor, 0);
+        assert!(!state.should_quit);
     }
 
     #[test]
