@@ -987,24 +987,24 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(26), // Cinema 16:9 Cover Frame
+                Constraint::Length(11), // Glove-fit 9x6 Portrait Cover Frame
                 Constraint::Length(2),  // Breathing spacer
                 Constraint::Min(0),     // Editorial Metadata & CTA Deck
-                Constraint::Length(26), // Right Telemetry HUD
+                Constraint::Length(30), // Right Telemetry HUD (29 inner cols, zero clipping)
             ])
             .split(inner)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(24), // Cover Frame
+                Constraint::Length(11), // Glove-fit 9x6 Portrait Cover Frame
                 Constraint::Length(2),  // Breathing spacer
                 Constraint::Min(0),     // Editorial Metadata & CTA Deck
             ])
             .split(inner)
     };
 
-    // ── Zone 1: Cinema Cover Frame ───────────────────────────────────────────
+    // ── Zone 1: Portrait Cover Frame ─────────────────────────────────────────
     let cover_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1027,7 +1027,9 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
             );
         } else {
             let label = if state.cover_failed_anime_id == Some(anime.id) {
-                "Cover unavailable"
+                if cover_inner.width < 18 { "N/A" } else { "Cover unavailable" }
+            } else if cover_inner.width < 18 {
+                "󰑮 ..."
             } else {
                 "󰑮 Loading cover..."
             };
@@ -1151,13 +1153,15 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
         genre_spans.push(Span::styled(" Anime ", Style::default().fg(theme.text_dim).bg(theme.border_idle)));
     }
 
-    // Rows 4-5: Strictly 2-line word-wrapped synopsis
+    // Rows 4-5: Strictly 2-sentence clean summary (full synopsis lives on Detail screen)
     let raw_desc = anime
         .description
         .as_deref()
         .unwrap_or("No description available.");
     let cleaned_desc = clean_synopsis_single_line(raw_desc);
-    let (syn_line1, syn_line2) = wrap_two_lines(&cleaned_desc, center_w.saturating_sub(1));
+    let line_budget = center_w.saturating_sub(1);
+    let summary_desc = summarize_two_sentences(&cleaned_desc, line_budget.saturating_mul(2));
+    let (syn_line1, syn_line2) = wrap_two_lines(&summary_desc, line_budget);
 
     // Row 6: Optional external player launch status OR breathing spacer
     let launch_status = state
@@ -1274,7 +1278,7 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
         };
 
         let mut audio_line = vec![
-            Span::styled("  AUDIO   ", Style::default().fg(theme.text_dim)),
+            Span::styled("  AUDIO  ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format!(" {} ", audio_tag),
                 Style::default().fg(theme.text).bg(theme.border_idle).add_modifier(Modifier::BOLD),
@@ -1322,6 +1326,71 @@ fn active_banner_anime<'a>(state: &AppState, data: &'a HomeData) -> Option<&'a A
     let (row_key, _, _, _) = row_meta(&state.active_row);
     let items = row_items(&state.active_row, data);
     items.get(state.row_offset(row_key))
+}
+
+/// Summarize a cleaned synopsis into at most two complete sentences fitting within `max_chars`.
+/// Avoids mid-word/mid-sentence cutoffs in the Featured Spotlight while leaving full synopses for Detail.
+pub fn summarize_two_sentences(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+
+    const ABBREVIATIONS: &[&str] = &[
+        "mr.", "mrs.", "ms.", "dr.", "prof.", "vs.", "no.", "st.", "vol.", "ep.", "etc.", "e.g.", "i.e.",
+    ];
+
+    let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut sentence_ends: Vec<usize> = Vec::new();
+
+    for (idx, &(byte_pos, ch)) in chars.iter().enumerate() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let next_ch = chars.get(idx + 1).map(|&(_, c)| c);
+        // Must be followed by end-of-string or whitespace (skips decimals like "8.1")
+        if let Some(nc) = next_ch {
+            if !nc.is_whitespace() {
+                continue;
+            }
+        }
+        let end_byte = byte_pos + ch.len_utf8();
+        if ch == '.' {
+            let prefix_lower = trimmed[..end_byte].to_lowercase();
+            let last_token = prefix_lower.split_whitespace().last().unwrap_or("");
+            if ABBREVIATIONS.contains(&last_token) {
+                continue;
+            }
+        }
+        sentence_ends.push(end_byte);
+        if sentence_ends.len() >= 2 {
+            break;
+        }
+    }
+
+    // Prefer 2 complete sentences if they fit, otherwise 1 complete sentence if it fits
+    for &end_byte in sentence_ends.iter().rev() {
+        let candidate = trimmed[..end_byte].trim();
+        if candidate.chars().count() <= max_chars {
+            return candidate.to_string();
+        }
+    }
+
+    // Fallback when even the first sentence exceeds max_chars
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let limit = max_chars.saturating_sub(1);
+    let mut cut_byte = trimmed.len();
+    for (count, (b_idx, _)) in trimmed.char_indices().enumerate() {
+        if count >= limit {
+            cut_byte = b_idx;
+            break;
+        }
+    }
+    let slice = &trimmed[..cut_byte];
+    let word_cut = slice.rfind(' ').filter(|&pos| pos > slice.len() / 2).unwrap_or(slice.len());
+    format!("{}…", slice[..word_cut].trim_end())
 }
 
 /// Render all visible category tiers (with Smart Bento Split for Continue Watching + Watchlist).
@@ -2822,5 +2891,59 @@ mod tests {
 
         let (_, cw_width) = row_card_metrics_for(&CategoryRow::ContinueWatching, 140);
         assert_eq!(cw_width, CARD_WIDTH);
+    }
+
+    #[test]
+    fn test_summarize_two_sentences_picks_complete_sentences() {
+        let desc = "Aoi Ashito's game has earned him a spot on the A team. Surrounded by elite players like Dr. Akutsu, practices are merciless. Even more trials await him in the third sentence.";
+        let two = summarize_two_sentences(desc, 180);
+        assert_eq!(
+            two,
+            "Aoi Ashito's game has earned him a spot on the A team. Surrounded by elite players like Dr. Akutsu, practices are merciless."
+        );
+        // Tighter budget falls back cleanly to 1 complete sentence rather than mid-word ellipsis
+        let one = summarize_two_sentences(desc, 70);
+        assert_eq!(one, "Aoi Ashito's game has earned him a spot on the A team.");
+    }
+
+    #[test]
+    fn test_hero_hud_does_not_clip_anime4k_tag() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut data = HomeData::empty();
+        data.trending.push(Anime {
+            id: 7,
+            title_romaji: "Aoashi Season 2".to_string(),
+            description: Some(
+                "Aoi Ashito earns a spot on the A team. Practices with elite teammates push him to his limits. A third sentence should not appear in Spotlight."
+                    .to_string(),
+            ),
+            score: Some(81),
+            episodes: Some(24),
+            ..Anime::default()
+        });
+
+        let mut state = AppState::new();
+        state.active_row = CategoryRow::Trending;
+        state.anime4k_mode = crate::config::Anime4KMode::Balanced;
+
+        let backend = TestBackend::new(148, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let featured = data.trending[0].clone();
+        terminal
+            .draw(|f| render_featured(f, Rect::new(0, 0, 148, 10), &mut state, Some(&featured), &data))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..10 {
+            for x in 0..148 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("◈ A4K 2x"), "Anime4K badge was clipped: {rendered}");
+        assert!(rendered.contains("push him to his limits."));
+        assert!(!rendered.contains("third sentence"));
     }
 }
