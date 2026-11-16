@@ -34,6 +34,41 @@ pub struct RemoteSubtitleTrack {
     pub url: Option<String>,
 }
 
+/// Individual audio / dub language track representation for the mobile companion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAudioTrack {
+    pub id: u32,
+    pub code: String,
+    pub label: String,
+    pub is_active: bool,
+    #[serde(default)]
+    pub is_dub: bool,
+    #[serde(default)]
+    pub mpv_aid: Option<u32>,
+}
+
+/// Format a consistent display label for an audio track and indicate whether it is a dub (`true`) or original Japanese (`false`).
+pub fn format_audio_track_label(code: &str, base_name: &str) -> (String, bool) {
+    let lower_code = code.to_lowercase();
+    if lower_code.starts_with("jpn") || lower_code == "ja" {
+        ("Japanese (Original / 日本語)".to_string(), false)
+    } else if lower_code.starts_with("eng") || lower_code == "en" {
+        ("English (Dub)".to_string(), true)
+    } else {
+        let trimmed = base_name.trim();
+        let label = if trimmed.is_empty() {
+            format!("{} (Dub)", code.to_uppercase())
+        } else if trimmed.to_lowercase().contains("dub")
+            || trimmed.to_lowercase().contains("original")
+        {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed} (Dub)")
+        };
+        (label, true)
+    }
+}
+
 /// Individual episode entry for the mobile episode switcher.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteEpisodeItem {
@@ -56,6 +91,10 @@ pub struct RemotePlaybackState {
     pub volume: i32,
     pub speed: f64,
     pub audio_mode: String,
+    #[serde(default)]
+    pub audio_lang: String,
+    #[serde(default)]
+    pub audio_tracks: Vec<RemoteAudioTrack>,
     pub sub_active: bool,
     pub sub_lang: String,
     pub sub_delay: f64,
@@ -88,6 +127,25 @@ impl Default for RemotePlaybackState {
             volume: 80,
             speed: 1.0,
             audio_mode: "sub".to_string(),
+            audio_lang: "Japanese (Original / 日本語)".to_string(),
+            audio_tracks: vec![
+                RemoteAudioTrack {
+                    id: 1,
+                    code: "jpn".to_string(),
+                    label: "Japanese (Original / 日本語)".to_string(),
+                    is_active: true,
+                    is_dub: false,
+                    mpv_aid: Some(1),
+                },
+                RemoteAudioTrack {
+                    id: 2,
+                    code: "eng".to_string(),
+                    label: "English (Dub)".to_string(),
+                    is_active: false,
+                    is_dub: true,
+                    mpv_aid: Some(2),
+                },
+            ],
             sub_active: true,
             sub_lang: "eng".to_string(),
             sub_delay: 0.0,
@@ -133,6 +191,8 @@ pub struct RemoteActionRequest {
     pub delta: Option<f64>,
     pub pos: Option<f64>,
     pub value: Option<i32>,
+    #[serde(default)]
+    pub audio_id: Option<u32>,
     pub sub_id: Option<u32>,
     pub sub_url: Option<String>,
     pub episode: Option<u32>,
@@ -584,6 +644,55 @@ async fn handle_http_client(
     }
 }
 
+/// Deterministically select an audio track by ID (via direct mpv `set_property aid` or dual-stream fallback).
+async fn apply_audio_track_selection(
+    audio_id: u32,
+    sock_path: &str,
+    state: &Arc<RwLock<RemotePlaybackState>>,
+    tx_app: Option<&tokio::sync::mpsc::Sender<crate::AppMessage>>,
+) {
+    let target = {
+        let st = state.read().await;
+        st.audio_tracks.iter().find(|t| t.id == audio_id).cloned()
+    };
+    let Some(track) = target else {
+        return;
+    };
+
+    if let Some(aid) = track.mpv_aid {
+        let cmd = serde_json::json!({ "command": ["set_property", "aid", aid] });
+        if send_mpv_json_command(sock_path, cmd).await {
+            let osd = format!("✦ Audio: {}", track.label);
+            let _ = send_mpv_json_command(
+                sock_path,
+                serde_json::json!({ "command": ["show-text", osd, 2500] }),
+            )
+            .await;
+
+            let mut st = state.write().await;
+            for item in &mut st.audio_tracks {
+                item.is_active = item.id == audio_id;
+            }
+            st.audio_lang = track.label;
+            st.audio_mode = if track.is_dub { "dub" } else { "sub" }.to_string();
+        }
+    } else {
+        {
+            let mut st = state.write().await;
+            for item in &mut st.audio_tracks {
+                item.is_active = item.id == audio_id;
+            }
+            st.audio_lang = track.label;
+            st.audio_mode = if track.is_dub { "dub" } else { "sub" }.to_string();
+        }
+        if let Some(tx) = tx_app {
+            let _ = tx
+                .send(crate::AppMessage::RemoteSwitchAudioStream(track.is_dub))
+                .await;
+        }
+    }
+}
+
 /// Executes touch remote commands against mpv IPC with optimistic local state sync and app message relay.
 async fn handle_remote_action(
     req: &RemoteActionRequest,
@@ -833,11 +942,36 @@ async fn handle_remote_action(
                 }
             }
         }
+        "set_audio" => {
+            if let Some(audio_id) = req.audio_id {
+                apply_audio_track_selection(audio_id, sock_path, state, tx_app).await;
+            }
+        }
         "toggle_audio" => {
-            let cmd = serde_json::json!({ "command": ["cycle", "audio"] });
-            if send_mpv_json_command(sock_path, cmd).await {
-                let mut st = state.write().await;
-                st.audio_mode = if st.audio_mode == "sub" { "dub".to_string() } else { "sub".to_string() };
+            let target_id = {
+                let st = state.read().await;
+                let active_is_dub = st
+                    .audio_tracks
+                    .iter()
+                    .find(|t| t.is_active)
+                    .map(|t| t.is_dub)
+                    .unwrap_or(st.audio_mode == "dub");
+                if active_is_dub {
+                    st.audio_tracks
+                        .iter()
+                        .find(|t| !t.is_dub)
+                        .or_else(|| st.audio_tracks.first())
+                        .map(|t| t.id)
+                } else {
+                    st.audio_tracks
+                        .iter()
+                        .find(|t| t.is_dub && t.code.starts_with("eng"))
+                        .or_else(|| st.audio_tracks.iter().find(|t| t.is_dub))
+                        .map(|t| t.id)
+                }
+            };
+            if let Some(id) = target_id {
+                apply_audio_track_selection(id, sock_path, state, tx_app).await;
             }
         }
         "set_speed" => {
@@ -1274,7 +1408,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     <div class="quick-actions">
       <button class="btn btn-action" onclick="sendAction('skip_intro')">◈ Skip Intro</button>
       <button class="btn btn-action" onclick="sendAction('seek', { delta: 85 })">◈ Jump Recap</button>
-      <button class="btn btn-action" onclick="sendAction('toggle_audio')">Audio (Sub/Dub)</button>
+      <button class="btn btn-action" id="quick-audio-btn" onclick="handleQuickAudio()">✦ Audio: JPN</button>
       <button class="btn btn-action" onclick="sendAction('toggle_sub_visibility')">Subtitles On/Off</button>
     </div>
 
@@ -1364,17 +1498,16 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
         <button class="btn-pill" id="speed-150" onclick="setSpeed(1.5)">1.5x</button>
       </div>
 
-      <div class="section-label">AUDIO MODE</div>
-      <div class="btn-group">
-        <button class="btn-pill" id="audio-sub-btn" onclick="sendAction('toggle_audio')">Japanese (Sub)</button>
-        <button class="btn-pill" id="audio-dub-btn" onclick="sendAction('toggle_audio')">English (Dub)</button>
-      </div>
-
       <div class="section-label">ERA-ADAPTIVE ANIME4K MASTERING <span class="lang-code" id="era-badge-pill" style="margin-left:6px;background:#1d2a22;color:#50fa7b;">MODERN HD</span></div>
       <div class="btn-group">
         <button class="btn-pill" id="a4k-off" onclick="setAnime4k('off')">Off</button>
         <button class="btn-pill" id="a4k-balanced" onclick="setAnime4k('balanced')">Balanced 2x</button>
         <button class="btn-pill" id="a4k-ultra" onclick="setAnime4k('ultra')">Ultra 4K</button>
+      </div>
+
+      <div class="section-label">SELECT AUDIO LANGUAGE <span class="lang-code" id="audio-count-pill" style="margin-left:6px;"></span></div>
+      <div class="item-list" id="audio-tracks-list">
+        <!-- Rendered dynamically -->
       </div>
     </div>
   </div>
@@ -1388,6 +1521,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     let currentState = null;
     let lastPosterUrl = '';
     let lastSubtitlesKey = '';
+    let lastAudioTracksKey = '';
     let lastEpisodesKey = '';
     let lastSeekSent = 0;
     let lastVolSent = 0;
@@ -1494,7 +1628,18 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
         profileBadge.innerText = `${pIcon} ${pName}`;
       }
 
-      document.getElementById('audio-badge').innerText = (data.audio_mode || 'sub').toUpperCase();
+      const audioTracks = data.audio_tracks || [];
+      const activeAudio = audioTracks.find(a => a.is_active);
+      const activeAudioCode = (activeAudio ? activeAudio.code : (data.audio_mode === 'dub' ? 'ENG' : 'JPN')).toUpperCase();
+      document.getElementById('audio-badge').innerText = `${(data.audio_mode || 'sub').toUpperCase()} · ${activeAudioCode}`;
+      const quickAudioBtn = document.getElementById('quick-audio-btn');
+      if (quickAudioBtn) {
+        quickAudioBtn.innerText = `✦ Audio: ${activeAudioCode}`;
+      }
+      const audioCountPill = document.getElementById('audio-count-pill');
+      if (audioCountPill) {
+        audioCountPill.innerText = `${audioTracks.length} TRACK${audioTracks.length === 1 ? '' : 'S'}`;
+      }
       document.getElementById('sub-badge').innerText = data.sub_lang || 'Subtitles';
       const eraBadge = data.era_badge || 'MODERN HD';
       document.getElementById('res-badge').innerText = eraBadge;
@@ -1554,9 +1699,15 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
         renderEpisodesList(data.episodes, data.episode);
       }
 
-      // Speed & Audio Pills
+      // Only rebuild Audio Tracks List if track list or active audio track changed
+      const audioKey = JSON.stringify(audioTracks);
+      if (audioKey !== lastAudioTracksKey) {
+        lastAudioTracksKey = audioKey;
+        renderAudioTracksList(audioTracks);
+      }
+
+      // Speed & Shader Pills
       updateSpeedPills(data.speed || 1.0);
-      updateAudioPills(data.audio_mode || 'sub');
       updatePresetPills(data.sub_preset || 'Studio Minimal');
       updateA4kPills(data.anime4k || 'off');
     }
@@ -1643,18 +1794,44 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       if (el) el.classList.add('active');
     }
 
-    function updateAudioPills(mode) {
-      const sub = document.getElementById('audio-sub-btn');
-      const dub = document.getElementById('audio-dub-btn');
-      if (sub && dub) {
-        if (mode === 'dub') {
-          sub.classList.remove('active');
-          dub.classList.add('active');
-        } else {
-          sub.classList.add('active');
-          dub.classList.remove('active');
-        }
+    function renderAudioTracksList(tracks) {
+      const container = document.getElementById('audio-tracks-list');
+      if (!container) return;
+      if (!tracks || tracks.length === 0) {
+        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">Japanese (Original) stream active.</div>';
+        return;
       }
+      container.innerHTML = tracks.map(a => `
+        <div class="list-item ${a.is_active ? 'selected' : ''}" onclick="selectAudioTrack(${a.id})">
+          <div class="item-left">
+            <span class="check-mark">${a.is_active ? '󰄬' : ''}</span>
+            <span>${a.label}</span>
+          </div>
+          <span class="lang-code">${a.code.toUpperCase()}</span>
+        </div>
+      `).join('');
+    }
+
+    function selectAudioTrack(id) {
+      if (currentState && currentState.audio_tracks) {
+        for (let a of currentState.audio_tracks) {
+          a.is_active = (a.id === id);
+          if (a.is_active) {
+            const code = (a.code || (a.is_dub ? 'eng' : 'jpn')).toUpperCase();
+            const modeLabel = a.is_dub ? 'DUB' : 'SUB';
+            document.getElementById('audio-badge').innerText = `${modeLabel} · ${code}`;
+            const quickAudioBtn = document.getElementById('quick-audio-btn');
+            if (quickAudioBtn) quickAudioBtn.innerText = `✦ Audio: ${code}`;
+          }
+        }
+        renderAudioTracksList(currentState.audio_tracks);
+      }
+      sendAction('set_audio', { audio_id: id });
+      closeAllDrawers();
+    }
+
+    function handleQuickAudio() {
+      openDrawer('audio');
     }
 
     function updatePresetPills(preset) {
@@ -1807,6 +1984,7 @@ mod tests {
             delta: None,
             pos: None,
             value: None,
+            audio_id: None,
             sub_id: None,
             sub_url: None,
             episode: None,
@@ -1829,6 +2007,7 @@ mod tests {
             delta: None,
             pos: None,
             value: None,
+            audio_id: None,
             sub_id: Some(2),
             sub_url: None,
             episode: None,
@@ -1854,6 +2033,7 @@ mod tests {
             delta: None,
             pos: None,
             value: None,
+            audio_id: None,
             sub_id: None,
             sub_url: None,
             episode: None,
@@ -1865,6 +2045,79 @@ mod tests {
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
         let st = state.read().await;
         assert_eq!(st.sub_preset, "Netflix Clean");
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_action_set_audio_switches_exact_mpv_aid_without_cycling() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::services::ipc::set_active_socket_path(Some(r"\\.\pipe\solus-mpv-154587-1".to_string()));
+        crate::services::ipc::set_active_ipc_sender(Some(tx));
+
+        let mut init_state = RemotePlaybackState::default();
+        init_state.audio_tracks = vec![
+            RemoteAudioTrack {
+                id: 1,
+                code: "jpn".to_string(),
+                label: "Japanese (Original / 日本語)".to_string(),
+                is_active: true,
+                is_dub: false,
+                mpv_aid: Some(1),
+            },
+            RemoteAudioTrack {
+                id: 2,
+                code: "eng".to_string(),
+                label: "English (Dub)".to_string(),
+                is_active: false,
+                is_dub: true,
+                mpv_aid: Some(4),
+            },
+            RemoteAudioTrack {
+                id: 3,
+                code: "spa-419".to_string(),
+                label: "Spanish (Latin America) (Dub)".to_string(),
+                is_active: false,
+                is_dub: true,
+                mpv_aid: Some(2),
+            },
+        ];
+        let state = Arc::new(RwLock::new(init_state));
+
+        let req_for = |audio_id: u32| RemoteActionRequest {
+            action: "set_audio".to_string(),
+            delta: None,
+            pos: None,
+            value: None,
+            audio_id: Some(audio_id),
+            sub_id: None,
+            sub_url: None,
+            episode: None,
+            speed: None,
+            preset: None,
+            mode: None,
+        };
+
+        // Select English (aid 4), click English repeatedly, then switch back to Japanese (aid 1) and Spanish (aid 2)
+        for &(audio_id, expected_aid, expected_mode) in &[
+            (2u32, 4u64, "dub"),
+            (2u32, 4u64, "dub"),
+            (1u32, 1u64, "sub"),
+            (3u32, 2u64, "dub"),
+        ] {
+            handle_remote_action(&req_for(audio_id), r"\\.\pipe\solus-mpv", &state, None).await;
+            let cmd_line = rx.recv().await.unwrap();
+            let _osd_line = rx.recv().await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(cmd_line.trim()).unwrap();
+            assert_eq!(parsed["command"], serde_json::json!(["set_property", "aid", expected_aid]));
+
+            let st = state.read().await;
+            assert_eq!(st.audio_mode, expected_mode);
+            assert!(st.audio_tracks.iter().find(|t| t.id == audio_id).unwrap().is_active);
+            assert_eq!(st.audio_tracks.iter().filter(|t| t.is_active).count(), 1);
+        }
+
+        crate::services::ipc::set_active_ipc_sender(None);
+        crate::services::ipc::set_active_socket_path(None);
     }
 
     #[tokio::test]

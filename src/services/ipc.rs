@@ -127,6 +127,118 @@ pub fn parse_property_change(line: &str) -> Option<(String, f64)> {
     None
 }
 
+/// Parse audio tracks from an mpv JSON-RPC `track-list` property-change event.
+/// Preserves exact `mpv_aid` IDs while sorting Japanese original first, English dub second, and remaining dubs cleanly.
+pub fn parse_audio_tracks_from_property_change(
+    line: &str,
+) -> Option<Vec<crate::services::remote::RemoteAudioTrack>> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? != "property-change" {
+        return None;
+    }
+    if parsed.get("name")?.as_str()? != "track-list" {
+        return None;
+    }
+    let items = parsed.get("data")?.as_array()?;
+
+    let mut raw_tracks: Vec<(usize, crate::services::remote::RemoteAudioTrack)> = Vec::new();
+    let mut used_labels: HashSet<String> = HashSet::new();
+
+    for entry in items {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("audio") {
+            continue;
+        }
+        let Some(aid_u64) = entry.get("id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let aid = aid_u64 as u32;
+        let lang = entry
+            .get("lang")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let title = entry
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let selected = entry
+            .get("selected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let lang_missing = lang.is_empty() || lang.eq_ignore_ascii_case("und");
+        let title_missing = title.is_empty() || title.eq_ignore_ascii_case("und");
+
+        let (code, base_name) = if lang_missing && title_missing {
+            if aid == 1 {
+                ("jpn".to_string(), "Japanese".to_string())
+            } else {
+                crate::api::subtitles::resolve_lang_meta(&format!("Audio Track {aid}"), "")
+            }
+        } else {
+            crate::api::subtitles::resolve_lang_meta(title, lang)
+        };
+
+        let (mut label, is_dub) =
+            crate::services::remote::format_audio_track_label(&code, &base_name);
+        if !used_labels.insert(label.clone()) {
+            label = format!("{label} (#{aid})");
+            used_labels.insert(label.clone());
+        }
+
+        let priority = if !is_dub {
+            0
+        } else if code.starts_with("eng") || code == "en" {
+            1
+        } else if code.starts_with("ara") {
+            2
+        } else if code.starts_with("spa") {
+            3
+        } else if code.starts_with("por") {
+            4
+        } else if code.starts_with("fra") || code.starts_with("fre") {
+            5
+        } else if code.starts_with("ger") || code.starts_with("deu") {
+            6
+        } else if code.starts_with("rus") {
+            7
+        } else if code.starts_with("ind") {
+            8
+        } else {
+            9
+        };
+
+        raw_tracks.push((
+            priority,
+            crate::services::remote::RemoteAudioTrack {
+                id: aid,
+                code,
+                label,
+                is_active: selected,
+                is_dub,
+                mpv_aid: Some(aid),
+            },
+        ));
+    }
+
+    if raw_tracks.is_empty() {
+        return None;
+    }
+
+    raw_tracks.sort_by_key(|(prio, _)| *prio);
+    let tracks: Vec<crate::services::remote::RemoteAudioTrack> = raw_tracks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (_, mut track))| {
+            track.id = (idx + 1) as u32;
+            track
+        })
+        .collect();
+
+    Some(tracks)
+}
+
 /// Check if a given playback position falls inside any un-skipped interval.
 pub fn check_skip_interval<'a>(
     pos: f64,
@@ -250,10 +362,11 @@ where
     set_active_socket_path(Some(sock_path.clone()));
     set_active_ipc_sender(Some(cmd_tx.clone()));
 
-    // Subscribe to time-pos and duration property changes
+    // Subscribe to time-pos, duration, and live track-list property changes
     let observe_cmds = [
         r#"{"command": ["observe_property", 1, "time-pos"]}"#,
         r#"{"command": ["observe_property", 2, "duration"]}"#,
+        r#"{"command": ["observe_property", 3, "track-list"]}"#,
     ];
     for cmd in observe_cmds {
         let _ = writer_half.write_all(format!("{}\n", cmd).as_bytes()).await;
@@ -267,6 +380,7 @@ where
     let mut last_save_time = tokio::time::Instant::now();
     let mut scrobbled = false;
     let mut skipped_intervals: HashSet<String> = HashSet::new();
+    let mut last_audio_tracks: Vec<crate::services::remote::RemoteAudioTrack> = Vec::new();
 
     loop {
         tokio::select! {
@@ -292,6 +406,13 @@ where
                 let Ok(Some(line)) = line_res else {
                     break;
                 };
+
+                if let Some(tracks) = parse_audio_tracks_from_property_change(&line) {
+                    if tracks != last_audio_tracks {
+                        last_audio_tracks = tracks.clone();
+                        let _ = tx.send(AppMessage::AudioTracksUpdated(tracks)).await;
+                    }
+                }
 
                 if let Some((name, val)) = parse_property_change(&line) {
                     match name.as_str() {
@@ -523,11 +644,13 @@ mod tests {
         let (server_read, _server_write) = tokio::io::split(server_io);
         let mut lines = BufReader::new(server_read).lines();
 
-        // First two commands must be observe_property subscriptions
+        // First three commands must be observe_property subscriptions
         let l1 = lines.next_line().await.unwrap().unwrap();
         let l2 = lines.next_line().await.unwrap().unwrap();
+        let l3 = lines.next_line().await.unwrap().unwrap();
         assert!(l1.contains("observe_property"));
         assert!(l2.contains("observe_property"));
+        assert!(l3.contains("observe_property"));
         assert_eq!(
             get_active_socket_path().as_deref(),
             Some(r"\\.\pipe\solus-mpv-1-1")
@@ -535,11 +658,48 @@ mod tests {
 
         // Send a command through the active monitor channel
         assert!(try_send_via_active_monitor(r#"{"command":["cycle","pause"]}"#));
-        let l3 = lines.next_line().await.unwrap().unwrap();
-        assert_eq!(l3, r#"{"command":["cycle","pause"]}"#);
+        let l4 = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(l4, r#"{"command":["cycle","pause"]}"#);
 
         drop(lines);
         drop(_server_write);
         let _ = task.await;
+    }
+
+    #[test]
+    fn test_parse_audio_tracks_from_property_change_multi_dub() {
+        let event = r#"{
+            "event": "property-change",
+            "id": 3,
+            "name": "track-list",
+            "data": [
+                {"id": 1, "type": "video", "selected": true},
+                {"id": 1, "type": "audio", "lang": "es-419", "title": "Spanish (Latin America)", "selected": false},
+                {"id": 2, "type": "audio", "lang": "pt-BR", "title": "Portuguese (Brazil)", "selected": false},
+                {"id": 3, "type": "audio", "lang": "jpn", "title": "Japanese", "selected": true},
+                {"id": 4, "type": "audio", "lang": "fra", "title": "French", "selected": false},
+                {"id": 5, "type": "audio", "lang": "eng", "title": "English", "selected": false},
+                {"id": 1, "type": "sub", "lang": "eng", "selected": true}
+            ]
+        }"#;
+
+        let tracks = parse_audio_tracks_from_property_change(event).expect("audio tracks parsed");
+        assert_eq!(tracks.len(), 5);
+        assert_eq!(tracks[0].code, "jpn");
+        assert_eq!(tracks[0].mpv_aid, Some(3));
+        assert!(tracks[0].is_active);
+        assert!(!tracks[0].is_dub);
+
+        assert_eq!(tracks[1].code, "eng");
+        assert_eq!(tracks[1].mpv_aid, Some(5));
+        assert!(!tracks[1].is_active);
+        assert!(tracks[1].is_dub);
+
+        assert_eq!(tracks[2].code, "spa-419");
+        assert_eq!(tracks[2].mpv_aid, Some(1));
+        assert_eq!(tracks[3].code, "por-br");
+        assert_eq!(tracks[3].mpv_aid, Some(2));
+        assert_eq!(tracks[4].code, "fra");
+        assert_eq!(tracks[4].mpv_aid, Some(4));
     }
 }

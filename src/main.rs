@@ -168,6 +168,10 @@ enum AppMessage {
     UpdateFailed(String),
     /// Remote touch companion requested switching to an episode
     RemotePlayEpisode(u32),
+    /// Remote touch companion requested switching between separate /sub and /dub streams
+    RemoteSwitchAudioStream(bool),
+    /// Live mpv IPC audio track list update
+    AudioTracksUpdated(Vec<services::remote::RemoteAudioTrack>),
     /// Remote touch companion toggled or selected Anime4K shader mode
     RemoteAnime4K(config::Anime4KMode),
 }
@@ -704,6 +708,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         state.playback_qualities = info.qualities;
                         state.playback_sub_languages = info.subtitles;
+                        state.playback_audio_tracks = info.audio_tracks;
                         state.playback_providers = info.providers;
                         state.dub_available = Some(info.dub_available);
                         state.pending_master_url = info.master_url;
@@ -729,28 +734,47 @@ async fn main() -> anyhow::Result<()> {
                         state.sync_active_provider();
                         state.is_loading_subs = false;
 
-                        if !state.playback_sub_languages.is_empty() {
-                            let r_state = state.remote_state.clone();
-                            let r_subs: Vec<services::remote::RemoteSubtitleTrack> = state
-                                .playback_sub_languages
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, s)| services::remote::RemoteSubtitleTrack {
-                                    id: (idx + 1) as u32,
-                                    code: s.code.clone(),
-                                    label: s.name.clone(),
-                                    is_active: idx == state.playback_sub_cursor,
-                                    url: if s.url.is_empty() { None } else { Some(s.url.clone()) },
-                                })
-                                .collect();
-                            tokio::spawn(async move {
-                                {
-                                    let mut st = r_state.write().await;
+                        let r_state = state.remote_state.clone();
+                        let r_subs: Vec<services::remote::RemoteSubtitleTrack> = state
+                            .playback_sub_languages
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, s)| services::remote::RemoteSubtitleTrack {
+                                id: (idx + 1) as u32,
+                                code: s.code.clone(),
+                                label: s.name.clone(),
+                                is_active: idx == state.playback_sub_cursor,
+                                url: if s.url.is_empty() { None } else { Some(s.url.clone()) },
+                            })
+                            .collect();
+                        let r_audio = build_initial_remote_audio_tracks(
+                            &state.playback_audio_tracks,
+                            state.dub_available.unwrap_or(false) || is_dub,
+                            is_dub,
+                        );
+                        let r_audio_lang = r_audio
+                            .iter()
+                            .find(|t| t.is_active)
+                            .map(|t| t.label.clone())
+                            .unwrap_or_else(|| {
+                                if is_dub {
+                                    "English (Dub)".to_string()
+                                } else {
+                                    "Japanese (Original / 日本語)".to_string()
+                                }
+                            });
+                        tokio::spawn(async move {
+                            {
+                                let mut st = r_state.write().await;
+                                if !r_subs.is_empty() {
                                     st.subtitles = r_subs;
                                 }
-                                services::remote::broadcast_state(&r_state).await;
-                            });
-                        }
+                                st.audio_tracks = r_audio;
+                                st.audio_lang = r_audio_lang;
+                                st.audio_mode = if is_dub { "dub" } else { "sub" }.to_string();
+                            }
+                            services::remote::broadcast_state(&r_state).await;
+                        });
                     }
                 }
                 AppMessage::AiringStatusUpdated(anime_id, status, episodes, next_airing) => {
@@ -1095,100 +1119,80 @@ async fn main() -> anyhow::Result<()> {
                     state.show_toast(format!("Update failed: {}", err), unix_now());
                 }
                 AppMessage::RemotePlayEpisode(ep) => {
-                    if let Some(ref anime) = state.selected_anime.clone() {
-                        // Close the current episode immediately, before resolving the next stream
-                        services::remote::quit_active_player().await;
-                        state.stop_player();
-                        state.selected_episode = Some(ep);
-                        let title = anime.display_title().to_string();
-                        let season_year = anime.season_year;
+                    launch_remote_stream_switch(&mut state, &pool, &cfg, &tx, ep, None, None).await;
+                }
+                AppMessage::RemoteSwitchAudioStream(target_dub) => {
+                    let ep = state.selected_episode.unwrap_or(1);
+                    let current_pos = {
+                        let st = state.remote_state.read().await;
+                        st.time_pos
+                    };
+                    let resume_pos = if current_pos > 2.0 {
+                        Some(current_pos)
+                    } else {
+                        None
+                    };
+                    launch_remote_stream_switch(
+                        &mut state,
+                        &pool,
+                        &cfg,
+                        &tx,
+                        ep,
+                        Some(target_dub),
+                        resume_pos,
+                    )
+                    .await;
+                }
+                AppMessage::AudioTracksUpdated(mpv_tracks) => {
+                    let is_dub_stream = state
+                        .last_play_options
+                        .as_ref()
+                        .is_some_and(|o| o.dub);
+                    let resolved_tracks = if mpv_tracks.len() == 1
+                        && (state.dub_available == Some(true) || is_dub_stream)
+                    {
+                        let live_aid = mpv_tracks[0].mpv_aid.or(Some(1));
+                        vec![
+                            services::remote::RemoteAudioTrack {
+                                id: 1,
+                                code: "jpn".to_string(),
+                                label: "Japanese (Original / 日本語)".to_string(),
+                                is_active: !is_dub_stream,
+                                is_dub: false,
+                                mpv_aid: if !is_dub_stream { live_aid } else { None },
+                            },
+                            services::remote::RemoteAudioTrack {
+                                id: 2,
+                                code: "eng".to_string(),
+                                label: "English (Dub)".to_string(),
+                                is_active: is_dub_stream,
+                                is_dub: true,
+                                mpv_aid: if is_dub_stream { live_aid } else { None },
+                            },
+                        ]
+                    } else {
+                        mpv_tracks
+                    };
 
-                        // Reuse exact playback settings from the previous episode (player, dub, quality, provider, sub_lang)
-                        let prev = state.last_play_options.clone();
-                        let query = prev
-                            .as_ref()
-                            .map(|o| o.title.clone())
-                            .unwrap_or_else(|| anime.playback_query());
-                        let is_dub = prev
-                            .as_ref()
-                            .map(|o| o.dub)
-                            .unwrap_or(cfg.audio_mode == config::AudioMode::Dub);
-                        let player = prev
-                            .as_ref()
-                            .map(|o| o.player.clone())
-                            .unwrap_or_else(|| state.selected_player().as_str().to_string());
-                        let quality = prev
-                            .as_ref()
-                            .map(|o| o.quality.clone())
-                            .unwrap_or_else(|| cfg.quality.as_str().to_string());
-                        let pref_sub_lang = prev
-                            .as_ref()
-                            .and_then(|o| o.sub_lang.clone())
-                            .unwrap_or_else(|| cfg.default_sub_lang.clone());
-                        let was_direct_stream = prev
-                            .as_ref()
-                            .map(|o| o.stream_url.is_some())
-                            .unwrap_or(true);
-
-                        state.show_toast(format!("❖ Remote: Loading Episode {}...", ep), unix_now());
-
-                        // Resolve fresh stream URL and subtitle track for the requested episode
-                        let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
-                        state.playback_qualities = stream_info.qualities.clone();
-                        state.playback_sub_languages = stream_info.subtitles.clone();
-                        state.playback_providers = stream_info.providers.clone();
-                        state.dub_available = Some(stream_info.dub_available);
-                        state.pending_master_url = stream_info.master_url.clone();
-
-                        let mut stream_url = None;
-                        if was_direct_stream {
-                            stream_url = stream_info
-                                .qualities
-                                .iter()
-                                .find(|q| q.label.eq_ignore_ascii_case(&quality))
-                                .or_else(|| stream_info.qualities.first())
-                                .map(|q| q.url.clone())
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| stream_info.master_url.clone());
-                        }
-
-                        let chosen_sub = stream_info
-                            .subtitles
+                    if !resolved_tracks.is_empty() {
+                        let active = resolved_tracks
                             .iter()
-                            .find(|s| {
-                                s.name.to_lowercase().contains(&pref_sub_lang.to_lowercase())
-                                    || s.code.to_lowercase().starts_with(&pref_sub_lang.to_lowercase())
-                                    || s.lang_keyword().eq_ignore_ascii_case(&pref_sub_lang)
-                            })
-                            .or_else(|| stream_info.subtitles.first());
-
-                        let sub_lang = chosen_sub
-                            .map(|s| s.lang_keyword().to_string())
-                            .or(Some(pref_sub_lang));
-                        let sub_url = chosen_sub
-                            .map(|s| s.url.clone())
-                            .filter(|u| !u.is_empty());
-
-                        let glsl_shaders = services::shaders::build_shader_arg_for_year(
-                            state.anime4k_mode,
-                            season_year,
-                        );
-
-                        let opts = api::player::PlayOptions {
-                            title: query,
-                            episode: ep,
-                            quality,
-                            dub: is_dub,
-                            player,
-                            sub_lang,
-                            sub_url,
-                            stream_url,
-                            ipc_socket: None,
-                            start_pos: None,
-                            glsl_shaders,
-                            sub_style: Some(cfg.subtitle_style.clone()),
-                        };
-                        start_playback(&mut state, opts, title, ep, &tx, &pool, &cfg).await;
+                            .find(|t| t.is_active)
+                            .or_else(|| resolved_tracks.first())
+                            .cloned();
+                        let r_state = state.remote_state.clone();
+                        tokio::spawn(async move {
+                            {
+                                let mut st = r_state.write().await;
+                                if let Some(ref act) = active {
+                                    st.audio_lang = act.label.clone();
+                                    st.audio_mode =
+                                        if act.is_dub { "dub" } else { "sub" }.to_string();
+                                }
+                                st.audio_tracks = resolved_tracks;
+                            }
+                            services::remote::broadcast_state(&r_state).await;
+                        });
                     }
                 }
                 AppMessage::RemoteAnime4K(mode) => {
@@ -6227,6 +6231,184 @@ async fn handle_tailored_results(
     }
 }
 
+fn build_initial_remote_audio_tracks(
+    audio_opts: &[api::subtitles::AudioTrackOption],
+    dub_available: bool,
+    is_dub_active: bool,
+) -> Vec<services::remote::RemoteAudioTrack> {
+    if audio_opts.len() > 1 {
+        let mut tracks: Vec<services::remote::RemoteAudioTrack> = audio_opts
+            .iter()
+            .enumerate()
+            .map(|(idx, opt)| {
+                let (label, is_dub) =
+                    services::remote::format_audio_track_label(&opt.code, &opt.name);
+                services::remote::RemoteAudioTrack {
+                    id: (idx + 1) as u32,
+                    code: opt.code.clone(),
+                    label,
+                    is_active: false,
+                    is_dub,
+                    mpv_aid: Some((idx + 1) as u32),
+                }
+            })
+            .collect();
+
+        let active_idx = if is_dub_active {
+            tracks
+                .iter()
+                .position(|t| t.is_dub && t.code.starts_with("eng"))
+                .or_else(|| tracks.iter().position(|t| t.is_dub))
+                .unwrap_or(0)
+        } else {
+            tracks.iter().position(|t| !t.is_dub).unwrap_or(0)
+        };
+        if let Some(t) = tracks.get_mut(active_idx) {
+            t.is_active = true;
+        }
+        return tracks;
+    }
+
+    let mut tracks = vec![services::remote::RemoteAudioTrack {
+        id: 1,
+        code: "jpn".to_string(),
+        label: "Japanese (Original / 日本語)".to_string(),
+        is_active: !is_dub_active,
+        is_dub: false,
+        mpv_aid: if !is_dub_active { Some(1) } else { None },
+    }];
+    if dub_available || is_dub_active {
+        tracks.push(services::remote::RemoteAudioTrack {
+            id: 2,
+            code: "eng".to_string(),
+            label: "English (Dub)".to_string(),
+            is_active: is_dub_active,
+            is_dub: true,
+            mpv_aid: if is_dub_active { Some(1) } else { None },
+        });
+    }
+    tracks
+}
+
+async fn launch_remote_stream_switch(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+    ep: u32,
+    dub_override: Option<bool>,
+    resume_pos: Option<f64>,
+) {
+    let Some(ref anime) = state.selected_anime.clone() else {
+        return;
+    };
+
+    // Close the current player immediately before resolving the next stream
+    services::remote::quit_active_player().await;
+    state.stop_player();
+    state.selected_episode = Some(ep);
+    let title = anime.display_title().to_string();
+    let season_year = anime.season_year;
+
+    // Reuse exact playback settings from the previous episode (player, quality, sub_lang)
+    let prev = state.last_play_options.clone();
+    let query = prev
+        .as_ref()
+        .map(|o| o.title.clone())
+        .unwrap_or_else(|| anime.playback_query());
+    let is_dub = dub_override.unwrap_or_else(|| {
+        prev.as_ref()
+            .map(|o| o.dub)
+            .unwrap_or(cfg.audio_mode == config::AudioMode::Dub)
+    });
+    let player = prev
+        .as_ref()
+        .map(|o| o.player.clone())
+        .unwrap_or_else(|| state.selected_player().as_str().to_string());
+    let quality = prev
+        .as_ref()
+        .map(|o| o.quality.clone())
+        .unwrap_or_else(|| cfg.quality.as_str().to_string());
+    let pref_sub_lang = prev
+        .as_ref()
+        .and_then(|o| o.sub_lang.clone())
+        .unwrap_or_else(|| cfg.default_sub_lang.clone());
+    let was_direct_stream = prev
+        .as_ref()
+        .map(|o| o.stream_url.is_some())
+        .unwrap_or(true);
+
+    if dub_override.is_some() {
+        let mode_label = if is_dub {
+            "English (Dub)"
+        } else {
+            "Japanese (Sub)"
+        };
+        state.show_toast(format!("❖ Remote: Switching audio to {}...", mode_label), unix_now());
+    } else {
+        state.show_toast(format!("❖ Remote: Loading Episode {}...", ep), unix_now());
+    }
+
+    // Resolve fresh stream URL and subtitle track for the requested episode & audio stream
+    let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
+    state.playback_qualities = stream_info.qualities.clone();
+    state.playback_sub_languages = stream_info.subtitles.clone();
+    state.playback_audio_tracks = stream_info.audio_tracks.clone();
+    state.playback_providers = stream_info.providers.clone();
+    state.dub_available = Some(stream_info.dub_available || is_dub);
+    state.pending_master_url = stream_info.master_url.clone();
+
+    let mut stream_url = None;
+    if was_direct_stream {
+        stream_url = stream_info
+            .qualities
+            .iter()
+            .find(|q| q.label.eq_ignore_ascii_case(&quality))
+            .or_else(|| stream_info.qualities.first())
+            .map(|q| q.url.clone())
+            .filter(|u| !u.is_empty())
+            .or_else(|| stream_info.master_url.clone());
+    }
+
+    let chosen_sub = stream_info
+        .subtitles
+        .iter()
+        .find(|s| {
+            s.name.to_lowercase().contains(&pref_sub_lang.to_lowercase())
+                || s.code.to_lowercase().starts_with(&pref_sub_lang.to_lowercase())
+                || s.lang_keyword().eq_ignore_ascii_case(&pref_sub_lang)
+        })
+        .or_else(|| stream_info.subtitles.first());
+
+    let sub_lang = chosen_sub
+        .map(|s| s.lang_keyword().to_string())
+        .or(Some(pref_sub_lang));
+    let sub_url = chosen_sub
+        .map(|s| s.url.clone())
+        .filter(|u| !u.is_empty());
+
+    let glsl_shaders = services::shaders::build_shader_arg_for_year(
+        state.anime4k_mode,
+        season_year,
+    );
+
+    let opts = api::player::PlayOptions {
+        title: query,
+        episode: ep,
+        quality,
+        dub: is_dub,
+        player,
+        sub_lang,
+        sub_url,
+        stream_url,
+        ipc_socket: None,
+        start_pos: resume_pos,
+        glsl_shaders,
+        sub_style: Some(cfg.subtitle_style.clone()),
+    };
+    start_playback(state, opts, title, ep, tx, pool, cfg).await;
+}
+
 /// Spawn player wrapper with IPC socket, auto-scrobble on 85% completion, auto-skip intro/outro, and exact timestamp resume.
 async fn start_playback(
     state:   &mut AppState,
@@ -6343,6 +6525,22 @@ async fn start_playback(
     let r_sub_preset = cfg.subtitle_style.preset.label().to_string();
     let r_anime4k = state.anime4k_mode.as_str().to_string();
     let r_audio_mode = if opts.dub { "dub".to_string() } else { "sub".to_string() };
+    let r_audio_tracks = build_initial_remote_audio_tracks(
+        &state.playback_audio_tracks,
+        state.dub_available.unwrap_or(false) || opts.dub,
+        opts.dub,
+    );
+    let r_audio_lang = r_audio_tracks
+        .iter()
+        .find(|t| t.is_active)
+        .map(|t| t.label.clone())
+        .unwrap_or_else(|| {
+            if opts.dub {
+                "English (Dub)".to_string()
+            } else {
+                "Japanese (Original / 日本語)".to_string()
+            }
+        });
     let r_aid = anime_id;
     let r_season_year = season_year;
     let r_era_badge = era.short_badge().to_string();
@@ -6367,6 +6565,8 @@ async fn start_playback(
             st.sub_preset = r_sub_preset;
             st.anime4k = r_anime4k;
             st.audio_mode = r_audio_mode;
+            st.audio_lang = r_audio_lang;
+            st.audio_tracks = r_audio_tracks;
             st.active_profile = r_profile_name;
             st.profile_icon = r_profile_icon;
         }

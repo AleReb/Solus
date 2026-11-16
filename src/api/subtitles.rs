@@ -24,6 +24,14 @@ pub struct SubtitleOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioTrackOption {
+    pub code: String,
+    pub name: String,
+    pub stream_label: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderOption {
     pub id: String,
     pub name: String,
@@ -103,6 +111,8 @@ pub struct StreamInfo {
     pub master_url: Option<String>,
     pub qualities: Vec<QualityOption>,
     pub subtitles: Vec<SubtitleOption>,
+    #[serde(default)]
+    pub audio_tracks: Vec<AudioTrackOption>,
     pub providers: Vec<ProviderOption>,
     pub dub_available: bool,
 }
@@ -116,6 +126,7 @@ impl StreamInfo {
                 QualityOption { label: "720p".to_string(), url: String::new() },
             ],
             subtitles: vec![SubtitleOption::default_english()],
+            audio_tracks: Vec::new(),
             providers: default_providers(),
             dub_available: false,
         }
@@ -296,6 +307,101 @@ pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<Quality
     result
 }
 
+/// Prioritize audio tracks: Japanese original first, English dub second,
+/// then major dub languages followed by remaining tracks in original order.
+pub fn prioritize_audio_tracks(tracks: &mut [AudioTrackOption]) {
+    let lang_priority = |code: &str| -> usize {
+        if code.starts_with("jpn") || code == "ja" {
+            0
+        } else if code.starts_with("eng") || code == "en" {
+            1
+        } else if code.starts_with("ara") {
+            2
+        } else if code.starts_with("spa") {
+            3
+        } else if code.starts_with("por") {
+            4
+        } else if code.starts_with("fra") || code.starts_with("fre") {
+            5
+        } else if code.starts_with("ger") || code.starts_with("deu") {
+            6
+        } else if code.starts_with("rus") {
+            7
+        } else if code.starts_with("ind") {
+            8
+        } else {
+            9
+        }
+    };
+
+    tracks.sort_by_key(|t| lang_priority(&t.code));
+}
+
+fn extract_hls_attr(line: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let mut search_from = 0;
+    while let Some(rel_idx) = line[search_from..].find(&needle) {
+        let abs_idx = search_from + rel_idx;
+        let boundary_ok = abs_idx == 0
+            || matches!(
+                line.as_bytes()[abs_idx - 1],
+                b':' | b',' | b' ' | b'\t'
+            );
+        if boundary_ok {
+            let val_part = &line[abs_idx + needle.len()..];
+            if let Some(after_quote) = val_part.strip_prefix('"') {
+                if let Some(end_q) = after_quote.find('"') {
+                    return Some(after_quote[..end_q].trim().to_string());
+                }
+            } else {
+                let end = val_part.find(',').unwrap_or(val_part.len());
+                return Some(val_part[..end].trim().to_string());
+            }
+        }
+        search_from = abs_idx + needle.len();
+    }
+    None
+}
+
+/// Parse actual available audio / dub language tracks from `#EXT-X-MEDIA:TYPE=AUDIO` entries in an HLS master playlist.
+pub fn parse_m3u8_audio_tracks(m3u8_content: &str) -> Vec<AudioTrackOption> {
+    let mut tracks = Vec::new();
+    let mut seen_codes = HashSet::new();
+
+    for raw_line in m3u8_content.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("#EXT-X-MEDIA:") {
+            continue;
+        }
+        let media_type = extract_hls_attr(line, "TYPE").unwrap_or_default();
+        if !media_type.eq_ignore_ascii_case("AUDIO") {
+            continue;
+        }
+
+        let name_attr = extract_hls_attr(line, "NAME").unwrap_or_default();
+        let lang_attr = extract_hls_attr(line, "LANGUAGE").unwrap_or_default();
+        let is_default = extract_hls_attr(line, "DEFAULT")
+            .is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+
+        let (code, resolved_name) = resolve_lang_meta(&name_attr, &lang_attr);
+        if seen_codes.insert(code.clone()) {
+            tracks.push(AudioTrackOption {
+                code,
+                name: resolved_name.clone(),
+                stream_label: if !name_attr.is_empty() {
+                    name_attr
+                } else {
+                    resolved_name
+                },
+                is_default,
+            });
+        }
+    }
+
+    prioritize_audio_tracks(&mut tracks);
+    tracks
+}
+
 /// Dynamically fetch verified stream info (qualities, subtitles, and direct master URL)
 /// for a specific anime episode. Automatically queries and merges community multi-language
 /// subtitle tracks (Arabic, Spanish, French, German, Italian, etc.) if not already present in the stream.
@@ -435,7 +541,7 @@ async fn resolve_primary_stream(
         );
         if let Ok(mut info) = mal_res {
             if !info.subtitles.is_empty() || !info.qualities.is_empty() {
-                info.dub_available = dub_avail || is_dub;
+                info.dub_available = info.dub_available || dub_avail || is_dub;
                 return Some(info);
             }
         }
@@ -807,7 +913,7 @@ async fn fetch_stream_via_hianime(
     let embed_resp = client.get(&embed_url).send().await.map_err(|_| ())?;
     let embed_html = embed_resp.text().await.map_err(|_| ())?;
     let mut info = parse_stream_embed(client, &embed_html).await?;
-    info.dub_available = has_dub;
+    info.dub_available = info.dub_available || has_dub;
     Ok(info)
 }
 
@@ -826,10 +932,12 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
     let subtitles = subs.map(|arr| map_subtitles(arr)).unwrap_or_else(|| vec![SubtitleOption::default_english()]);
 
     let mut qualities = Vec::new();
+    let mut audio_tracks = Vec::new();
     if let Some(ref m_url) = master_url {
         if let Ok(resp) = client.get(m_url).header("Referer", "https://zokoanime.video/").send().await {
             if let Ok(text) = resp.text().await {
                 qualities = parse_m3u8_qualities(m_url, &text);
+                audio_tracks = parse_m3u8_audio_tracks(&text);
             }
         }
         if qualities.is_empty() {
@@ -847,12 +955,15 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
         }
     }
 
+    let dub_available = audio_tracks.iter().any(|t| !t.code.starts_with("jpn"));
+
     Ok(StreamInfo {
         master_url,
         qualities,
         subtitles,
+        audio_tracks,
         providers,
-        dub_available: false,
+        dub_available,
     })
 }
 
@@ -869,7 +980,7 @@ fn deobfuscate_blob(blob_b64: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
+pub fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
     let l_lower = label.to_lowercase();
     let lang_lower = if lang.is_empty() {
         l_lower.clone()
@@ -1285,5 +1396,24 @@ mod tests {
         let has_ara = subs.iter().any(|s| s.code.starts_with("ara"));
         let has_rus = subs.iter().any(|s| s.code.starts_with("rus"));
         assert!(has_ara || has_rus, "Expected Arabic or Russian subtitle for Welcome to the N.H.K Ep 1");
+    }
+
+    #[test]
+    fn test_parse_m3u8_audio_tracks_and_prioritization() {
+        let manifest = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish (Latin America)",LANGUAGE="es-419",DEFAULT=NO,AUTOSELECT=YES,URI="audio/es-419/index.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="audio/eng/index.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="French (France)",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,URI="audio/fra/index.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Japanese",LANGUAGE="ja",DEFAULT=YES,AUTOSELECT=YES,URI="audio/jpn/index.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=5300000,RESOLUTION=1920x1080,AUDIO="aud"
+1080/index.m3u8
+"#;
+        let tracks = parse_m3u8_audio_tracks(manifest);
+        assert_eq!(tracks.len(), 4);
+        assert_eq!(tracks[0].code, "jpn");
+        assert!(tracks[0].is_default);
+        assert_eq!(tracks[1].code, "eng");
+        assert_eq!(tracks[2].code, "spa-419");
+        assert_eq!(tracks[3].code, "fra");
     }
 }

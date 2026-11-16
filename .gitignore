@@ -2,3 +2,4 @@
 .claude/
 *.db
 .DS_Store
+/PLAN.md

@@ -262,6 +262,9 @@ pub struct AppState {
     /// Playback options: available subtitle languages for the currently inspected anime episode
     pub playback_sub_languages: Vec<crate::api::subtitles::SubtitleOption>,
 
+    /// Playback options: available audio / dub tracks parsed from HLS master playlist
+    pub playback_audio_tracks: Vec<crate::api::subtitles::AudioTrackOption>,
+
     /// Playback options: selected subtitle language index
     pub playback_sub_cursor: usize,
 
@@ -623,6 +626,7 @@ impl AppState {
             playback_qualities: Vec::new(),
             playback_quality_cursor: 0,
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
+            playback_audio_tracks: Vec::new(),
             playback_sub_cursor: 0,
             playback_players: if cfg!(target_os = "macos") {
                 vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc]
@@ -1151,6 +1155,7 @@ impl AppState {
         self.playback_sub_focused = false;
         self.is_loading_subs = true;
         self.pending_master_url = None;
+        self.playback_audio_tracks.clear();
         self.playback_sub_languages = vec![crate::api::subtitles::SubtitleOption::default_english()];
         self.screen = Screen::PlaybackOptions;
     }

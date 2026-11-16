@@ -559,6 +559,20 @@ fi
     Ok(wrapper_path)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn derive_master_playlist_url(video_link: &str) -> Option<String> {
+    let trimmed = video_link.split('?').next().unwrap_or(video_link);
+    if !trimmed.ends_with("/index.m3u8") {
+        return None;
+    }
+    let without_file = trimmed.strip_suffix("/index.m3u8")?;
+    let (parent_of_parent, _) = without_file.rsplit_once('/')?;
+    if !parent_of_parent.contains("://") || parent_of_parent.ends_with(":/") {
+        return None;
+    }
+    Some(format!("{}/master.m3u8", parent_of_parent))
+}
+
 /// Spawn ani-cli asynchronously. stdout + stderr are piped for log streaming.
 /// The player is detached by default (ani-cli default behaviour).
 /// Returns a tokio Child — caller is responsible for reading I/O and waiting.
@@ -687,6 +701,10 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                             cmd.arg("--sub-auto=fuzzy");
                         }
                     }
+                    if let Some(master_url) = derive_master_playlist_url(direct_url) {
+                        cmd.arg(format!("--audio-file={}", master_url));
+                    }
+                    cmd.arg("--audio-file-auto=all");
                     if opts.dub {
                         cmd.arg("--alang=en,eng,English");
                     } else {
@@ -1095,5 +1113,21 @@ mod tests {
         assert!(iina_content.contains("--keep-running"));
         assert!(iina_content.contains("--no-stdin"));
         assert!(iina_content.contains("--mpv-user-agent"));
+    }
+
+    #[test]
+    fn test_derive_master_playlist_url() {
+        assert_eq!(
+            derive_master_playlist_url("https://cdn.example.com/hls/v1/1080/index.m3u8"),
+            Some("https://cdn.example.com/hls/v1/master.m3u8".to_string())
+        );
+        assert_eq!(
+            derive_master_playlist_url("https://cdn.example.com/index.m3u8"),
+            None
+        );
+        assert_eq!(
+            derive_master_playlist_url("https://cdn.example.com/hls/master.m3u8"),
+            None
+        );
     }
 }
