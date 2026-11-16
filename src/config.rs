@@ -120,6 +120,10 @@ fn default_anime4k() -> Anime4KMode {
     Anime4KMode::Off
 }
 
+fn default_active_profile() -> String {
+    "default".to_string()
+}
+
 /// Root config struct — persisted to ~/.config/ani-tui/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -146,6 +150,9 @@ pub struct Config {
     /// Dual-tracker OAuth Client IDs (AniList + MyAnimeList)
     #[serde(default)]
     pub trackers:         TrackersConfig,
+    /// Active multi-user profile ID
+    #[serde(default = "default_active_profile")]
+    pub active_profile:   String,
     /// Schema revision for one-time default migrations (0 = legacy v1.0.6 defaults)
     #[serde(default)]
     pub config_version:   u32,
@@ -167,6 +174,7 @@ impl Default for Config {
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
             trackers:         TrackersConfig::default(),
+            active_profile:   default_active_profile(),
             config_version:   1,
         }
     }
@@ -496,8 +504,8 @@ impl TrackerAccount {
     }
 }
 
-/// Dual-tracker authentication & sync rules — persisted to ~/.config/solus/auth.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Dual-tracker authentication & sync rules — persisted per profile under ~/.config/solus/profiles/<id>/auth.json
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
     pub anilist: TrackerAccount,
@@ -509,6 +517,8 @@ pub struct AuthConfig {
     pub auto_scrobble_both: bool,
     #[serde(default)]
     pub auto_align_lagging: bool,
+    #[serde(skip)]
+    pub profile_id: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -519,6 +529,7 @@ impl Default for AuthConfig {
             merge_policy: MergePolicy::default(),
             auto_scrobble_both: true,
             auto_align_lagging: false,
+            profile_id: None,
         }
     }
 }
@@ -558,6 +569,31 @@ impl AuthConfig {
         Ok(Config::config_dir()?.join("auth.json"))
     }
 
+    pub fn auth_path_for_profile(profile_id: &str) -> Result<PathBuf> {
+        let safe_id = if profile_id.trim().is_empty() {
+            "default"
+        } else {
+            profile_id.trim()
+        };
+        Ok(Config::config_dir()?
+            .join("profiles")
+            .join(safe_id)
+            .join("auth.json"))
+    }
+
+    pub fn remove_profile_dir(profile_id: &str) {
+        let safe_id = profile_id.trim();
+        if safe_id.is_empty() || safe_id == "default" {
+            return;
+        }
+        if let Ok(dir) = Config::config_dir() {
+            let pdir = dir.join("profiles").join(safe_id);
+            if pdir.exists() {
+                let _ = std::fs::remove_dir_all(pdir);
+            }
+        }
+    }
+
     pub fn from_json_str(raw: &str) -> std::result::Result<Self, serde_json::Error> {
         let compat: RawAuthCompat = serde_json::from_str(raw)?;
         let mut anilist = compat.anilist.unwrap_or_default();
@@ -582,30 +618,68 @@ impl AuthConfig {
             merge_policy: compat.merge_policy.unwrap_or_default(),
             auto_scrobble_both: compat.auto_scrobble_both.unwrap_or(true),
             auto_align_lagging: compat.auto_align_lagging.unwrap_or(false),
+            profile_id: None,
         })
     }
 
-    pub fn load() -> Self {
-        if let Ok(path) = Self::auth_path() {
+    pub fn load_for_profile(profile_id: &str) -> Self {
+        let pid = if profile_id.trim().is_empty() {
+            "default"
+        } else {
+            profile_id.trim()
+        };
+
+        if let Ok(path) = Self::auth_path_for_profile(pid) {
             if path.exists() {
                 if let Ok(raw) = std::fs::read_to_string(path) {
-                    if let Ok(cfg) = Self::from_json_str(&raw) {
+                    if let Ok(mut cfg) = Self::from_json_str(&raw) {
+                        cfg.profile_id = Some(pid.to_string());
                         return cfg;
                     }
                 }
             }
         }
-        Self::default()
+
+        if pid == "default" {
+            if let Ok(legacy_path) = Self::auth_path() {
+                if legacy_path.exists() {
+                    if let Ok(raw) = std::fs::read_to_string(legacy_path) {
+                        if let Ok(mut cfg) = Self::from_json_str(&raw) {
+                            cfg.profile_id = Some("default".to_string());
+                            return cfg;
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            profile_id: Some(pid.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub fn load() -> Self {
+        Self::load_for_profile("default")
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::auth_path()?;
+        let pid = self.profile_id.as_deref().unwrap_or("default");
+        let path = Self::auth_path_for_profile(pid)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| AppError::Config(format!("Failed to serialize auth: {e}")))?;
-        std::fs::write(path, content)?;
+        std::fs::write(&path, &content)?;
+        if pid == "default" {
+            if let Ok(legacy_path) = Self::auth_path() {
+                if let Some(parent) = legacy_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(legacy_path, &content);
+            }
+        }
         Ok(())
     }
 
@@ -703,6 +777,7 @@ mod tests {
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
             trackers:         TrackersConfig::default(),
+            active_profile:   default_active_profile(),
             config_version:   1,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
@@ -735,6 +810,7 @@ mod tests {
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
             trackers:         TrackersConfig::default(),
+            active_profile:   default_active_profile(),
             config_version:   1,
         };
 

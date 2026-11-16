@@ -69,6 +69,10 @@ pub struct RemotePlaybackState {
     pub season_year: Option<i64>,
     #[serde(default)]
     pub era_badge: String,
+    #[serde(default)]
+    pub active_profile: String,
+    #[serde(default)]
+    pub profile_icon: String,
 }
 
 impl Default for RemotePlaybackState {
@@ -116,6 +120,8 @@ impl Default for RemotePlaybackState {
             anime_id: None,
             season_year: None,
             era_badge: "MODERN HD".to_string(),
+            active_profile: "Default".to_string(),
+            profile_icon: "◈".to_string(),
         }
     }
 }
@@ -162,12 +168,19 @@ pub fn generate_terminal_qr(url: &str) -> Option<String> {
     Some(qr_str)
 }
 
-/// Locates the active mpv IPC Unix domain socket or Windows named pipe, checking preferred paths and active /tmp sockets.
+/// Locates the active mpv IPC Unix domain socket or Windows named pipe, checking active registry, preferred paths, and /tmp sockets.
 pub async fn resolve_active_socket(preferred: &str) -> Option<String> {
     #[cfg(unix)]
     {
+        // 0. Process-wide active socket registered by ipc.rs / start_playback
+        if let Some(active) = crate::services::ipc::get_active_socket_path() {
+            if std::path::Path::new(&active).exists() {
+                return Some(active);
+            }
+        }
+
         // 1. Direct path check
-        if std::path::Path::new(preferred).exists() {
+        if !preferred.is_empty() && std::path::Path::new(preferred).exists() {
             return Some(preferred.to_string());
         }
 
@@ -201,6 +214,11 @@ pub async fn resolve_active_socket(preferred: &str) -> Option<String> {
     }
     #[cfg(windows)]
     {
+        if let Some(active) = crate::services::ipc::get_active_socket_path() {
+            if !active.trim().is_empty() {
+                return Some(active);
+            }
+        }
         if !preferred.is_empty() {
             Some(preferred.to_string())
         } else {
@@ -209,6 +227,9 @@ pub async fn resolve_active_socket(preferred: &str) -> Option<String> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        if let Some(active) = crate::services::ipc::get_active_socket_path() {
+            return Some(active);
+        }
         if !preferred.is_empty() {
             Some(preferred.to_string())
         } else {
@@ -224,9 +245,17 @@ async fn connect_remote_ipc(target_sock: &str) -> Option<IpcStream> {
     }
     #[cfg(windows)]
     {
-        tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(target_sock)
-            .ok()
+        for attempt in 0..5 {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(target_sock) {
+                Ok(client) => return Some(client),
+                Err(e) if attempt < 4 && e.raw_os_error() == Some(231) => {
+                    // ERROR_PIPE_BUSY (231): wait briefly and retry
+                    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+        None
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -257,23 +286,33 @@ pub async fn broadcast_state(state: &Arc<RwLock<RemotePlaybackState>>) {
     }
 }
 
-/// Dispatches an mpv JSON-RPC command over the persistent Unix domain socket or Windows named pipe connection.
+/// Dispatches an mpv JSON-RPC command over the active IPC monitor channel, falling back to direct socket / named pipe connection.
 pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::Value) -> bool {
     let payload = format!("{}\n", cmd_value);
+
+    // Primary zero-overhead path: reuse the already-open IPC monitor writer (avoids Windows NPFS busy/name mismatches)
+    if crate::services::ipc::try_send_via_active_monitor(&payload) {
+        return true;
+    }
+
+    let active_override = crate::services::ipc::get_active_socket_path();
     let mut guard = CACHED_IPC.lock().await;
 
-    // Reuse the cached stream, but never let a dead mpv connection block all
-    // later remote actions indefinitely.
-    if let Some((_, ref mut stream)) = *guard {
-        if tokio::time::timeout(
-            tokio::time::Duration::from_millis(750),
-            async {
-                stream.write_all(payload.as_bytes()).await?;
-                stream.flush().await
-            },
-        )
-        .await
-        .is_ok_and(|result| result.is_ok())
+    // Reuse the cached stream only if it matches the active session socket/pipe
+    if let Some((ref cached_sock, ref mut stream)) = *guard {
+        let matches_active = active_override
+            .as_ref()
+            .is_none_or(|active| active == cached_sock);
+        if matches_active
+            && tokio::time::timeout(
+                tokio::time::Duration::from_millis(750),
+                async {
+                    stream.write_all(payload.as_bytes()).await?;
+                    stream.flush().await
+                },
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
         {
             return true;
         }
@@ -311,30 +350,40 @@ pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::
 /// Sends `quit` to the currently connected player and drops the cached IPC stream so the
 /// next command never targets a dead socket. Used for instant episode switching.
 pub async fn quit_active_player() {
+    let sent_via_monitor =
+        crate::services::ipc::try_send_via_active_monitor("{\"command\": [\"quit\"]}\n");
+    crate::services::ipc::set_active_ipc_sender(None);
+
     let mut guard = CACHED_IPC.lock().await;
-    if let Some((_, ref mut stream)) = *guard {
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(750),
-            async {
-                stream.write_all(b"{\"command\": [\"quit\"]}\n").await?;
-                stream.flush().await
-            },
-        )
-        .await;
-    } else {
-        drop(guard);
-        #[cfg(unix)]
-        {
-            if let Some(sock) = resolve_active_socket("/tmp/solus-mpv.sock").await {
+    if !sent_via_monitor {
+        if let Some((_, ref mut stream)) = *guard {
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(750),
+                async {
+                    stream.write_all(b"{\"command\": [\"quit\"]}\n").await?;
+                    stream.flush().await
+                },
+            )
+            .await;
+        } else {
+            drop(guard);
+            if let Some(sock) = resolve_active_socket("").await {
                 if let Some(mut st) = connect_remote_ipc(&sock).await {
-                    let _ = st.write_all(b"{\"command\": [\"quit\"]}\n").await;
-                    let _ = st.flush().await;
+                    let _ = tokio::time::timeout(
+                        tokio::time::Duration::from_millis(750),
+                        async {
+                            st.write_all(b"{\"command\": [\"quit\"]}\n").await?;
+                            st.flush().await
+                        },
+                    )
+                    .await;
                 }
             }
+            guard = CACHED_IPC.lock().await;
         }
-        guard = CACHED_IPC.lock().await;
     }
     *guard = None;
+    crate::services::ipc::set_active_socket_path(None);
     #[cfg(unix)]
     {
         let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
@@ -545,39 +594,44 @@ async fn handle_remote_action(
     match req.action.as_str() {
         "play_pause" => {
             let cmd = serde_json::json!({ "command": ["cycle", "pause"] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.is_playing = !st.is_playing;
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.is_playing = !st.is_playing;
+            }
         }
         "seek" => {
             let delta = req.delta.unwrap_or(10.0);
             let cmd = serde_json::json!({ "command": ["seek", delta, "relative"] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.time_pos = (st.time_pos + delta).max(0.0);
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.time_pos = (st.time_pos + delta).max(0.0);
+            }
         }
         "set_pos" => {
             if let Some(pos) = req.pos {
                 let cmd = serde_json::json!({ "command": ["set_property", "time-pos", pos] });
-                let _ = send_mpv_json_command(sock_path, cmd).await;
-                let mut st = state.write().await;
-                st.time_pos = pos;
+                if send_mpv_json_command(sock_path, cmd).await {
+                    let mut st = state.write().await;
+                    st.time_pos = pos;
+                }
             }
         }
         "volume" => {
             let delta = req.delta.unwrap_or(5.0);
             let cmd = serde_json::json!({ "command": ["add", "volume", delta] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.volume = (st.volume + delta as i32).clamp(0, 100);
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.volume = (st.volume + delta as i32).clamp(0, 100);
+            }
         }
         "set_volume" => {
             if let Some(val) = req.value {
                 let clamped = val.clamp(0, 100);
                 let cmd = serde_json::json!({ "command": ["set_property", "volume", clamped] });
-                let _ = send_mpv_json_command(sock_path, cmd).await;
-                let mut st = state.write().await;
-                st.volume = clamped;
+                if send_mpv_json_command(sock_path, cmd).await {
+                    let mut st = state.write().await;
+                    st.volume = clamped;
+                }
             }
         }
         "set_sub" => {
@@ -653,22 +707,25 @@ async fn handle_remote_action(
         }
         "toggle_sub_visibility" => {
             let cmd = serde_json::json!({ "command": ["cycle", "sub-visibility"] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.sub_active = !st.sub_active;
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.sub_active = !st.sub_active;
+            }
         }
         "set_sub_delay" => {
             let delta = req.delta.unwrap_or(0.25);
             let cmd = serde_json::json!({ "command": ["add", "sub-delay", delta] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.sub_delay += delta;
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.sub_delay += delta;
+            }
         }
         "reset_sub_delay" => {
             let cmd = serde_json::json!({ "command": ["set_property", "sub-delay", 0.0] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.sub_delay = 0.0;
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.sub_delay = 0.0;
+            }
         }
         "set_sub_preset" => {
             if let Some(ref preset_str) = req.preset {
@@ -778,23 +835,26 @@ async fn handle_remote_action(
         }
         "toggle_audio" => {
             let cmd = serde_json::json!({ "command": ["cycle", "audio"] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.audio_mode = if st.audio_mode == "sub" { "dub".to_string() } else { "sub".to_string() };
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.audio_mode = if st.audio_mode == "sub" { "dub".to_string() } else { "sub".to_string() };
+            }
         }
         "set_speed" => {
             if let Some(speed) = req.speed {
                 let cmd = serde_json::json!({ "command": ["set_property", "speed", speed] });
-                let _ = send_mpv_json_command(sock_path, cmd).await;
-                let mut st = state.write().await;
-                st.speed = speed;
+                if send_mpv_json_command(sock_path, cmd).await {
+                    let mut st = state.write().await;
+                    st.speed = speed;
+                }
             }
         }
         "skip_intro" => {
             let cmd = serde_json::json!({ "command": ["seek", 85.0, "relative"] });
-            let _ = send_mpv_json_command(sock_path, cmd).await;
-            let mut st = state.write().await;
-            st.time_pos = (st.time_pos + 85.0).max(0.0);
+            if send_mpv_json_command(sock_path, cmd).await {
+                let mut st = state.write().await;
+                st.time_pos = (st.time_pos + 85.0).max(0.0);
+            }
         }
         "toggle_fullscreen" => {
             let cmd = serde_json::json!({ "command": ["cycle", "fullscreen"] });
@@ -1171,6 +1231,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
   <div class="header">
     <div class="brand">❖ SOLUS REMOTE</div>
     <div class="header-actions">
+      <span class="tag-badge" id="profile-badge" style="border:1px solid var(--border-focus);color:var(--text);">◈ Default</span>
       <button class="btn-fs" onclick="sendAction('toggle_fullscreen')">󰄬 Fullscreen</button>
       <div class="status-badge" id="conn-badge">
         <div class="status-dot"></div><span id="conn-text">LIVE</span>
@@ -1425,6 +1486,13 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       document.getElementById('subtitle').innerText = data.is_playing 
         ? `Episode ${data.episode} — ${data.episode_title}`
         : 'Idle / Ready for playback';
+
+      const profileBadge = document.getElementById('profile-badge');
+      if (profileBadge) {
+        const pIcon = data.profile_icon || '◈';
+        const pName = data.active_profile || 'Default';
+        profileBadge.innerText = `${pIcon} ${pName}`;
+      }
 
       document.getElementById('audio-badge').innerText = (data.audio_mode || 'sub').toUpperCase();
       document.getElementById('sub-badge').innerText = data.sub_lang || 'Subtitles';
@@ -1732,6 +1800,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_remote_action_set_anime4k() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
         let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
         let req = RemoteActionRequest {
             action: "set_anime4k".to_string(),
@@ -1753,6 +1822,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_remote_action_set_sub_updates_active_track() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
         let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
         let req = RemoteActionRequest {
             action: "set_sub".to_string(),
@@ -1777,6 +1847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_remote_action_set_sub_preset() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
         let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
         let req = RemoteActionRequest {
             action: "set_sub_preset".to_string(),
@@ -1794,5 +1865,27 @@ mod tests {
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
         let st = state.read().await;
         assert_eq!(st.sub_preset, "Netflix Clean");
+    }
+
+    #[tokio::test]
+    async fn test_send_mpv_json_command_routes_through_active_ipc_monitor() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::services::ipc::set_active_socket_path(Some(r"\\.\pipe\solus-mpv-154587-1".to_string()));
+        crate::services::ipc::set_active_ipc_sender(Some(tx));
+
+        let ok = send_mpv_json_command(
+            r"\\.\pipe\solus-mpv",
+            serde_json::json!({ "command": ["cycle", "pause"] }),
+        )
+        .await;
+        assert!(ok);
+
+        let delivered = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(delivered.trim()).unwrap();
+        assert_eq!(parsed["command"], serde_json::json!(["cycle", "pause"]));
+
+        crate::services::ipc::set_active_ipc_sender(None);
+        crate::services::ipc::set_active_socket_path(None);
     }
 }

@@ -129,6 +129,11 @@ jobs:
             echo "commit_msg=$commit_msg"
           } >> "$GITHUB_OUTPUT"
 
+      - name: generate sha256 checksums
+        shell: bash
+        run: |
+          (cd artifacts && sha256sum solus-* ani-tui-* > SHA256SUMS.txt)
+
       - name: create release
         uses: softprops/action-gh-release@v2
         with:

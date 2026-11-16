@@ -45,6 +45,17 @@ pub enum Screen {
     UpdateModal,
     /// Seasonal Anime & Movie Release Calendar popup (`[c]`)
     Calendar,
+    /// Multi-user "Who's Watching?" profile switcher & manager (`[P]`)
+    ProfileModal,
+}
+
+/// Active inline text input mode inside the Profile Switcher modal (`[P]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProfileInputMode {
+    #[default]
+    None,
+    CreateName,
+    RenameName,
 }
 
 /// Phases of the in-app self-updater modal dialog.
@@ -567,6 +578,17 @@ pub struct AppState {
     pub calendar_tz_offset_secs: i64,
     pub calendar_today_unix: i64,
     pub is_loading_calendar: bool,
+
+    /// Multi-user profile switcher (`[P]`) state
+    pub active_profile_id: String,
+    pub active_profile_name: String,
+    pub active_profile_icon: String,
+    pub profiles_list: Vec<crate::db::user::ProfileSummary>,
+    pub profile_cursor: usize,
+    pub profile_input_mode: ProfileInputMode,
+    pub profile_name_input: String,
+    pub profile_avatar_cursor: usize,
+    pub profile_audio_dub: bool,
 }
 
 impl AppState {
@@ -725,6 +747,15 @@ impl AppState {
             calendar_tz_offset_secs: 0,
             calendar_today_unix: 0,
             is_loading_calendar: false,
+            active_profile_id: "default".to_string(),
+            active_profile_name: "Default".to_string(),
+            active_profile_icon: "◈".to_string(),
+            profiles_list: Vec::new(),
+            profile_cursor: 0,
+            profile_input_mode: ProfileInputMode::None,
+            profile_name_input: String::new(),
+            profile_avatar_cursor: 0,
+            profile_audio_dub: false,
         }
     }
 
@@ -855,7 +886,7 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal => {
                 if self.overlay_base == self.screen {
                     Screen::Home
                 } else {
@@ -1078,6 +1109,20 @@ impl AppState {
         }
     }
 
+    /// Open the Multi-User "Who's Watching?" Profile Switcher modal (`[P]`).
+    pub fn open_profile_modal(&mut self, summaries: Vec<crate::db::user::ProfileSummary>) {
+        if self.screen != Screen::ProfileModal {
+            self.overlay_base = self.current_base_screen();
+        }
+        self.profile_cursor = summaries.iter().position(|s| s.is_active).unwrap_or(0);
+        self.profiles_list = summaries;
+        self.profile_input_mode = ProfileInputMode::None;
+        self.profile_name_input.clear();
+        self.profile_avatar_cursor = 0;
+        self.profile_audio_dub = false;
+        self.screen = Screen::ProfileModal;
+    }
+
     /// Open the playback query picker for the current anime.
     pub fn open_playback_query_picker(&mut self, anime: &Anime) {
         self.playback_queries = anime.playback_queries();
@@ -1280,7 +1325,7 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal => self.overlay_base.clone(),
             Screen::CastDeck => Screen::Detail,
             Screen::Home => Screen::Home,
         }

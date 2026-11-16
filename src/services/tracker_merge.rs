@@ -332,6 +332,7 @@ pub async fn merge_and_reconcile(
     unresolved_mal_titles: Vec<String>,
     now: i64,
 ) -> Result<MergeReport> {
+    let pid = crate::db::user::get_active_profile_id(pool).await;
     let dismissed_cw = get_dismissed_ids(pool, "continue_watching").await?;
     let dismissed_wl = get_dismissed_ids(pool, "watchlist").await?;
 
@@ -342,14 +343,16 @@ pub async fn merge_and_reconcile(
     let mut prev_replaced_planning: HashSet<i64> = HashSet::new();
     for provider in replaced_providers {
         let prev_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT anime_id FROM tracker_entries WHERE provider = ? AND status = 'PLANNING'",
+            "SELECT anime_id FROM tracker_entries WHERE profile_id = ? AND provider = ? AND status = 'PLANNING'",
         )
+        .bind(&pid)
         .bind(provider.as_str())
         .fetch_all(&mut *tx)
         .await?;
         prev_replaced_planning.extend(prev_ids);
 
-        sqlx::query("DELETE FROM tracker_entries WHERE provider = ?")
+        sqlx::query("DELETE FROM tracker_entries WHERE profile_id = ? AND provider = ?")
+            .bind(&pid)
             .bind(provider.as_str())
             .execute(&mut *tx)
             .await?;
@@ -359,15 +362,16 @@ pub async fn merge_and_reconcile(
         execute_upsert_anime(&mut *tx, &rec.anime).await?;
         sqlx::query(
             "INSERT INTO tracker_entries
-                 (anime_id, provider, status, progress, score, remote_updated_at, last_synced_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(anime_id, provider) DO UPDATE SET
+                 (profile_id, anime_id, provider, status, progress, score, remote_updated_at, last_synced_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(profile_id, anime_id, provider) DO UPDATE SET
                  status            = excluded.status,
                  progress          = excluded.progress,
                  score             = COALESCE(excluded.score, tracker_entries.score),
                  remote_updated_at = COALESCE(excluded.remote_updated_at, tracker_entries.remote_updated_at),
                  last_synced_at    = excluded.last_synced_at",
         )
+        .bind(&pid)
         .bind(rec.anime.id)
         .bind(rec.provider.as_str())
         .bind(&rec.status)
@@ -382,16 +386,19 @@ pub async fn merge_and_reconcile(
     let all_rows = sqlx::query_as::<_, TrackerEntryRow>(
         "SELECT anime_id, provider, status, progress, score, remote_updated_at, last_synced_at
          FROM tracker_entries
+         WHERE profile_id = ?
          ORDER BY anime_id ASC, provider ASC",
     )
+    .bind(&pid)
     .fetch_all(&mut *tx)
     .await?;
 
     let title_rows = sqlx::query(
         "SELECT id, mal_id, COALESCE(NULLIF(TRIM(title_english), ''), title_romaji) AS display_title
          FROM anime
-         WHERE id IN (SELECT DISTINCT anime_id FROM tracker_entries)",
+         WHERE id IN (SELECT DISTINCT anime_id FROM tracker_entries WHERE profile_id = ?)",
     )
+    .bind(&pid)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -459,17 +466,19 @@ pub async fn merge_and_reconcile(
 
         match resolved.status.as_str() {
             "CURRENT" => {
-                sqlx::query("DELETE FROM watchlist WHERE anime_id = ?")
+                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await?;
 
                 if resolved.progress > 0 && !dismissed_cw.contains(&anime_id) {
                     sqlx::query(
-                        "INSERT INTO history (anime_id, episode, watched_at)
-                         VALUES (?, ?, ?)
-                         ON CONFLICT(anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
+                        "INSERT INTO history (profile_id, anime_id, episode, watched_at)
+                         VALUES (?, ?, ?, ?)
+                         ON CONFLICT(profile_id, anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
                     )
+                    .bind(&pid)
                     .bind(anime_id)
                     .bind(resolved.progress as i64)
                     .bind(now)
@@ -477,12 +486,13 @@ pub async fn merge_and_reconcile(
                     .await?;
 
                     sqlx::query(
-                        "INSERT INTO continue_watching (anime_id, last_episode, last_watched)
-                         VALUES (?, ?, ?)
-                         ON CONFLICT(anime_id) DO UPDATE SET
+                        "INSERT INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
+                         VALUES (?, ?, ?, ?)
+                         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
                              last_episode = excluded.last_episode,
                              last_watched = excluded.last_watched",
                     )
+                    .bind(&pid)
                     .bind(anime_id)
                     .bind(resolved.progress as i64)
                     .bind(now)
@@ -490,8 +500,9 @@ pub async fn merge_and_reconcile(
                     .await?;
 
                     let _ = sqlx::query(
-                        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'continue_watching'",
+                        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'continue_watching'",
                     )
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await;
@@ -499,33 +510,38 @@ pub async fn merge_and_reconcile(
             }
             "PLANNING" => {
                 if !dismissed_wl.contains(&anime_id) {
-                    sqlx::query("INSERT OR IGNORE INTO watchlist (anime_id, added_at) VALUES (?, ?)")
+                    sqlx::query("INSERT OR IGNORE INTO watchlist (profile_id, anime_id, added_at) VALUES (?, ?, ?)")
+                        .bind(&pid)
                         .bind(anime_id)
                         .bind(resolved.best_updated_at.max(now))
                         .execute(&mut *tx)
                         .await?;
 
                     let _ = sqlx::query(
-                        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'watchlist'",
+                        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'watchlist'",
                     )
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await;
                 }
             }
             "COMPLETED" => {
-                sqlx::query("DELETE FROM watchlist WHERE anime_id = ?")
+                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("DELETE FROM continue_watching WHERE anime_id = ?")
+                sqlx::query("DELETE FROM continue_watching WHERE profile_id = ? AND anime_id = ?")
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await?;
             }
             _ => {
                 // PAUSED / DROPPED: keep out of Planning Watchlist so it stays accurate
-                sqlx::query("DELETE FROM watchlist WHERE anime_id = ?")
+                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+                    .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await?;
@@ -537,7 +553,8 @@ pub async fn merge_and_reconcile(
     // unless another connected provider still holds them or they are purely Local.
     for old_wl_id in prev_replaced_planning {
         if !tracked_ids.contains(&old_wl_id) {
-            sqlx::query("DELETE FROM watchlist WHERE anime_id = ?")
+            sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+                .bind(&pid)
                 .bind(old_wl_id)
                 .execute(&mut *tx)
                 .await?;
@@ -558,12 +575,14 @@ pub async fn merge_and_reconcile(
 
 /// Compute the live `MergeReport` purely from stored SQLite `tracker_entries`.
 pub async fn build_merge_audit(pool: &SqlitePool, policy: MergePolicy) -> Result<MergeReport> {
+    let pid = crate::db::user::get_active_profile_id(pool).await;
     let all_rows = get_all_tracker_entries(pool).await?;
     let title_rows = sqlx::query(
         "SELECT id, mal_id, COALESCE(NULLIF(TRIM(title_english), ''), title_romaji) AS display_title
          FROM anime
-         WHERE id IN (SELECT DISTINCT anime_id FROM tracker_entries)",
+         WHERE id IN (SELECT DISTINCT anime_id FROM tracker_entries WHERE profile_id = ?)",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
 

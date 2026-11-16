@@ -565,7 +565,9 @@ fi
 pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     let args = build_args(opts);
     let player = resolve_player(&opts.player);
+    #[cfg(not(windows))]
     let wrapper_path = ensure_player_wrapper(&player)?;
+    #[cfg(not(windows))]
     let bin_dir = wrapper_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -729,6 +731,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 Some(val) => env::split_paths(&val).collect::<Vec<_>>(),
                 None => Vec::new(),
             };
+            #[cfg(not(windows))]
             current_paths.insert(0, bin_dir.clone());
             #[cfg(target_os = "macos")]
             {
@@ -804,6 +807,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         Some(val) => env::split_paths(&val).collect::<Vec<_>>(),
         None => Vec::new(),
     };
+    #[cfg(not(windows))]
     current_paths.insert(0, bin_dir);
     #[cfg(windows)]
     {

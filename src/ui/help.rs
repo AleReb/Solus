@@ -69,6 +69,7 @@ const FEATURES_BINDINGS: &[BindingRow] = &[
 ];
 
 const SYSTEM_BINDINGS: &[BindingRow] = &[
+    BindingRow { key: "P", desc: "Switch / manage user profiles" },
     BindingRow { key: "s", desc: "Open Settings Control Hub" },
     BindingRow { key: "t / T", desc: "Cycle active UI theme" },
     BindingRow { key: "!", desc: "Open System Doctor & Pipeline" },
@@ -105,6 +106,7 @@ fn active_section(screen: &Screen) -> HelpSection {
         | Screen::Setup
         | Screen::UpdateModal
         | Screen::AniListLogin
+        | Screen::ProfileModal
         | Screen::Help => HelpSection::System,
     }
 }
@@ -124,6 +126,7 @@ fn context_label(screen: &Screen) -> &'static str {
         Screen::Setup => "SYSTEM DOCTOR",
         Screen::UpdateModal => "SELF-UPDATE",
         Screen::AniListLogin => "ANILIST AUTH",
+        Screen::ProfileModal => "PROFILE SWITCHER",
         Screen::Help => "COMMAND MATRIX",
     }
 }

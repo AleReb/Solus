@@ -433,10 +433,12 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     }
     all_ids.sort_unstable();
     all_ids.dedup();
+    let pid = user::get_active_profile_id(pool).await;
     let watched_counts = user::get_watched_counts(pool, &all_ids).await.unwrap_or_default();
     let progress_rows = sqlx::query_as::<_, (i64, i64, f64, f64)>(
-        "SELECT anime_id, episode, position_secs, duration_secs FROM playback_progress ORDER BY updated_at DESC",
+        "SELECT anime_id, episode, position_secs, duration_secs FROM playback_progress WHERE profile_id = ? ORDER BY updated_at DESC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();

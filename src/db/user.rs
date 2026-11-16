@@ -1,9 +1,354 @@
-//! User data: watch history, continue watching, watchlist.
+//! User data: multi-user profiles, watch history, continue watching, watchlist.
 
 use crate::config::{AudioMode, TrackerProvider};
 use crate::error::Result;
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
+
+/// Custom theme-fitted profile badge icons (zero color emojis).
+pub const PROFILE_AVATAR_PRESETS: &[(&str, &str)] = &[
+    ("◈", "Diamond"),
+    ("✦", "Star"),
+    ("❖", "Crucible"),
+    ("⬡", "Hex"),
+    ("◎", "Beacon"),
+    ("◆", "Prism"),
+    ("󰍂", "Spirit"),
+    ("", "Solus"),
+];
+
+/// A single local user profile sharing cached anime metadata while isolating user activity.
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
+pub struct UserProfile {
+    pub id: String,
+    pub display_name: String,
+    pub avatar_icon: String,
+    pub theme_index: i64,
+    pub audio_mode: String,
+    pub created_at: i64,
+    pub last_active_at: i64,
+}
+
+/// Aggregated profile card metadata for the "Who's Watching?" switcher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileSummary {
+    pub profile: UserProfile,
+    pub episodes_watched: usize,
+    pub hours_watched: f64,
+    pub watchlist_count: usize,
+    pub auth: crate::config::AuthConfig,
+    pub is_active: bool,
+}
+
+/// Normalize a human-readable profile name into a safe filesystem / SQL slug.
+pub fn sanitize_profile_id(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace()) && !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "profile".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Read the active profile ID for this SQLite database (defaults to `"default"`).
+pub async fn get_active_profile_id(pool: &SqlitePool) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT profile_id FROM active_profile_state WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| "default".to_string())
+}
+
+/// Switch the active profile ID in SQLite and update its last_active_at timestamp.
+pub async fn set_active_profile_id(pool: &SqlitePool, profile_id: &str, now: i64) -> Result<()> {
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles WHERE id = ?")
+        .bind(profile_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if exists == 0 {
+        return Err(crate::error::AppError::Config(format!(
+            "Profile '{}' does not exist",
+            profile_id
+        )));
+    }
+    sqlx::query("INSERT OR REPLACE INTO active_profile_state (id, profile_id) VALUES (1, ?)")
+        .bind(profile_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE profiles SET last_active_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(profile_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Resolve a CLI `--profile` value matching either exact ID or case-insensitive display name.
+pub async fn resolve_profile_id_by_name_or_id(pool: &SqlitePool, input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM profiles WHERE id = ? OR LOWER(display_name) = LOWER(?) LIMIT 1",
+    )
+    .bind(trimmed)
+    .bind(trimmed)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Fetch the currently active `UserProfile` row.
+pub async fn get_active_profile(pool: &SqlitePool) -> Result<UserProfile> {
+    let active_id = get_active_profile_id(pool).await;
+    if let Some(p) = sqlx::query_as::<_, UserProfile>(
+        "SELECT id, display_name, avatar_icon, theme_index, audio_mode, created_at, last_active_at
+         FROM profiles WHERE id = ?",
+    )
+    .bind(&active_id)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(p);
+    }
+
+    let fallback = sqlx::query_as::<_, UserProfile>(
+        "SELECT id, display_name, avatar_icon, theme_index, audio_mode, created_at, last_active_at
+         FROM profiles WHERE id = 'default'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(fallback)
+}
+
+/// List all user profiles ordered with `"default"` first, then creation time ascending.
+pub async fn list_profiles(pool: &SqlitePool) -> Result<Vec<UserProfile>> {
+    let rows = sqlx::query_as::<_, UserProfile>(
+        "SELECT id, display_name, avatar_icon, theme_index, audio_mode, created_at, last_active_at
+         FROM profiles
+         ORDER BY CASE WHEN id = 'default' THEN 0 ELSE 1 END ASC, created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// List all profiles enriched with isolated watch stats and per-profile tracker auth.
+pub async fn list_profile_summaries(pool: &SqlitePool) -> Result<Vec<ProfileSummary>> {
+    let profiles = list_profiles(pool).await?;
+    let active_id = get_active_profile_id(pool).await;
+    let mut summaries = Vec::with_capacity(profiles.len());
+
+    for profile in profiles {
+        let ep_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM history WHERE profile_id = ?",
+        )
+        .bind(&profile.id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        let tracked_secs: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(position_secs), 0.0) FROM playback_progress WHERE profile_id = ?",
+        )
+        .bind(&profile.id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0.0);
+
+        let tracked_cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM playback_progress WHERE profile_id = ?",
+        )
+        .bind(&profile.id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        let untracked = (ep_count - tracked_cnt).max(0);
+        let hours_watched = (tracked_secs + (untracked as f64 * 1440.0)) / 3600.0;
+
+        let watchlist_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM watchlist WHERE profile_id = ?",
+        )
+        .bind(&profile.id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        let auth = crate::config::AuthConfig::load_for_profile(&profile.id);
+        let is_active = profile.id == active_id;
+
+        summaries.push(ProfileSummary {
+            profile,
+            episodes_watched: ep_count.max(0) as usize,
+            hours_watched,
+            watchlist_count: watchlist_count.max(0) as usize,
+            auth,
+            is_active,
+        });
+    }
+
+    Ok(summaries)
+}
+
+/// Create a new isolated profile with a unique slug ID.
+pub async fn create_profile(
+    pool: &SqlitePool,
+    display_name: &str,
+    avatar_icon: &str,
+    theme_index: usize,
+    audio_mode: &str,
+    now: i64,
+) -> Result<UserProfile> {
+    let clean_name = display_name.trim();
+    let final_name = if clean_name.is_empty() {
+        "Viewer"
+    } else {
+        clean_name
+    };
+    let base_id = sanitize_profile_id(final_name);
+    let mut candidate = base_id.clone();
+    let mut suffix = 2usize;
+    loop {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles WHERE id = ?")
+            .bind(&candidate)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        if exists == 0 {
+            break;
+        }
+        candidate = format!("{base_id}-{suffix}");
+        suffix += 1;
+    }
+
+    let icon = if avatar_icon.trim().is_empty() {
+        "◈"
+    } else {
+        avatar_icon.trim()
+    };
+    let mode = if audio_mode.eq_ignore_ascii_case("dub") {
+        "dub"
+    } else {
+        "sub"
+    };
+
+    sqlx::query(
+        "INSERT INTO profiles (id, display_name, avatar_icon, theme_index, audio_mode, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&candidate)
+    .bind(final_name)
+    .bind(icon)
+    .bind(theme_index as i64)
+    .bind(mode)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(UserProfile {
+        id: candidate,
+        display_name: final_name.to_string(),
+        avatar_icon: icon.to_string(),
+        theme_index: theme_index as i64,
+        audio_mode: mode.to_string(),
+        created_at: now,
+        last_active_at: now,
+    })
+}
+
+/// Update an existing profile's display name, icon, theme, and preferred audio mode.
+pub async fn update_profile(
+    pool: &SqlitePool,
+    profile_id: &str,
+    display_name: &str,
+    avatar_icon: &str,
+    theme_index: usize,
+    audio_mode: &str,
+) -> Result<()> {
+    let clean_name = display_name.trim();
+    if clean_name.is_empty() {
+        return Ok(());
+    }
+    let icon = if avatar_icon.trim().is_empty() {
+        "◈"
+    } else {
+        avatar_icon.trim()
+    };
+    let mode = if audio_mode.eq_ignore_ascii_case("dub") {
+        "dub"
+    } else {
+        "sub"
+    };
+    sqlx::query(
+        "UPDATE profiles SET display_name = ?, avatar_icon = ?, theme_index = ?, audio_mode = ? WHERE id = ?",
+    )
+    .bind(clean_name)
+    .bind(icon)
+    .bind(theme_index as i64)
+    .bind(mode)
+    .bind(profile_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a non-default profile and purge all of its profile-scoped records.
+pub async fn delete_profile(pool: &SqlitePool, profile_id: &str) -> Result<bool> {
+    if profile_id == "default" || profile_id.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let active_id = get_active_profile_id(pool).await;
+    let mut tx = pool.begin().await?;
+
+    for table in [
+        "history",
+        "continue_watching",
+        "watchlist",
+        "playback_progress",
+        "tracker_entries",
+        "dismissed_sync",
+        "playback_prefs",
+        "audio_prefs",
+    ] {
+        let q = format!("DELETE FROM {table} WHERE profile_id = ?");
+        sqlx::query(&q).bind(profile_id).execute(&mut *tx).await?;
+    }
+
+    let deleted = sqlx::query("DELETE FROM profiles WHERE id = ?")
+        .bind(profile_id)
+        .execute(&mut *tx)
+        .await?;
+
+    if active_id == profile_id {
+        sqlx::query("INSERT OR REPLACE INTO active_profile_state (id, profile_id) VALUES (1, 'default')")
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(deleted.rows_affected() > 0)
+}
 
 /// A single history entry: which episode of which show was watched.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -38,16 +383,18 @@ pub async fn batch_sync_user_collection(
     dismissed_wl: &std::collections::HashSet<i64>,
     now: i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     let mut tx = pool.begin().await?;
 
     for (anime, progress) in &coll.watching {
         crate::db::cache::execute_upsert_anime(&mut *tx, anime).await?;
         if !dismissed_cw.contains(&anime.id) {
             sqlx::query(
-                "INSERT INTO history (anime_id, episode, watched_at)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
+                "INSERT INTO history (profile_id, anime_id, episode, watched_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(profile_id, anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
             )
+            .bind(&pid)
             .bind(anime.id)
             .bind(*progress as i64)
             .bind(now)
@@ -55,12 +402,13 @@ pub async fn batch_sync_user_collection(
             .await?;
 
             sqlx::query(
-                "INSERT INTO continue_watching (anime_id, last_episode, last_watched)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(anime_id) DO UPDATE SET
+                "INSERT INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(profile_id, anime_id) DO UPDATE SET
                      last_episode = excluded.last_episode,
                      last_watched = excluded.last_watched",
             )
+            .bind(&pid)
             .bind(anime.id)
             .bind(*progress as i64)
             .bind(now)
@@ -68,8 +416,9 @@ pub async fn batch_sync_user_collection(
             .await?;
 
             let _ = sqlx::query(
-                "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'continue_watching'",
+                "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'continue_watching'",
             )
+            .bind(&pid)
             .bind(anime.id)
             .execute(&mut *tx)
             .await;
@@ -80,16 +429,18 @@ pub async fn batch_sync_user_collection(
         crate::db::cache::execute_upsert_anime(&mut *tx, anime).await?;
         if !dismissed_wl.contains(&anime.id) {
             sqlx::query(
-                "INSERT OR IGNORE INTO watchlist (anime_id, added_at) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO watchlist (profile_id, anime_id, added_at) VALUES (?, ?, ?)",
             )
+            .bind(&pid)
             .bind(anime.id)
             .bind(now)
             .execute(&mut *tx)
             .await?;
 
             let _ = sqlx::query(
-                "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'watchlist'",
+                "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'watchlist'",
             )
+            .bind(&pid)
             .bind(anime.id)
             .execute(&mut *tx)
             .await;
@@ -111,11 +462,13 @@ pub async fn record_watched(
     episode:  i64,
     now:      i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT INTO history (anime_id, episode, watched_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
+        "INSERT INTO history (profile_id, anime_id, episode, watched_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id, episode) DO UPDATE SET watched_at = excluded.watched_at",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(episode)
     .bind(now)
@@ -124,12 +477,13 @@ pub async fn record_watched(
 
     // Also update or insert continue_watching
     sqlx::query(
-        "INSERT INTO continue_watching (anime_id, last_episode, last_watched)
-         VALUES (?, ?, ?)
-         ON CONFLICT(anime_id) DO UPDATE SET
+        "INSERT INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
              last_episode = excluded.last_episode,
              last_watched = excluded.last_watched",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(episode)
     .bind(now)
@@ -137,8 +491,9 @@ pub async fn record_watched(
     .await?;
 
     let _ = sqlx::query(
-        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'continue_watching'",
+        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'continue_watching'",
     )
+    .bind(&pid)
     .bind(anime_id)
     .execute(pool)
     .await;
@@ -146,13 +501,31 @@ pub async fn record_watched(
     Ok(())
 }
 
+/// Remove a single watched episode from the active profile's history.
+pub async fn remove_watched_episode(
+    pool: &SqlitePool,
+    anime_id: i64,
+    episode: i64,
+) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
+    sqlx::query("DELETE FROM history WHERE profile_id = ? AND anime_id = ? AND episode = ?")
+        .bind(&pid)
+        .bind(anime_id)
+        .bind(episode)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Fetch full history for a show, ordered by episode ascending.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn get_history(pool: &SqlitePool, anime_id: i64) -> Result<Vec<HistoryEntry>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, HistoryEntry>(
         "SELECT anime_id, episode, watched_at FROM history
-         WHERE anime_id = ? ORDER BY episode ASC",
+         WHERE profile_id = ? AND anime_id = ? ORDER BY episode ASC",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_all(pool)
     .await?;
@@ -162,12 +535,15 @@ pub async fn get_history(pool: &SqlitePool, anime_id: i64) -> Result<Vec<History
 /// Check whether a specific episode has been watched.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn is_watched(pool: &SqlitePool, anime_id: i64, episode: i64) -> Result<bool> {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM history WHERE anime_id = ? AND episode = ?")
-            .bind(anime_id)
-            .bind(episode)
-            .fetch_one(pool)
-            .await?;
+    let pid = get_active_profile_id(pool).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM history WHERE profile_id = ? AND anime_id = ? AND episode = ?",
+    )
+    .bind(&pid)
+    .bind(anime_id)
+    .bind(episode)
+    .fetch_one(pool)
+    .await?;
     Ok(count > 0)
 }
 
@@ -175,10 +551,13 @@ pub async fn is_watched(pool: &SqlitePool, anime_id: i64, episode: i64) -> Resul
 
 /// Fetch all continue-watching entries, ordered by most recently watched first.
 pub async fn get_continue_watching(pool: &SqlitePool) -> Result<Vec<ContinueEntry>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, ContinueEntry>(
         "SELECT anime_id, last_episode, last_watched FROM continue_watching
+         WHERE profile_id = ?
          ORDER BY last_watched DESC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -190,9 +569,12 @@ pub async fn get_continue_entry(
     pool:     &SqlitePool,
     anime_id: i64,
 ) -> Result<Option<ContinueEntry>> {
+    let pid = get_active_profile_id(pool).await;
     let row = sqlx::query_as::<_, ContinueEntry>(
-        "SELECT anime_id, last_episode, last_watched FROM continue_watching WHERE anime_id = ?",
+        "SELECT anime_id, last_episode, last_watched FROM continue_watching
+         WHERE profile_id = ? AND anime_id = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_optional(pool)
     .await?;
@@ -202,18 +584,22 @@ pub async fn get_continue_entry(
 /// Remove a show from continue watching and purge its local episode watch history.
 /// Also records a sync dismissal so startup/background AniList syncs do not re-add it.
 pub async fn remove_continue_watching(pool: &SqlitePool, anime_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM continue_watching WHERE anime_id = ?")
+    let pid = get_active_profile_id(pool).await;
+    sqlx::query("DELETE FROM continue_watching WHERE profile_id = ? AND anime_id = ?")
+        .bind(&pid)
         .bind(anime_id)
         .execute(pool)
         .await?;
-    sqlx::query("DELETE FROM history WHERE anime_id = ?")
+    sqlx::query("DELETE FROM history WHERE profile_id = ? AND anime_id = ?")
+        .bind(&pid)
         .bind(anime_id)
         .execute(pool)
         .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO dismissed_sync (anime_id, list_type, dismissed_at)
-         VALUES (?, 'continue_watching', strftime('%s','now'))",
+        "INSERT OR REPLACE INTO dismissed_sync (profile_id, anime_id, list_type, dismissed_at)
+         VALUES (?, ?, 'continue_watching', strftime('%s','now'))",
     )
+    .bind(&pid)
     .bind(anime_id)
     .execute(pool)
     .await?;
@@ -224,16 +610,19 @@ pub async fn remove_continue_watching(pool: &SqlitePool, anime_id: i64) -> Resul
 
 /// Add a show to the watchlist (and clear any prior sync dismissal).
 pub async fn add_to_watchlist(pool: &SqlitePool, anime_id: i64, now: i64) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT OR IGNORE INTO watchlist (anime_id, added_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO watchlist (profile_id, anime_id, added_at) VALUES (?, ?, ?)",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(now)
     .execute(pool)
     .await?;
     let _ = sqlx::query(
-        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'watchlist'",
+        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'watchlist'",
     )
+    .bind(&pid)
     .bind(anime_id)
     .execute(pool)
     .await;
@@ -242,14 +631,17 @@ pub async fn add_to_watchlist(pool: &SqlitePool, anime_id: i64, now: i64) -> Res
 
 /// Remove a show from the watchlist and record a sync dismissal so AniList syncs do not re-add it.
 pub async fn remove_from_watchlist(pool: &SqlitePool, anime_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM watchlist WHERE anime_id = ?")
+    let pid = get_active_profile_id(pool).await;
+    sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+        .bind(&pid)
         .bind(anime_id)
         .execute(pool)
         .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO dismissed_sync (anime_id, list_type, dismissed_at)
-         VALUES (?, 'watchlist', strftime('%s','now'))",
+        "INSERT OR REPLACE INTO dismissed_sync (profile_id, anime_id, list_type, dismissed_at)
+         VALUES (?, ?, 'watchlist', strftime('%s','now'))",
     )
+    .bind(&pid)
     .bind(anime_id)
     .execute(pool)
     .await?;
@@ -258,9 +650,11 @@ pub async fn remove_from_watchlist(pool: &SqlitePool, anime_id: i64) -> Result<(
 
 /// Fetch all anime IDs that the user explicitly removed/dismissed from `list_type` ("watchlist" or "continue_watching").
 pub async fn get_dismissed_ids(pool: &SqlitePool, list_type: &str) -> Result<HashSet<i64>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_scalar::<_, i64>(
-        "SELECT anime_id FROM dismissed_sync WHERE list_type = ?",
+        "SELECT anime_id FROM dismissed_sync WHERE profile_id = ? AND list_type = ?",
     )
+    .bind(&pid)
     .bind(list_type)
     .fetch_all(pool)
     .await?;
@@ -269,8 +663,10 @@ pub async fn get_dismissed_ids(pool: &SqlitePool, list_type: &str) -> Result<Has
 
 /// Check if a show is in the watchlist.
 pub async fn is_in_watchlist(pool: &SqlitePool, anime_id: i64) -> Result<bool> {
+    let pid = get_active_profile_id(pool).await;
     let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM watchlist WHERE anime_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM watchlist WHERE profile_id = ? AND anime_id = ?")
+            .bind(&pid)
             .bind(anime_id)
             .fetch_one(pool)
             .await?;
@@ -279,9 +675,11 @@ pub async fn is_in_watchlist(pool: &SqlitePool, anime_id: i64) -> Result<bool> {
 
 /// Get all distinct episode numbers watched for a specific anime, ordered ascending.
 pub async fn get_watched_episodes(pool: &SqlitePool, anime_id: i64) -> Result<Vec<i64>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_scalar::<_, i64>(
-        "SELECT DISTINCT episode FROM history WHERE anime_id = ? ORDER BY episode ASC",
+        "SELECT DISTINCT episode FROM history WHERE profile_id = ? AND anime_id = ? ORDER BY episode ASC",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_all(pool)
     .await?;
@@ -290,12 +688,14 @@ pub async fn get_watched_episodes(pool: &SqlitePool, anime_id: i64) -> Result<Ve
 
 /// Get watched-episode counts for multiple anime IDs.
 pub async fn get_watched_counts(pool: &SqlitePool, anime_ids: &[i64]) -> Result<HashMap<i64, usize>> {
+    let pid = get_active_profile_id(pool).await;
     let mut counts = HashMap::new();
 
     for &anime_id in anime_ids {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT episode) FROM history WHERE anime_id = ?",
+            "SELECT COUNT(DISTINCT episode) FROM history WHERE profile_id = ? AND anime_id = ?",
         )
+        .bind(&pid)
         .bind(anime_id)
         .fetch_one(pool)
         .await?;
@@ -307,18 +707,26 @@ pub async fn get_watched_counts(pool: &SqlitePool, anime_ids: &[i64]) -> Result<
 
 /// Fetch all watchlist anime IDs, ordered by date added.
 pub async fn get_watchlist(pool: &SqlitePool) -> Result<Vec<i64>> {
-    let ids: Vec<i64> =
-        sqlx::query_scalar("SELECT anime_id FROM watchlist ORDER BY added_at DESC")
-            .fetch_all(pool)
-            .await?;
+    let pid = get_active_profile_id(pool).await;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT anime_id FROM watchlist WHERE profile_id = ? ORDER BY added_at DESC",
+    )
+    .bind(&pid)
+    .fetch_all(pool)
+    .await?;
     Ok(ids)
 }
 
 /// Get all anime IDs that have any watch history or are in continue watching.
 pub async fn get_all_watched_anime_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let pid = get_active_profile_id(pool).await;
     let ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT DISTINCT anime_id FROM history UNION SELECT anime_id FROM continue_watching"
+        "SELECT DISTINCT anime_id FROM history WHERE profile_id = ?
+         UNION
+         SELECT anime_id FROM continue_watching WHERE profile_id = ?",
     )
+    .bind(&pid)
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
     Ok(ids)
@@ -328,14 +736,20 @@ pub async fn get_all_watched_anime_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
 pub async fn get_calendar_tracking_snapshot(
     pool: &SqlitePool,
 ) -> Result<(HashSet<i64>, HashMap<i64, HashSet<u32>>)> {
+    let pid = get_active_profile_id(pool).await;
     let tracked_rows: Vec<i64> = sqlx::query_scalar(
-        "SELECT anime_id FROM continue_watching UNION SELECT anime_id FROM watchlist",
+        "SELECT anime_id FROM continue_watching WHERE profile_id = ?
+         UNION
+         SELECT anime_id FROM watchlist WHERE profile_id = ?",
     )
+    .bind(&pid)
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
     let tracked_ids: HashSet<i64> = tracked_rows.into_iter().collect();
 
-    let hist_rows = sqlx::query("SELECT anime_id, episode FROM history")
+    let hist_rows = sqlx::query("SELECT anime_id, episode FROM history WHERE profile_id = ?")
+        .bind(&pid)
         .fetch_all(pool)
         .await?;
     let mut watched_map: HashMap<i64, HashSet<u32>> = HashMap::new();
@@ -357,13 +771,15 @@ pub async fn set_playback_query(
     query:    &str,
     now:      i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT INTO playback_prefs (anime_id, query, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(anime_id) DO UPDATE SET
+        "INSERT INTO playback_prefs (profile_id, anime_id, query, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
              query = excluded.query,
              updated_at = excluded.updated_at",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(query)
     .bind(now)
@@ -374,9 +790,11 @@ pub async fn set_playback_query(
 
 /// Get the preferred playback query for a show, if one has been saved before.
 pub async fn get_playback_query(pool: &SqlitePool, anime_id: i64) -> Result<Option<String>> {
+    let pid = get_active_profile_id(pool).await;
     let query = sqlx::query_scalar::<_, String>(
-        "SELECT query FROM playback_prefs WHERE anime_id = ?",
+        "SELECT query FROM playback_prefs WHERE profile_id = ? AND anime_id = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_optional(pool)
     .await?;
@@ -390,18 +808,20 @@ pub async fn set_audio_mode(
     audio:    AudioMode,
     now:      i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     let value = match audio {
         AudioMode::Sub => "sub",
         AudioMode::Dub => "dub",
     };
 
     sqlx::query(
-        "INSERT INTO audio_prefs (anime_id, audio_mode, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(anime_id) DO UPDATE SET
+        "INSERT INTO audio_prefs (profile_id, anime_id, audio_mode, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
              audio_mode = excluded.audio_mode,
              updated_at = excluded.updated_at",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(value)
     .bind(now)
@@ -412,9 +832,11 @@ pub async fn set_audio_mode(
 
 /// Get the preferred audio mode for a show, if one has been saved before.
 pub async fn get_audio_mode(pool: &SqlitePool, anime_id: i64) -> Result<Option<AudioMode>> {
+    let pid = get_active_profile_id(pool).await;
     let audio = sqlx::query_scalar::<_, String>(
-        "SELECT audio_mode FROM audio_prefs WHERE anime_id = ?",
+        "SELECT audio_mode FROM audio_prefs WHERE profile_id = ? AND anime_id = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_optional(pool)
     .await?;
@@ -435,13 +857,15 @@ pub async fn touch_continue_watching(
     episode:  i64,
     now:      i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT INTO continue_watching (anime_id, last_episode, last_watched)
-         VALUES (?, ?, ?)
-         ON CONFLICT(anime_id) DO UPDATE SET
+        "INSERT INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
              last_episode = excluded.last_episode,
              last_watched = excluded.last_watched",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(episode)
     .bind(now)
@@ -449,8 +873,9 @@ pub async fn touch_continue_watching(
     .await?;
 
     let _ = sqlx::query(
-        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'continue_watching'",
+        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'continue_watching'",
     )
+    .bind(&pid)
     .bind(anime_id)
     .execute(pool)
     .await;
@@ -467,14 +892,16 @@ pub async fn save_playback_progress(
     duration_secs: f64,
     now:           i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT INTO playback_progress (anime_id, episode, position_secs, duration_secs, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(anime_id, episode) DO UPDATE SET
+        "INSERT INTO playback_progress (profile_id, anime_id, episode, position_secs, duration_secs, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id, episode) DO UPDATE SET
              position_secs = excluded.position_secs,
              duration_secs = excluded.duration_secs,
              updated_at    = excluded.updated_at",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(episode as i64)
     .bind(position_secs)
@@ -492,9 +919,12 @@ pub async fn get_playback_progress(
     anime_id: i64,
     episode:  u32,
 ) -> Result<Option<(f64, f64)>> {
+    let pid = get_active_profile_id(pool).await;
     let row = sqlx::query_as::<_, (f64, f64)>(
-        "SELECT position_secs, duration_secs FROM playback_progress WHERE anime_id = ? AND episode = ?",
+        "SELECT position_secs, duration_secs FROM playback_progress
+         WHERE profile_id = ? AND anime_id = ? AND episode = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(episode as i64)
     .fetch_optional(pool)
@@ -508,9 +938,12 @@ pub async fn get_all_progress_for_anime(
     pool:     &SqlitePool,
     anime_id: i64,
 ) -> Result<HashMap<u32, (f64, f64)>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, (i64, f64, f64)>(
-        "SELECT episode, position_secs, duration_secs FROM playback_progress WHERE anime_id = ?",
+        "SELECT episode, position_secs, duration_secs FROM playback_progress
+         WHERE profile_id = ? AND anime_id = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_all(pool)
     .await?;
@@ -700,17 +1133,19 @@ pub async fn upsert_tracker_entry(
     remote_updated_at: Option<i64>,
     now: i64,
 ) -> Result<()> {
+    let pid = get_active_profile_id(pool).await;
     sqlx::query(
         "INSERT INTO tracker_entries
-             (anime_id, provider, status, progress, score, remote_updated_at, last_synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(anime_id, provider) DO UPDATE SET
+             (profile_id, anime_id, provider, status, progress, score, remote_updated_at, last_synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id, provider) DO UPDATE SET
              status            = excluded.status,
              progress          = excluded.progress,
              score             = COALESCE(excluded.score, tracker_entries.score),
              remote_updated_at = COALESCE(excluded.remote_updated_at, tracker_entries.remote_updated_at),
              last_synced_at    = excluded.last_synced_at",
     )
+    .bind(&pid)
     .bind(anime_id)
     .bind(provider.as_str())
     .bind(status)
@@ -729,7 +1164,9 @@ pub async fn delete_tracker_entry(
     anime_id: i64,
     provider: TrackerProvider,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM tracker_entries WHERE anime_id = ? AND provider = ?")
+    let pid = get_active_profile_id(pool).await;
+    sqlx::query("DELETE FROM tracker_entries WHERE profile_id = ? AND anime_id = ? AND provider = ?")
+        .bind(&pid)
         .bind(anime_id)
         .bind(provider.as_str())
         .execute(pool)
@@ -742,7 +1179,9 @@ pub async fn clear_provider_tracker_entries(
     pool: &SqlitePool,
     provider: TrackerProvider,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM tracker_entries WHERE provider = ?")
+    let pid = get_active_profile_id(pool).await;
+    sqlx::query("DELETE FROM tracker_entries WHERE profile_id = ? AND provider = ?")
+        .bind(&pid)
         .bind(provider.as_str())
         .execute(pool)
         .await?;
@@ -751,11 +1190,14 @@ pub async fn clear_provider_tracker_entries(
 
 /// Fetch all stored tracker snapshot rows across all providers.
 pub async fn get_all_tracker_entries(pool: &SqlitePool) -> Result<Vec<TrackerEntryRow>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, TrackerEntryRow>(
         "SELECT anime_id, provider, status, progress, score, remote_updated_at, last_synced_at
          FROM tracker_entries
+         WHERE profile_id = ?
          ORDER BY anime_id ASC, provider ASC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -766,12 +1208,14 @@ pub async fn get_tracker_entries_for_anime(
     pool: &SqlitePool,
     anime_id: i64,
 ) -> Result<Vec<TrackerEntryRow>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, TrackerEntryRow>(
         "SELECT anime_id, provider, status, progress, score, remote_updated_at, last_synced_at
          FROM tracker_entries
-         WHERE anime_id = ?
+         WHERE profile_id = ? AND anime_id = ?
          ORDER BY provider ASC",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_all(pool)
     .await?;
@@ -783,9 +1227,11 @@ pub async fn get_anime_watchlist_source(
     pool: &SqlitePool,
     anime_id: i64,
 ) -> Result<WatchlistSource> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT provider, status FROM tracker_entries WHERE anime_id = ?",
+        "SELECT provider, status FROM tracker_entries WHERE profile_id = ? AND anime_id = ?",
     )
+    .bind(&pid)
     .bind(anime_id)
     .fetch_all(pool)
     .await?;
@@ -804,21 +1250,25 @@ pub async fn get_anime_watchlist_source(
 pub async fn get_watchlist_with_sources(
     pool: &SqlitePool,
 ) -> Result<Vec<(i64, WatchlistSource)>> {
+    let pid = get_active_profile_id(pool).await;
     let rows = sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT w.anime_id,
                 EXISTS(
                     SELECT 1 FROM tracker_entries te
-                    WHERE te.anime_id = w.anime_id
+                    WHERE te.profile_id = w.profile_id
+                      AND te.anime_id = w.anime_id
                       AND te.provider = 'anilist'
                       AND te.status = 'PLANNING'
                 ) AS in_al,
                 EXISTS(
                     SELECT 1 FROM tracker_entries te
-                    WHERE te.anime_id = w.anime_id
+                    WHERE te.profile_id = w.profile_id
+                      AND te.anime_id = w.anime_id
                       AND te.provider = 'mal'
                       AND te.status = 'PLANNING'
                 ) AS in_mal
          FROM watchlist w
+         WHERE w.profile_id = ?
          ORDER BY
             CASE
                 WHEN in_al = 1 AND in_mal = 0 THEN 0
@@ -829,6 +1279,7 @@ pub async fn get_watchlist_with_sources(
             w.added_at DESC,
             w.anime_id ASC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
 
@@ -1008,6 +1459,7 @@ struct CalendarTelemetry {
 
 async fn load_calendar_telemetry(
     pool: &SqlitePool,
+    profile_id: &str,
     avg_hours_per_ep: f64,
 ) -> CalendarTelemetry {
     let history_day_rows = sqlx::query(
@@ -1015,9 +1467,11 @@ async fn load_calendar_telemetry(
                 CAST(julianday(date(watched_at, 'unixepoch', 'localtime')) AS INTEGER) as jday,
                 COUNT(*) as cnt
          FROM history
+         WHERE profile_id = ?
          GROUP BY day_str
          ORDER BY jday ASC",
     )
+    .bind(profile_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1150,22 +1604,29 @@ async fn load_calendar_telemetry(
 
 /// Query local SQLite watch history and anime metadata to generate personalized analytics.
 pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> {
+    let pid = get_active_profile_id(pool).await;
+
     // 1. Total distinct episodes watched & duration calculation
-    let total_episodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM history")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+    let total_episodes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM history WHERE profile_id = ?",
+    )
+    .bind(&pid)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
 
     let tracked_seconds: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(position_secs), 0.0) FROM playback_progress",
+        "SELECT COALESCE(SUM(position_secs), 0.0) FROM playback_progress WHERE profile_id = ?",
     )
+    .bind(&pid)
     .fetch_one(pool)
     .await
     .unwrap_or(0.0);
 
     let tracked_episodes_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM playback_progress",
+        "SELECT COUNT(*) FROM playback_progress WHERE profile_id = ?",
     )
+    .bind(&pid)
     .fetch_one(pool)
     .await
     .unwrap_or(0);
@@ -1181,16 +1642,20 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
                 COUNT(h.episode) as watched_count, MAX(h.watched_at) as last_watched_at
          FROM history h
          JOIN anime a ON h.anime_id = a.id
+         WHERE h.profile_id = ?
          GROUP BY a.id",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await?;
 
     let progress_rows = sqlx::query(
         "SELECT anime_id, COALESCE(SUM(position_secs), 0.0) as dur, COUNT(*) as cnt
          FROM playback_progress
+         WHERE profile_id = ?
          GROUP BY anime_id",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1209,8 +1674,10 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
                 SUM(CASE WHEN f.filler_type != 'filler' THEN 1 ELSE 0 END) as canon_cnt
          FROM history h
          JOIN anime_fillers f ON h.anime_id = f.anime_id AND h.episode = f.episode
+         WHERE h.profile_id = ?
          GROUP BY h.anime_id",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1443,7 +1910,7 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     } else {
         0.4
     };
-    let cal = load_calendar_telemetry(pool, avg_hours_per_ep).await;
+    let cal = load_calendar_telemetry(pool, &pid, avg_hours_per_ep).await;
 
     // 4. Local hour & weekday histograms
     let hour_rows = sqlx::query(
@@ -1451,8 +1918,10 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
                 CAST(strftime('%w', watched_at, 'unixepoch', 'localtime') AS INTEGER) as dow,
                 COUNT(*) as cnt
          FROM history
+         WHERE profile_id = ?
          GROUP BY hr, dow",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1508,15 +1977,17 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
 
     // 5. Real SUB/DUB counts from audio_prefs (fixed from legacy playback_prefs typo)
     let sub_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audio_prefs WHERE audio_mode = 'sub'",
+        "SELECT COUNT(*) FROM audio_prefs WHERE profile_id = ? AND audio_mode = 'sub'",
     )
+    .bind(&pid)
     .fetch_one(pool)
     .await
     .unwrap_or(0);
 
     let dub_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audio_prefs WHERE audio_mode = 'dub'",
+        "SELECT COUNT(*) FROM audio_prefs WHERE profile_id = ? AND audio_mode = 'dub'",
     )
+    .bind(&pid)
     .fetch_one(pool)
     .await
     .unwrap_or(0);
@@ -1536,11 +2007,13 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     // 6. Watchlist backlog horizon (sorted newest saved first)
     let wl_rows = sqlx::query(
         "SELECT a.id, a.title_english, a.title_romaji, a.episodes, a.genres,
-                (SELECT COUNT(*) FROM history h WHERE h.anime_id = a.id) as watched_eps
+                (SELECT COUNT(*) FROM history h WHERE h.profile_id = w.profile_id AND h.anime_id = a.id) as watched_eps
          FROM watchlist w
          JOIN anime a ON w.anime_id = a.id
+         WHERE w.profile_id = ?
          ORDER BY w.added_at DESC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1602,8 +2075,10 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
                 strftime('%m-%d %H:%M', h.watched_at, 'unixepoch', 'localtime') as fmt_time
          FROM history h
          JOIN anime a ON h.anime_id = a.id
+         WHERE h.profile_id = ?
          ORDER BY h.watched_at DESC",
     )
+    .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -2203,5 +2678,77 @@ mod tests {
         );
         assert_eq!(get_anime_watchlist_source(&pool, 1).await.unwrap(), WatchlistSource::Both);
         assert_eq!(get_anime_watchlist_source(&pool, 4).await.unwrap(), WatchlistSource::Local);
+    }
+
+    #[tokio::test]
+    async fn test_multi_profile_isolation_and_shared_catalog() {
+        let pool = init(":memory:").await.unwrap();
+        let anime = Anime {
+            id: 777,
+            title_romaji: "Frieren".into(),
+            title_english: Some("Frieren: Beyond Journey's End".into()),
+            title_native: None,
+            description: None,
+            episodes: Some(28),
+            status: Some("FINISHED".into()),
+            season: Some("FALL".into()),
+            season_year: Some(2023),
+            score: Some(91),
+            format: Some("TV".into()),
+            genres: "[\"Adventure\",\"Fantasy\"]".into(),
+            cover_url: None,
+            cover_blob: None,
+            has_dub: 1,
+            updated_at: 100,
+            next_airing_episode: None,
+            mal_id: Some(52991),
+        };
+        upsert_anime(&pool, &anime).await.unwrap();
+
+        // Profile 1 ("default") watches eps 1..=3, saves progress on ep 4, and puts show on watchlist
+        record_watched(&pool, 777, 1, 1000).await.unwrap();
+        record_watched(&pool, 777, 2, 1100).await.unwrap();
+        record_watched(&pool, 777, 3, 1200).await.unwrap();
+        save_playback_progress(&pool, 777, 4, 620.0, 1440.0, 1250).await.unwrap();
+        add_to_watchlist(&pool, 777, 1250).await.unwrap();
+
+        // Create and switch to Profile 2 ("brother")
+        let brother = create_profile(&pool, "Brother", "✦", 1, "dub", 2000)
+            .await
+            .unwrap();
+        assert_eq!(brother.id, "brother");
+        set_active_profile_id(&pool, &brother.id, 2000).await.unwrap();
+
+        // Brother has zero blended watch history, continue watching, watchlist, or playback progress
+        assert!(get_watched_episodes(&pool, 777).await.unwrap().is_empty());
+        assert!(get_continue_watching(&pool).await.unwrap().is_empty());
+        assert!(get_watchlist(&pool).await.unwrap().is_empty());
+        assert!(get_playback_progress(&pool, 777, 4).await.unwrap().is_none());
+        let brother_analytics = compute_user_analytics(&pool).await.unwrap();
+        assert_eq!(brother_analytics.total_episodes_watched, 0);
+
+        // Shared anime catalog remains accessible without duplication
+        let shared = crate::db::cache::get_anime(&pool, 777).await.unwrap();
+        assert!(shared.is_some());
+
+        // Brother watches ep 1 only
+        record_watched(&pool, 777, 1, 2100).await.unwrap();
+        assert_eq!(get_watched_episodes(&pool, 777).await.unwrap(), vec![1]);
+        let brother_analytics_after = compute_user_analytics(&pool).await.unwrap();
+        assert_eq!(brother_analytics_after.total_episodes_watched, 1);
+
+        // Switch back to default: its 3 episodes, ep 4 progress, and watchlist are completely intact
+        set_active_profile_id(&pool, "default", 3000).await.unwrap();
+        assert_eq!(get_watched_episodes(&pool, 777).await.unwrap(), vec![1, 2, 3]);
+        assert!(is_in_watchlist(&pool, 777).await.unwrap());
+        let prog = get_playback_progress(&pool, 777, 4).await.unwrap().unwrap();
+        assert!((prog.0 - 620.0).abs() < 1e-4);
+        let default_analytics = compute_user_analytics(&pool).await.unwrap();
+        assert_eq!(default_analytics.total_episodes_watched, 3);
+
+        // Delete brother profile and verify default data survives
+        assert!(delete_profile(&pool, &brother.id).await.unwrap());
+        assert!(!delete_profile(&pool, "default").await.unwrap());
+        assert_eq!(get_watched_episodes(&pool, 777).await.unwrap(), vec![1, 2, 3]);
     }
 }

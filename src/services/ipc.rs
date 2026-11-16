@@ -10,9 +10,66 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::Path;
+use std::sync::RwLock;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::Sender;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+
+static ACTIVE_SOCKET_PATH: RwLock<Option<String>> = RwLock::new(None);
+static ACTIVE_IPC_TX: RwLock<Option<UnboundedSender<String>>> = RwLock::new(None);
+
+#[cfg(test)]
+pub fn test_ipc_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+/// Record the active mpv IPC socket or Windows named pipe path for the running playback session.
+pub fn set_active_socket_path(path: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_SOCKET_PATH.write() {
+        *guard = path.filter(|s| !s.trim().is_empty());
+    }
+}
+
+/// Return the currently registered mpv IPC socket or Windows named pipe path.
+pub fn get_active_socket_path() -> Option<String> {
+    ACTIVE_SOCKET_PATH
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Register (or clear) the active IPC monitor's outbound command sender.
+pub fn set_active_ipc_sender(tx: Option<UnboundedSender<String>>) {
+    if let Ok(mut guard) = ACTIVE_IPC_TX.write() {
+        *guard = tx;
+    }
+}
+
+/// Dispatch an mpv JSON-RPC payload directly through the already-connected IPC monitor writer.
+pub fn try_send_via_active_monitor(payload: &str) -> bool {
+    let sender = ACTIVE_IPC_TX
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
+    if let Some(tx) = sender {
+        return tx.send(payload.to_string()).is_ok();
+    }
+    false
+}
+
+fn clear_active_monitor_if_same(sock_path: &str, cmd_tx: &UnboundedSender<String>) {
+    if let Ok(mut guard) = ACTIVE_IPC_TX.write() {
+        if guard.as_ref().is_some_and(|cur| cur.same_channel(cmd_tx)) {
+            *guard = None;
+        }
+    }
+    if let Ok(mut guard) = ACTIVE_SOCKET_PATH.write() {
+        if guard.as_deref() == Some(sock_path) {
+            *guard = None;
+        }
+    }
+}
 
 #[cfg(unix)]
 type IpcStream = tokio::net::UnixStream;
@@ -105,25 +162,15 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
 }
 
 async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
-    let IpcMonitorConfig {
-        anime_id,
-        mal_id,
-        episode,
-        sock_path,
-        pool,
-        tx,
-        auth,
-        trackers,
-        mut skip_intervals,
-        auto_skip_intro,
-    } = config;
+    let sock_path_for_cleanup = config.sock_path.clone();
+    set_active_socket_path(Some(config.sock_path.clone()));
 
     // Fetch AniSkip intervals in parallel while waiting for mpv's IPC socket so
     // player startup is never blocked by AniList / AniSkip network round trips.
     let connect_fut = async {
         for _ in 0..150 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Some(s) = connect_ipc(&sock_path).await {
+            if let Some(s) = connect_ipc(&config.sock_path).await {
                 return Some(s);
             }
         }
@@ -131,10 +178,10 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     };
 
     let aniskip_fut = async {
-        if !skip_intervals.is_empty() || !auto_skip_intro {
+        if !config.skip_intervals.is_empty() || !config.auto_skip_intro {
             return None;
         }
-        let mid = if let Some(m) = mal_id {
+        let mid = if let Some(m) = config.mal_id {
             Some(m)
         } else {
             let client = reqwest::Client::builder()
@@ -142,35 +189,66 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
                 .timeout(Duration::from_secs(4))
                 .build()
                 .unwrap_or_default();
-            let resolved = crate::api::anilist::resolve_mal_id(&client, anime_id).await;
+            let resolved = crate::api::anilist::resolve_mal_id(&client, config.anime_id).await;
             if let Some(m) = resolved {
-                let _ = tx.send(AppMessage::AnimeMalIdReady(anime_id, m)).await;
+                let _ = config.tx.send(AppMessage::AnimeMalIdReady(config.anime_id, m)).await;
             }
             resolved
         };
         if let Some(m) = mid {
-            Some(crate::api::aniskip::fetch_skip_times(m, episode).await)
+            Some(crate::api::aniskip::fetch_skip_times(m, config.episode).await)
         } else {
             None
         }
     };
 
     let (stream, fetched_skips) = tokio::join!(connect_fut, aniskip_fut);
+    let mut config = config;
     if let Some(skips) = fetched_skips {
-        skip_intervals = skips;
+        config.skip_intervals = skips;
     }
 
     let stream = match stream {
         Some(s) => s,
         None => {
+            if get_active_socket_path().as_deref() == Some(sock_path_for_cleanup.as_str()) {
+                set_active_socket_path(None);
+            }
             // Clean up socket file if left behind
             #[cfg(unix)]
-            let _ = std::fs::remove_file(&sock_path);
+            let _ = std::fs::remove_file(&sock_path_for_cleanup);
             return;
         }
     };
 
+    drive_ipc_stream(stream, config).await;
+
+    // Clean up socket file
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&sock_path_for_cleanup);
+}
+
+async fn drive_ipc_stream<S>(stream: S, config: IpcMonitorConfig)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let IpcMonitorConfig {
+        anime_id,
+        mal_id: _,
+        episode,
+        sock_path,
+        pool,
+        tx,
+        auth,
+        trackers,
+        skip_intervals,
+        auto_skip_intro,
+    } = config;
+
     let (reader_half, mut writer_half) = tokio::io::split(stream);
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+    set_active_socket_path(Some(sock_path.clone()));
+    set_active_ipc_sender(Some(cmd_tx.clone()));
 
     // Subscribe to time-pos and duration property changes
     let observe_cmds = [
@@ -190,119 +268,147 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     let mut scrobbled = false;
     let mut skipped_intervals: HashSet<String> = HashSet::new();
 
-    while let Ok(Some(line)) = reader.next_line().await {
-        if let Some((name, val)) = parse_property_change(&line) {
-            match name.as_str() {
-                "duration" => {
-                    current_duration = val;
-                }
-                "time-pos" => {
-                    current_pos = val;
-
-                    // 1. Auto-skip intro / outro
-                    if auto_skip_intro {
-                        if let Some(to_skip) = check_skip_interval(current_pos, &skip_intervals, &skipped_intervals) {
-                            let key = format!("{}:{:.1}", to_skip.skip_type, to_skip.interval.start_time);
-                            skipped_intervals.insert(key);
-
-                            let seek_cmd = format!(
-                                "{{\"command\": [\"seek\", {}, \"absolute\"]}}\n",
-                                to_skip.interval.end_time
-                            );
-                            let osd_label = match to_skip.skip_type.as_str() {
-                                "ed" | "mixed-ed" => "Outro",
-                                _ => "Intro",
-                            };
-                            let osd_cmd = format!(
-                                "{{\"command\": [\"show-text\", \"󰄬 Solus: Auto-skipped {}\", 3000]}}\n",
-                                osd_label
-                            );
-
-                            let _ = writer_half.write_all(seek_cmd.as_bytes()).await;
-                            let _ = writer_half.write_all(osd_cmd.as_bytes()).await;
-                            let _ = writer_half.flush().await;
-
-                            let _ = tx
-                                .send(AppMessage::PlaybackLog(format!(
-                                    "󰄬 Auto-skipped {} at {:.1}s -> {:.1}s",
-                                    osd_label, current_pos, to_skip.interval.end_time
-                                )))
-                                .await;
+    loop {
+        tokio::select! {
+            biased;
+            cmd_opt = cmd_rx.recv() => {
+                match cmd_opt {
+                    Some(cmd_payload) => {
+                        let data = if cmd_payload.ends_with('\n') {
+                            cmd_payload
+                        } else {
+                            format!("{cmd_payload}\n")
+                        };
+                        if writer_half.write_all(data.as_bytes()).await.is_err()
+                            || writer_half.flush().await.is_err()
+                        {
+                            break;
                         }
                     }
+                    None => break,
+                }
+            }
+            line_res = reader.next_line() => {
+                let Ok(Some(line)) = line_res else {
+                    break;
+                };
 
-                    // 2. Auto-scrobble once 85% completion threshold is reached
-                    if !scrobbled && is_completion_threshold_reached(current_pos, current_duration) {
-                        scrobbled = true;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
+                if let Some((name, val)) = parse_property_change(&line) {
+                    match name.as_str() {
+                        "duration" => {
+                            current_duration = val;
+                        }
+                        "time-pos" => {
+                            current_pos = val;
 
-                        let pool_clone = pool.clone();
-                        let mut auth_clone = auth.clone();
-                        let trackers_clone = trackers.clone();
-                        tokio::spawn(async move {
-                            let _ = db::user::record_watched(&pool_clone, anime_id, episode as i64, now).await;
-                            if let Ok(Some(anime)) = db::cache::get_anime(&pool_clone, anime_id).await {
-                                let _ = crate::services::scrobble::sync_episode_watched_all(
-                                    &pool_clone,
-                                    &anime,
+                            // 1. Auto-skip intro / outro
+                            if auto_skip_intro {
+                                if let Some(to_skip) = check_skip_interval(current_pos, &skip_intervals, &skipped_intervals) {
+                                    let key = format!("{}:{:.1}", to_skip.skip_type, to_skip.interval.start_time);
+                                    skipped_intervals.insert(key);
+
+                                    let seek_cmd = format!(
+                                        "{{\"command\": [\"seek\", {}, \"absolute\"]}}\n",
+                                        to_skip.interval.end_time
+                                    );
+                                    let osd_label = match to_skip.skip_type.as_str() {
+                                        "ed" | "mixed-ed" => "Outro",
+                                        _ => "Intro",
+                                    };
+                                    let osd_cmd = format!(
+                                        "{{\"command\": [\"show-text\", \"󰄬 Solus: Auto-skipped {}\", 3000]}}\n",
+                                        osd_label
+                                    );
+
+                                    let _ = writer_half.write_all(seek_cmd.as_bytes()).await;
+                                    let _ = writer_half.write_all(osd_cmd.as_bytes()).await;
+                                    let _ = writer_half.flush().await;
+
+                                    let _ = tx
+                                        .send(AppMessage::PlaybackLog(format!(
+                                            "󰄬 Auto-skipped {} at {:.1}s -> {:.1}s",
+                                            osd_label, current_pos, to_skip.interval.end_time
+                                        )))
+                                        .await;
+                                }
+                            }
+
+                            // 2. Auto-scrobble once 85% completion threshold is reached
+                            if !scrobbled && is_completion_threshold_reached(current_pos, current_duration) {
+                                scrobbled = true;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+
+                                let pool_clone = pool.clone();
+                                let mut auth_clone = auth.clone();
+                                let trackers_clone = trackers.clone();
+                                tokio::spawn(async move {
+                                    let _ = db::user::record_watched(&pool_clone, anime_id, episode as i64, now).await;
+                                    if let Ok(Some(anime)) = db::cache::get_anime(&pool_clone, anime_id).await {
+                                        let _ = crate::services::scrobble::sync_episode_watched_all(
+                                            &pool_clone,
+                                            &anime,
+                                            episode,
+                                            &mut auth_clone,
+                                            &trackers_clone,
+                                            now,
+                                        )
+                                        .await;
+                                    } else if let Some(token) = auth_clone.anilist_token() {
+                                        let client = crate::api::anilist::AniListClient::with_token(Some(token));
+                                        let _ = client.save_progress(anime_id, episode).await;
+                                    }
+                                });
+
+                                let _ = tx.send(AppMessage::EpisodeAutoScrobbled(anime_id, episode)).await;
+                                let _ = tx
+                                    .send(AppMessage::PlaybackLog(format!(
+                                        "󰄬 Episode {} completed (85% reached) — auto-scrobbled",
+                                        episode
+                                    )))
+                                    .await;
+                            }
+
+                            // 3. Throttle progress updates to UI and database
+                            let now_instant = tokio::time::Instant::now();
+                            if (current_pos - last_saved_pos).abs() >= 3.0 || now_instant.duration_since(last_save_time).as_secs() >= 4 {
+                                last_saved_pos = current_pos;
+                                last_save_time = now_instant;
+                                let now_unix = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+
+                                let _ = db::user::save_playback_progress(
+                                    &pool,
+                                    anime_id,
                                     episode,
-                                    &mut auth_clone,
-                                    &trackers_clone,
-                                    now,
+                                    current_pos,
+                                    current_duration,
+                                    now_unix,
                                 )
                                 .await;
-                            } else if let Some(token) = auth_clone.anilist_token() {
-                                let client = crate::api::anilist::AniListClient::with_token(Some(token));
-                                let _ = client.save_progress(anime_id, episode).await;
+
+                                let _ = tx
+                                    .send(AppMessage::PlaybackProgressUpdated(
+                                        anime_id,
+                                        episode,
+                                        current_pos,
+                                        current_duration,
+                                    ))
+                                    .await;
                             }
-                        });
-
-                        let _ = tx.send(AppMessage::EpisodeAutoScrobbled(anime_id, episode)).await;
-                        let _ = tx
-                            .send(AppMessage::PlaybackLog(format!(
-                                "󰄬 Episode {} completed (85% reached) — auto-scrobbled",
-                                episode
-                            )))
-                            .await;
-                    }
-
-                    // 3. Throttle progress updates to UI and database
-                    let now_instant = tokio::time::Instant::now();
-                    if (current_pos - last_saved_pos).abs() >= 3.0 || now_instant.duration_since(last_save_time).as_secs() >= 4 {
-                        last_saved_pos = current_pos;
-                        last_save_time = now_instant;
-                        let now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-
-                        let _ = db::user::save_playback_progress(
-                            &pool,
-                            anime_id,
-                            episode,
-                            current_pos,
-                            current_duration,
-                            now_unix,
-                        )
-                        .await;
-
-                        let _ = tx
-                            .send(AppMessage::PlaybackProgressUpdated(
-                                anime_id,
-                                episode,
-                                current_pos,
-                                current_duration,
-                            ))
-                            .await;
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
     }
+
+    clear_active_monitor_if_same(&sock_path, &cmd_tx);
 
     // On player exit, persist the final position
     if current_pos > 0.0 {
@@ -328,10 +434,6 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
             ))
             .await;
     }
-
-    // Clean up socket file
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&sock_path);
 }
 
 #[cfg(test)]
@@ -392,5 +494,52 @@ mod tests {
         assert!(is_completion_threshold_reached(1207.0, 1420.0));  // 85.0%
         assert!(is_completion_threshold_reached(1400.0, 1420.0));  // 98.5%
         assert!(!is_completion_threshold_reached(10.0, 20.0));    // < 60s video ignored
+    }
+
+    #[tokio::test]
+    async fn test_try_send_via_active_monitor_delivers_commands() {
+        let _guard = test_ipc_lock().lock().await;
+        let pool = crate::db::init(":memory:").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let config = IpcMonitorConfig {
+            anime_id: 1,
+            mal_id: None,
+            episode: 1,
+            sock_path: r"\\.\pipe\solus-mpv-1-1".to_string(),
+            pool,
+            tx,
+            auth: crate::config::AuthConfig::default(),
+            trackers: crate::config::TrackersConfig::default(),
+            skip_intervals: Vec::new(),
+            auto_skip_intro: false,
+        };
+
+        let task = tokio::spawn(async move {
+            drive_ipc_stream(client_io, config).await;
+        });
+
+        let (server_read, _server_write) = tokio::io::split(server_io);
+        let mut lines = BufReader::new(server_read).lines();
+
+        // First two commands must be observe_property subscriptions
+        let l1 = lines.next_line().await.unwrap().unwrap();
+        let l2 = lines.next_line().await.unwrap().unwrap();
+        assert!(l1.contains("observe_property"));
+        assert!(l2.contains("observe_property"));
+        assert_eq!(
+            get_active_socket_path().as_deref(),
+            Some(r"\\.\pipe\solus-mpv-1-1")
+        );
+
+        // Send a command through the active monitor channel
+        assert!(try_send_via_active_monitor(r#"{"command":["cycle","pause"]}"#));
+        let l3 = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(l3, r#"{"command":["cycle","pause"]}"#);
+
+        drop(lines);
+        drop(_server_write);
+        let _ = task.await;
     }
 }

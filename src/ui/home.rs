@@ -42,6 +42,7 @@ pub enum HomeFooterAction {
     Wizard,
     Analytics,
     Remote,
+    Profile,
     Theme,
     Login,
     StopPlayback,
@@ -88,6 +89,7 @@ fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
             Screen::UpdateModal => (64, 45),
             Screen::RemoteModal => (64, 76),
             Screen::CastModal => (68, 55),
+            Screen::ProfileModal => crate::ui::profile::modal_pct(frame_area),
             Screen::Help => crate::ui::help::modal_pct(frame_area),
             Screen::Setup => crate::ui::setup::modal_pct(frame_area),
             Screen::AniListLogin => crate::ui::login::modal_pct(frame_area),
@@ -345,7 +347,11 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
         ),
         (false, false) => "󰍂 Guest".to_string(),
     };
-    let right_text = format!("{}  ·  ◈ {} ", user_badge, theme.name);
+    let profile_badge = format!(
+        "{} {} [P]",
+        state.active_profile_icon, state.active_profile_name
+    );
+    let right_text = format!("{}  ·  {}  ·  ◈ {} ", profile_badge, user_badge, theme.name);
     let right_width = right_text.chars().count() as u16 + 2;
 
     for (num, row, label) in top_bar_shelves(data) {
@@ -381,6 +387,13 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
         } else {
             theme.text_dim
         };
+        spans.push(Span::styled(
+            profile_badge,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
         spans.push(Span::styled(
             user_badge,
             Style::default().fg(auth_color).add_modifier(Modifier::BOLD),
@@ -712,6 +725,21 @@ fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockR
         });
     }
 
+    let profile_chip_label: String = state.active_profile_name.chars().take(10).collect();
+    explore_right.push(DockChip {
+        icon: "◈",
+        key: "[P]",
+        label: if profile_chip_label.is_empty() {
+            "Profile".to_string()
+        } else {
+            profile_chip_label
+        },
+        key_color: theme.accent,
+        label_color: theme.text,
+        priority: 4,
+        bg: None,
+        action: Some(HomeFooterAction::Profile),
+    });
     explore_right.push(DockChip {
         icon: "◈",
         key: "[T]",
@@ -2593,5 +2621,34 @@ mod tests {
             trailing_slack <= 4,
             "expected minimal right slack with divider present, got {trailing_slack} cols"
         );
+    }
+
+    #[test]
+    fn test_top_bar_renders_profile_badge_without_concatenation() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut data = HomeData::empty();
+        data.trending.push(Anime::default());
+        data.popular.push(Anime::default());
+
+        let mut state = AppState::new();
+        state.active_profile_name = "Brother".to_string();
+        state.active_profile_icon = "✦".to_string();
+
+        let backend = TestBackend::new(140, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 140, 1);
+        terminal
+            .draw(|f| render_top_bar(f, area, &state, &data))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut row0 = String::new();
+        for x in 0..140 {
+            row0.push_str(buf[(x, 0)].symbol());
+        }
+        assert!(row0.contains("✦ Brother [P]  ·  "));
+        assert!(!row0.contains("[P]Guest"));
+        assert!(!row0.contains("SOLUSTrending"));
     }
 }

@@ -258,14 +258,79 @@ fn detect_windows_terminal_font_size() -> (u16, u16) {
     (11, 22)
 }
 
+fn parse_cli_profile_arg(args: &[String]) -> Option<String> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--profile" || arg == "-p" {
+            if let Some(val) = args.get(i + 1) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--profile=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── Config + DB ───────────────────────────────────────────────────────────
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_profile = parse_cli_profile_arg(&cli_args);
     let mut cfg = config::Config::load().context("Failed to load config")?;
     let db_path = config::Config::db_path().context("Failed to resolve DB path")?;
     let pool    = db::init(db_path.to_str().unwrap_or(":memory:"))
         .await
         .context("Failed to initialise database")?;
+
+    let boot_now = unix_now();
+    if let Some(requested) = cli_profile {
+        let target_id = if let Some(existing_id) =
+            db::user::resolve_profile_id_by_name_or_id(&pool, &requested).await
+        {
+            existing_id
+        } else {
+            db::user::create_profile(&pool, &requested, "◈", 0, "sub", boot_now)
+                .await
+                .map(|p| p.id)
+                .unwrap_or_else(|_| "default".to_string())
+        };
+        let _ = db::user::set_active_profile_id(&pool, &target_id, boot_now).await;
+        cfg.active_profile = target_id;
+        let _ = cfg.save();
+    } else if !cfg.active_profile.trim().is_empty() && cfg.active_profile != "default" {
+        if let Some(pid) =
+            db::user::resolve_profile_id_by_name_or_id(&pool, &cfg.active_profile).await
+        {
+            let _ = db::user::set_active_profile_id(&pool, &pid, boot_now).await;
+        }
+    }
+
+    let active_profile = db::user::get_active_profile(&pool).await.unwrap_or(
+        db::user::UserProfile {
+            id: "default".to_string(),
+            display_name: "Default".to_string(),
+            avatar_icon: "◈".to_string(),
+            theme_index: 0,
+            audio_mode: "sub".to_string(),
+            created_at: boot_now,
+            last_active_at: boot_now,
+        },
+    );
+    cfg.active_profile = active_profile.id.clone();
+    cfg.audio_mode = if active_profile.audio_mode.eq_ignore_ascii_case("dub") {
+        config::AudioMode::Dub
+    } else {
+        config::AudioMode::Sub
+    };
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode()?;
@@ -288,9 +353,19 @@ async fn main() -> anyhow::Result<()> {
 
     // ── App state ─────────────────────────────────────────────────────────────
     let mut state     = AppState::new();
+    state.active_profile_id = active_profile.id.clone();
+    state.active_profile_name = active_profile.display_name.clone();
+    state.active_profile_icon = active_profile.avatar_icon.clone();
+    state.theme_index = (active_profile.theme_index.max(0) as usize) % ui::theme::THEMES.len();
+    state.auth = config::AuthConfig::load_for_profile(&active_profile.id);
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
+    {
+        let mut st = state.remote_state.write().await;
+        st.active_profile = state.active_profile_name.clone();
+        st.profile_icon = state.active_profile_icon.clone();
+    }
 
     // ── Instant Stale-While-Revalidate startup: load cached catalog (<15ms) ────
     let cached_home = services::sync::load_cached_home_data(&pool)
@@ -416,6 +491,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     state.now_playing = None;
                     state.player_stop = None;
+                    services::ipc::set_active_ipc_sender(None);
+                    services::ipc::set_active_socket_path(None);
                     let remote_state_done = state.remote_state.clone();
                     tokio::spawn(async move {
                         {
@@ -1213,6 +1290,10 @@ async fn main() -> anyhow::Result<()> {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::calendar::render_overlay(frame, &mut state);
                     }
+                    Screen::ProfileModal => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::profile::render_overlay(frame, &state);
+                    }
                 }
                 if state.watchlist_target_prompt.is_some() {
                     ui::home::render_watchlist_target_modal(frame, &state);
@@ -1334,6 +1415,7 @@ async fn handle_key(
         Screen::CastDeck => handle_cast_deck(key, state).await,
         Screen::UpdateModal => handle_update_modal(key, state, tx).await,
         Screen::Calendar => handle_calendar(key, state, home_data, pool, cfg, tx).await,
+        Screen::ProfileModal => handle_profile_modal(key, state, home_data, pool, cfg, tx).await,
     }
 }
 
@@ -1591,6 +1673,7 @@ async fn handle_mouse(
                             Wizard => KeyCode::Char('w'),
                             Analytics => KeyCode::Char('a'),
                             Remote => KeyCode::Char('m'),
+                            Profile => KeyCode::Char('P'),
                             Theme => KeyCode::Char('T'),
                             Login => KeyCode::Char('L'),
                             StopPlayback => KeyCode::Char('X'),
@@ -1992,9 +2075,22 @@ async fn handle_home(
             state.open_login();
             spawn_merge_audit(pool, &state.auth, tx);
         }
+        KeyCode::Char('P') => {
+            let summaries = db::user::list_profile_summaries(pool).await.unwrap_or_default();
+            state.open_profile_modal(summaries);
+        }
         KeyCode::Char('t') | KeyCode::Char('T') => {
             state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
             let theme_name = state.theme().name;
+            let pool2 = pool.clone();
+            let pid = state.active_profile_id.clone();
+            let pname = state.active_profile_name.clone();
+            let picon = state.active_profile_icon.clone();
+            let tidx = state.theme_index;
+            let audio = if cfg.audio_mode == config::AudioMode::Dub { "dub" } else { "sub" };
+            tokio::spawn(async move {
+                let _ = db::user::update_profile(&pool2, &pid, &pname, &picon, tidx, audio).await;
+            });
             state.show_toast(format!("Theme: {}", theme_name), unix_now());
         }
         KeyCode::Char('U') => {
@@ -2840,11 +2936,7 @@ async fn handle_detail(
                     state.watched_episodes.remove(&ep);
                     state.show_toast(format!("Episode {} marked unwatched", ep), now);
                     tokio::spawn(async move {
-                        let _ = sqlx::query("DELETE FROM history WHERE anime_id = ? AND episode = ?")
-                            .bind(anime_id)
-                            .bind(ep as i64)
-                            .execute(&pool2)
-                            .await;
+                        let _ = db::user::remove_watched_episode(&pool2, anime_id, ep as i64).await;
                     });
                 } else {
                     state.watched_episodes.insert(ep);
@@ -4923,6 +5015,355 @@ async fn handle_analytics(
     }
 }
 
+async fn apply_profile_switch(
+    target_profile: &db::user::UserProfile,
+    state: &mut AppState,
+    home_data: &mut ui::home::HomeData,
+    pool: &sqlx::SqlitePool,
+    cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let now = unix_now();
+    if db::user::set_active_profile_id(pool, &target_profile.id, now)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    cfg.active_profile = target_profile.id.clone();
+    cfg.audio_mode = if target_profile.audio_mode.eq_ignore_ascii_case("dub") {
+        config::AudioMode::Dub
+    } else {
+        config::AudioMode::Sub
+    };
+    let _ = cfg.save();
+
+    state.active_profile_id = target_profile.id.clone();
+    state.active_profile_name = target_profile.display_name.clone();
+    state.active_profile_icon = target_profile.avatar_icon.clone();
+    state.theme_index = (target_profile.theme_index.max(0) as usize) % ui::theme::THEMES.len();
+    state.auth = config::AuthConfig::load_for_profile(&target_profile.id);
+
+    state.analytics_data = None;
+    state.merge_report = None;
+    state.banner_progress = None;
+    state.watched_episodes.clear();
+    state.anime_progress.clear();
+    state.in_watchlist = false;
+    state.row_offsets.insert("continue_watching".to_string(), 0);
+    state.row_offsets.insert("watchlist".to_string(), 0);
+
+    let r_state = state.remote_state.clone();
+    let p_name = state.active_profile_name.clone();
+    let p_icon = state.active_profile_icon.clone();
+    tokio::spawn(async move {
+        {
+            let mut st = r_state.write().await;
+            st.active_profile = p_name;
+            st.profile_icon = p_icon;
+        }
+        services::remote::broadcast_state(&r_state).await;
+    });
+
+    if let Ok(new_home) = services::sync::load_cached_home_data(pool).await {
+        *home_data = new_home;
+        if row_len(&state.active_row, home_data) == 0 {
+            state.active_row = next_non_empty_row(&state.active_row, home_data, 1);
+        }
+        refresh_home_cover(state, home_data, pool, tx);
+        prefetch_all_home_covers(home_data, state, pool, tx);
+    }
+
+    if state.auth.is_authenticated() {
+        let pool2 = pool.clone();
+        let cfg2 = cfg.clone();
+        let tx2 = tx.clone();
+        let auth2 = state.auth.clone();
+        tokio::spawn(async move {
+            let client = api::anilist::AniListClient::with_token(auth2.anilist_token());
+            let mal_cid = cfg2.trackers.resolved_mal_client_id();
+            let now_ts = unix_now();
+            if let Ok(data) = services::sync::sync_all(
+                &pool2,
+                &client,
+                Some(&auth2),
+                mal_cid.as_deref(),
+                cfg2.cache.trending_ttl,
+                cfg2.cache.stable_ttl,
+                now_ts,
+            )
+            .await
+            {
+                let _ = tx2.send(AppMessage::HomeData(Box::new(data))).await;
+            }
+        });
+    }
+}
+
+async fn handle_profile_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    home_data: &mut ui::home::HomeData,
+    pool: &sqlx::SqlitePool,
+    cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    use db::user::PROFILE_AVATAR_PRESETS;
+    use state::ProfileInputMode;
+
+    if state.profile_input_mode != ProfileInputMode::None {
+        match key.code {
+            KeyCode::Esc => {
+                state.profile_input_mode = ProfileInputMode::None;
+                state.profile_name_input.clear();
+            }
+            KeyCode::Tab => {
+                state.profile_avatar_cursor =
+                    (state.profile_avatar_cursor + 1) % PROFILE_AVATAR_PRESETS.len();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                state.profile_audio_dub = !state.profile_audio_dub;
+            }
+            KeyCode::Backspace => {
+                state.profile_name_input.pop();
+            }
+            KeyCode::Char(c) => {
+                if !c.is_control() && state.profile_name_input.chars().count() < 24 {
+                    state.profile_name_input.push(c);
+                }
+            }
+            KeyCode::Enter => {
+                let name = state.profile_name_input.trim().to_string();
+                if name.is_empty() {
+                    state.show_toast("Profile name cannot be empty", unix_now());
+                    return;
+                }
+                let (icon, _) = PROFILE_AVATAR_PRESETS
+                    [state.profile_avatar_cursor % PROFILE_AVATAR_PRESETS.len()];
+                let audio_str = if state.profile_audio_dub { "dub" } else { "sub" };
+                let now = unix_now();
+
+                match state.profile_input_mode {
+                    ProfileInputMode::CreateName => {
+                        match db::user::create_profile(
+                            pool,
+                            &name,
+                            icon,
+                            state.theme_index,
+                            audio_str,
+                            now,
+                        )
+                        .await
+                        {
+                            Ok(created) => {
+                                state.profile_input_mode = ProfileInputMode::None;
+                                state.profile_name_input.clear();
+                                apply_profile_switch(&created, state, home_data, pool, cfg, tx)
+                                    .await;
+                                state.screen = Screen::Home;
+                                state.show_toast(
+                                    format!(
+                                        "◈ Created & switched to {} {}",
+                                        created.avatar_icon, created.display_name
+                                    ),
+                                    now,
+                                );
+                            }
+                            Err(e) => {
+                                state.show_toast(format!("Profile error: {e}"), now);
+                            }
+                        }
+                    }
+                    ProfileInputMode::RenameName => {
+                        if let Some(summary) = state.profiles_list.get(state.profile_cursor).cloned() {
+                            let target = summary.profile;
+                            let _ = db::user::update_profile(
+                                pool,
+                                &target.id,
+                                &name,
+                                icon,
+                                target.theme_index.max(0) as usize,
+                                audio_str,
+                            )
+                            .await;
+                            if target.id == state.active_profile_id {
+                                state.active_profile_name = name.clone();
+                                state.active_profile_icon = icon.to_string();
+                                cfg.audio_mode = if state.profile_audio_dub {
+                                    config::AudioMode::Dub
+                                } else {
+                                    config::AudioMode::Sub
+                                };
+                                let _ = cfg.save();
+                                let r_state = state.remote_state.clone();
+                                let p_name = state.active_profile_name.clone();
+                                let p_icon = state.active_profile_icon.clone();
+                                tokio::spawn(async move {
+                                    {
+                                        let mut st = r_state.write().await;
+                                        st.active_profile = p_name;
+                                        st.profile_icon = p_icon;
+                                    }
+                                    services::remote::broadcast_state(&r_state).await;
+                                });
+                            }
+                            state.profiles_list =
+                                db::user::list_profile_summaries(pool).await.unwrap_or_default();
+                            state.profile_input_mode = ProfileInputMode::None;
+                            state.profile_name_input.clear();
+                            state.show_toast(format!("◈ Updated profile: {} {}", icon, name), now);
+                        }
+                    }
+                    ProfileInputMode::None => {}
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('P') => {
+            state.go_back();
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
+            if state.profile_cursor > 0 {
+                state.profile_cursor -= 1;
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
+            if state.profile_cursor + 1 < state.profiles_list.len() {
+                state.profile_cursor += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(summary) = state.profiles_list.get(state.profile_cursor).cloned() {
+                let target = summary.profile;
+                apply_profile_switch(&target, state, home_data, pool, cfg, tx).await;
+                state.screen = Screen::Home;
+                state.show_toast(
+                    format!(
+                        "◈ Switched to profile: {} {}",
+                        target.avatar_icon, target.display_name
+                    ),
+                    unix_now(),
+                );
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            state.profile_input_mode = ProfileInputMode::CreateName;
+            state.profile_name_input.clear();
+            state.profile_avatar_cursor = 1;
+            state.profile_audio_dub = false;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let Some(summary) = state.profiles_list.get(state.profile_cursor) {
+                state.profile_input_mode = ProfileInputMode::RenameName;
+                state.profile_name_input = summary.profile.display_name.clone();
+                state.profile_avatar_cursor = PROFILE_AVATAR_PRESETS
+                    .iter()
+                    .position(|(ic, _)| *ic == summary.profile.avatar_icon)
+                    .unwrap_or(0);
+                state.profile_audio_dub = summary.profile.audio_mode.eq_ignore_ascii_case("dub");
+            }
+        }
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            if let Some(summary) = state.profiles_list.get(state.profile_cursor).cloned() {
+                let target = summary.profile;
+                let cur_idx = PROFILE_AVATAR_PRESETS
+                    .iter()
+                    .position(|(ic, _)| *ic == target.avatar_icon)
+                    .unwrap_or(0);
+                let (next_icon, _) =
+                    PROFILE_AVATAR_PRESETS[(cur_idx + 1) % PROFILE_AVATAR_PRESETS.len()];
+                let _ = db::user::update_profile(
+                    pool,
+                    &target.id,
+                    &target.display_name,
+                    next_icon,
+                    target.theme_index.max(0) as usize,
+                    &target.audio_mode,
+                )
+                .await;
+                if target.id == state.active_profile_id {
+                    state.active_profile_icon = next_icon.to_string();
+                }
+                state.profiles_list =
+                    db::user::list_profile_summaries(pool).await.unwrap_or_default();
+                state.show_toast(
+                    format!("Badge: {} {}", next_icon, target.display_name),
+                    unix_now(),
+                );
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(summary) = state.profiles_list.get(state.profile_cursor).cloned() {
+                let target = summary.profile;
+                let next_audio = if target.audio_mode.eq_ignore_ascii_case("dub") {
+                    "sub"
+                } else {
+                    "dub"
+                };
+                let _ = db::user::update_profile(
+                    pool,
+                    &target.id,
+                    &target.display_name,
+                    &target.avatar_icon,
+                    target.theme_index.max(0) as usize,
+                    next_audio,
+                )
+                .await;
+                if target.id == state.active_profile_id {
+                    cfg.audio_mode = if next_audio == "dub" {
+                        config::AudioMode::Dub
+                    } else {
+                        config::AudioMode::Sub
+                    };
+                    let _ = cfg.save();
+                }
+                state.profiles_list =
+                    db::user::list_profile_summaries(pool).await.unwrap_or_default();
+                state.show_toast(
+                    format!(
+                        "{} audio default: {}",
+                        target.display_name,
+                        next_audio.to_uppercase()
+                    ),
+                    unix_now(),
+                );
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+            if let Some(summary) = state.profiles_list.get(state.profile_cursor).cloned() {
+                let pid = summary.profile.id.clone();
+                if pid == "default" {
+                    state.show_toast("Default profile cannot be deleted", unix_now());
+                    return;
+                }
+                if db::user::delete_profile(pool, &pid).await.unwrap_or(false) {
+                    config::AuthConfig::remove_profile_dir(&pid);
+                    if pid == state.active_profile_id {
+                        if let Ok(def) = db::user::get_active_profile(pool).await {
+                            apply_profile_switch(&def, state, home_data, pool, cfg, tx).await;
+                        }
+                    }
+                    state.profiles_list =
+                        db::user::list_profile_summaries(pool).await.unwrap_or_default();
+                    if state.profile_cursor >= state.profiles_list.len() {
+                        state.profile_cursor = state.profiles_list.len().saturating_sub(1);
+                    }
+                    state.show_toast(
+                        format!("Removed profile: {}", summary.profile.display_name),
+                        unix_now(),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_remote_modal(
     key: event::KeyEvent,
     state: &mut AppState,
@@ -5865,6 +6306,7 @@ async fn start_playback(
         let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
         let _ = std::os::unix::fs::symlink(&sock_path, "/tmp/solus-mpv.sock");
     }
+    services::ipc::set_active_socket_path(Some(sock_path.clone()));
     opts.ipc_socket = Some(sock_path.clone());
 
     // Initialize remote companion state immediately
@@ -5904,6 +6346,8 @@ async fn start_playback(
     let r_aid = anime_id;
     let r_season_year = season_year;
     let r_era_badge = era.short_badge().to_string();
+    let r_profile_name = state.active_profile_name.clone();
+    let r_profile_icon = state.active_profile_icon.clone();
 
     tokio::spawn(async move {
         {
@@ -5923,6 +6367,8 @@ async fn start_playback(
             st.sub_preset = r_sub_preset;
             st.anime4k = r_anime4k;
             st.audio_mode = r_audio_mode;
+            st.active_profile = r_profile_name;
+            st.profile_icon = r_profile_icon;
         }
         services::remote::broadcast_state(&remote_state_init).await;
     });
@@ -6734,5 +7180,22 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn test_parse_cli_profile_arg() {
+        assert_eq!(
+            parse_cli_profile_arg(&["--profile".into(), "Brother".into()]),
+            Some("Brother".to_string())
+        );
+        assert_eq!(
+            parse_cli_profile_arg(&["-p".into(), "alice".into()]),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            parse_cli_profile_arg(&["--profile=Sarah".into()]),
+            Some("Sarah".to_string())
+        );
+        assert_eq!(parse_cli_profile_arg(&[]), None);
     }
 }
