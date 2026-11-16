@@ -7,7 +7,7 @@ mod state;
 mod ui;
 
 pub use ui::components::cover::{
-    build_stateful_protocol, hd_resize_mode, scale_to_frame_cover,
+    build_stateful_protocol, hd_resize_mode, scale_to_frame_contain, scale_to_frame_cover,
 };
 
 use anyhow::Context;
@@ -1846,7 +1846,7 @@ async fn handle_mouse(
                                                     state::CategoryRow::TopRated         => ("top_rated", &home_data.top_rated),
                                                     state::CategoryRow::Seasonal         => ("seasonal", &home_data.seasonal),
                                                 };
-                                                let (vis_n, row_card_w) = ui::home::compute_row_card_metrics(term_w);
+                                                let (vis_n, row_card_w) = ui::home::row_card_metrics_for(cat_row, term_w);
                                                 let row_pitch = row_card_w + ui::home::CARD_GAP;
                                                 let col = (mx / row_pitch) as usize;
                                                 let offset = state.row_offset(key);
@@ -6788,11 +6788,11 @@ async fn start_playback(
 // ─── Cover image download ─────────────────────────────────────────────────────
 
 pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
-    scale_to_frame_cover(img, 20, 6, (12, 24), 0.22)
+    scale_to_frame_contain(img, 20, 6, (12, 24))
 }
 
 pub fn prepare_card_cover_with_font(img: image::DynamicImage, font_size: (u16, u16)) -> image::DynamicImage {
-    scale_to_frame_cover(img, 20, 6, font_size, 0.22)
+    scale_to_frame_contain(img, 20, 6, font_size)
 }
 
 pub fn prepare_portrait_cover(img: image::DynamicImage) -> image::DynamicImage {
@@ -7247,6 +7247,33 @@ mod tests {
         let prepared = prepare_card_cover(img);
         assert_eq!(prepared.width(), 1200);
         assert_eq!(prepared.height(), 720);
+    }
+
+    #[test]
+    fn test_prepare_card_cover_contain_preserves_full_portrait_unclipped() {
+        use image::GenericImageView;
+        // Portrait image with distinct top band (bright red) and bottom band (bright blue)
+        let mut rgba = image::RgbaImage::new(200, 300);
+        for y in 0..300 {
+            for x in 0..200 {
+                let px = if y < 60 {
+                    image::Rgba([240, 20, 20, 255])
+                } else if y >= 240 {
+                    image::Rgba([20, 20, 240, 255])
+                } else {
+                    image::Rgba([20, 220, 20, 255])
+                };
+                rgba.put_pixel(x, y, px);
+            }
+        }
+        let prepared = prepare_card_cover(image::DynamicImage::ImageRgba8(rgba));
+        assert_eq!(prepared.width(), 1200);
+        assert_eq!(prepared.height(), 720);
+        // Center column (x=600) must still contain top red band and bottom blue band uncropped
+        let top_px = prepared.get_pixel(600, 10);
+        let bot_px = prepared.get_pixel(600, 710);
+        assert!(top_px[0] > 180 && top_px[2] < 80, "top band was cropped: {:?}", top_px);
+        assert!(bot_px[2] > 180 && bot_px[0] < 80, "bottom band was cropped: {:?}", bot_px);
     }
 
     #[test]

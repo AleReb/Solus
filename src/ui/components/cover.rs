@@ -58,6 +58,60 @@ pub fn scale_to_frame_cover(
     }
 }
 
+/// Scales the full image to fit (`contain`) inside the exact character cell frame (`target_cols x target_rows`)
+/// without cropping any edge, centered over a darkened, blurred ambient backdrop of the same image.
+/// Guarantees exact `target_w x target_h` pixel dimensions so all cards render at identical sizes.
+pub fn scale_to_frame_contain(
+    img: image::DynamicImage,
+    target_cols: u16,
+    target_rows: u16,
+    font_size: (u16, u16),
+) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 || target_cols == 0 || target_rows == 0 {
+        return img;
+    }
+
+    let font_w = (font_size.0 as u32).max(1);
+    let font_h = (font_size.1 as u32).max(1);
+
+    let base_pw = target_cols as u32 * font_w;
+    let base_ph = target_rows as u32 * font_h;
+
+    let multiplier = (1280 / base_pw).clamp(2, 16);
+    let target_w = base_pw * multiplier;
+    let target_h = base_ph * multiplier;
+
+    // 1. Build a fast darkened, blurred ambient backdrop filling 100% of target_w x target_h
+    let small_w = 160u32;
+    let small_h = ((160u64 * target_h as u64) / target_w.max(1) as u64).max(1) as u32;
+    let mut small_bg = img
+        .resize_to_fill(small_w, small_h, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    small_bg = image::imageops::blur(&small_bg, 8.0);
+    for px in small_bg.pixels_mut() {
+        px[0] = ((px[0] as u16 * 26) / 100) as u8;
+        px[1] = ((px[1] as u16 * 26) / 100) as u8;
+        px[2] = ((px[2] as u16 * 26) / 100) as u8;
+        px[3] = 255;
+    }
+    let mut canvas = image::imageops::resize(
+        &small_bg,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
+
+    // 2. Scale the entire original image to fit inside (target_w, target_h) with zero cropping
+    let fg = img.resize(target_w, target_h, image::imageops::FilterType::CatmullRom);
+    let fg_rgba = fg.to_rgba8();
+    let x_off = target_w.saturating_sub(fg_rgba.width()) / 2;
+    let y_off = target_h.saturating_sub(fg_rgba.height()) / 2;
+    image::imageops::overlay(&mut canvas, &fg_rgba, x_off as i64, y_off as i64);
+
+    image::DynamicImage::ImageRgba8(canvas)
+}
+
 /// Shared `Resize` mode using CatmullRom instead of ratatui-image's default `FilterType::Nearest`.
 pub fn hd_resize_mode() -> ratatui_image::Resize {
     ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::CatmullRom))

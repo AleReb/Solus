@@ -82,6 +82,9 @@ pub fn bento_left_width(cw_count: usize) -> u16 {
 
 /// Compute centered modal bounds matching overlays so underlying Home artwork doesn't bleed through.
 fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
+    if state.exit_confirm_open {
+        return Some(exit_confirm_modal_rect(frame_area));
+    }
     let (pct_x, pct_y) = if state.watchlist_target_prompt.is_some() {
         watchlist_modal_pct(frame_area)
     } else {
@@ -165,6 +168,17 @@ pub fn compute_row_card_metrics(usable_w: u16) -> (usize, u16) {
     let gaps_total = (vis_n.saturating_sub(1)) as u16 * gap;
     let card_w = (usable_w.saturating_sub(gaps_total) / vis_n as u16).clamp(min_card_w, max_card_w);
     (vis_n, card_w)
+}
+
+/// Compute `(visible_cards, card_width)` for a specific shelf row.
+/// `ContinueWatching` always uses fixed `CARD_WIDTH` (`22`) so all thumbnails match standard Trending card proportions.
+pub fn row_card_metrics_for(row: &CategoryRow, usable_w: u16) -> (usize, u16) {
+    if *row == CategoryRow::ContinueWatching {
+        let vis_n = ((usable_w + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).max(1) as usize;
+        (vis_n, CARD_WIDTH.min(usable_w))
+    } else {
+        compute_row_card_metrics(usable_w)
+    }
 }
 
 /// Compute `(start_idx, row_heights)` so visible tiers pack cleanly into `avail_h`
@@ -1857,7 +1871,7 @@ fn render_single_row(frame: &mut Frame, area: Rect, state: &mut AppState, row: &
         return;
     }
 
-    let (visible_n, card_w) = compute_row_card_metrics(card_area.width);
+    let (visible_n, card_w) = row_card_metrics_for(row, card_area.width);
     let view_start = row_view_start(offset, items.len(), visible_n);
 
     for (i, anime) in items.iter().skip(view_start).take(visible_n).enumerate() {
@@ -2400,7 +2414,7 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
 
 /// Compute the centered modal rectangle for the Exit Confirmation popup.
 pub fn exit_confirm_modal_rect(area: Rect) -> Rect {
-    let w = area.width.min(54).max(34.min(area.width));
+    let w = area.width.min(60).max(34.min(area.width));
     let h = area.height.min(11).max(7.min(area.height));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -2812,6 +2826,10 @@ mod tests {
             assert!(text.contains("Cancel · Stay"));
             assert!(text.contains("Exit Solus"));
             assert!(text.contains("Playback is active"));
+            assert!(text.contains("[N/Esc] Cancel"), "footer hint truncated in {}x{}: {text}", w, h);
         }
+
+        let (_, cw_width) = row_card_metrics_for(&CategoryRow::ContinueWatching, 140);
+        assert_eq!(cw_width, CARD_WIDTH);
     }
 }
