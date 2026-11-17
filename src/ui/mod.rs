@@ -11,6 +11,7 @@ pub mod play_options;
 pub mod play_query;
 pub mod playback;
 pub mod profile;
+pub mod queue;
 pub mod remote;
 pub mod search;
 pub mod settings;

@@ -1,0 +1,834 @@
+//! Watch Session Queue, background `N+1` prefetcher, temp session cache, and portable JSON playlists.
+
+use crate::{
+    api::{
+        player::PlayOptions,
+        subtitles::fetch_stream_info_with_mal,
+    },
+    config::{Anime4KMode, Config},
+    db::playlists::{PlaylistItemDraft, SavedPlaylistItem},
+    error::{AppError, Result},
+    services::{
+        downloader::parse_episode_range,
+        shaders::build_shader_arg_for_year,
+        subsync::ensure_synchronized_subtitle,
+        substyler::SubtitleStyleConfig,
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Conservative 50-minute freshness lifetime for pre-resolved CDN stream links.
+pub const PREFETCH_TTL_SECS: u64 = 3000;
+
+/// Fixed monochrome status label for a queued item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchStatus {
+    Ready,
+    Resolving,
+    Queued,
+    Stale,
+}
+
+impl PrefetchStatus {
+    pub fn badge(self) -> &'static str {
+        match self {
+            PrefetchStatus::Ready => "[ READY ]",
+            PrefetchStatus::Resolving => "[WARMING]",
+            PrefetchStatus::Queued => "[QUEUED ]",
+            PrefetchStatus::Stale => "[ STALE ]",
+        }
+    }
+
+    pub fn remote_badge(self) -> &'static str {
+        match self {
+            PrefetchStatus::Ready => "READY",
+            PrefetchStatus::Resolving => "WARM",
+            PrefetchStatus::Queued => "QUEUE",
+            PrefetchStatus::Stale => "STALE",
+        }
+    }
+}
+
+/// Pre-resolved playback payload ready for instant `mpv`/`vlc` launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedPrefetch {
+    pub options:     PlayOptions,
+    pub resolved_at: u64,
+    #[serde(default)]
+    pub sub_synced:  bool,
+}
+
+impl ResolvedPrefetch {
+    /// Returns true if the pre-resolved URL is within the conservative TTL window.
+    pub fn is_fresh(&self, now_unix: u64) -> bool {
+        now_unix >= self.resolved_at && now_unix.saturating_sub(self.resolved_at) < PREFETCH_TTL_SECS
+    }
+
+    /// Seconds remaining before cached link expires.
+    pub fn remaining_secs(&self, now_unix: u64) -> u64 {
+        let elapsed = now_unix.saturating_sub(self.resolved_at);
+        PREFETCH_TTL_SECS.saturating_sub(elapsed)
+    }
+}
+
+/// Single queued episode with durable intent + optional cached prefetch snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueItem {
+    #[serde(default)]
+    pub uid:         u64,
+    pub anime_id:    i64,
+    #[serde(default)]
+    pub mal_id:      Option<i64>,
+    #[serde(default)]
+    pub season_year: Option<i64>,
+    pub title:       String,
+    pub query:       String,
+    pub episode:     u32,
+    pub quality:     String,
+    pub dub:         bool,
+    pub sub_lang:    String,
+    pub player:      String,
+    #[serde(skip)]
+    pub resolving:   bool,
+    #[serde(default)]
+    pub prefetch:    Option<ResolvedPrefetch>,
+}
+
+impl QueueItem {
+    pub fn new(
+        anime_id: i64,
+        mal_id: Option<i64>,
+        season_year: Option<i64>,
+        title: String,
+        query: String,
+        episode: u32,
+        quality: String,
+        dub: bool,
+        sub_lang: String,
+        player: String,
+    ) -> Self {
+        Self {
+            uid: 0,
+            anime_id,
+            mal_id,
+            season_year,
+            title,
+            query,
+            episode,
+            quality,
+            dub,
+            sub_lang,
+            player,
+            resolving: false,
+            prefetch: None,
+        }
+    }
+
+    pub fn from_saved(saved: &SavedPlaylistItem) -> Self {
+        Self {
+            uid: 0,
+            anime_id: saved.anime_id,
+            mal_id: saved.mal_id,
+            season_year: saved.season_year,
+            title: saved.title.clone(),
+            query: saved.query.clone(),
+            episode: saved.episode,
+            quality: saved.quality.clone(),
+            dub: saved.dub,
+            sub_lang: saved.sub_lang.clone(),
+            player: saved.player.clone(),
+            resolving: false,
+            prefetch: None,
+        }
+    }
+
+    pub fn to_draft(&self) -> PlaylistItemDraft {
+        PlaylistItemDraft {
+            anime_id: self.anime_id,
+            mal_id: self.mal_id,
+            title: self.title.clone(),
+            query: self.query.clone(),
+            episode: self.episode,
+            season_year: self.season_year,
+            quality: self.quality.clone(),
+            dub: self.dub,
+            sub_lang: self.sub_lang.clone(),
+            player: self.player.clone(),
+        }
+    }
+
+    pub fn status(&self, now_unix: u64) -> PrefetchStatus {
+        if self.resolving {
+            PrefetchStatus::Resolving
+        } else if let Some(ref pre) = self.prefetch {
+            if pre.is_fresh(now_unix) {
+                PrefetchStatus::Ready
+            } else {
+                PrefetchStatus::Stale
+            }
+        } else {
+            PrefetchStatus::Queued
+        }
+    }
+}
+
+/// Metadata tracking the currently playing episode (whether started from queue or directly).
+#[derive(Debug, Clone)]
+pub struct ActiveNowItem {
+    pub item:            QueueItem,
+    pub used_prefetched: bool,
+    pub retried_once:    bool,
+}
+
+/// Result returned when inserting an item into the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnqueueOutcome {
+    pub position: usize,
+    pub replaced: bool,
+}
+
+/// Session watch queue persisted temporarily in `<cache_dir>/active_queue_<profile>.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchQueue {
+    #[serde(default)]
+    pub items:        VecDeque<QueueItem>,
+    #[serde(default = "default_true")]
+    pub auto_advance: bool,
+    #[serde(default)]
+    pub loop_mode:    bool,
+    #[serde(skip)]
+    pub manual_stop:  bool,
+    #[serde(skip)]
+    pub next_uid:     u64,
+    #[serde(skip)]
+    pub active_item:  Option<ActiveNowItem>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for WatchQueue {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            auto_advance: true,
+            loop_mode: false,
+            manual_stop: false,
+            next_uid: 1,
+            active_item: None,
+        }
+    }
+}
+
+impl WatchQueue {
+    fn alloc_uid(&mut self) -> u64 {
+        let uid = self.next_uid.max(1);
+        self.next_uid = uid.saturating_add(1);
+        uid
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Re-assign monotonic unique IDs and clear transient flags after deserialization.
+    pub fn normalize_uids(&mut self) {
+        self.next_uid = 1;
+        for item in &mut self.items {
+            item.uid = self.next_uid;
+            self.next_uid += 1;
+            item.resolving = false;
+        }
+        self.manual_stop = false;
+        self.active_item = None;
+    }
+
+    /// Append to tail unless an identical `(anime_id, episode)` is already queued (in which case refresh metadata).
+    pub fn enqueue_back(&mut self, mut item: QueueItem) -> EnqueueOutcome {
+        if let Some(pos) = self
+            .items
+            .iter()
+            .position(|existing| existing.anime_id == item.anime_id && existing.episode == item.episode)
+        {
+            if let Some(existing) = self.items.get_mut(pos) {
+                existing.quality = item.quality;
+                existing.dub = item.dub;
+                existing.sub_lang = item.sub_lang;
+                existing.player = item.player;
+                existing.prefetch = None;
+                existing.resolving = false;
+            }
+            return EnqueueOutcome {
+                position: pos + 1,
+                replaced: true,
+            };
+        }
+        item.uid = self.alloc_uid();
+        self.items.push_back(item);
+        EnqueueOutcome {
+            position: self.items.len(),
+            replaced: false,
+        }
+    }
+
+    /// Insert (or promote) `(anime_id, episode)` at index `0` so it plays next.
+    pub fn enqueue_next(&mut self, mut item: QueueItem) -> EnqueueOutcome {
+        let mut replaced = false;
+        if let Some(pos) = self
+            .items
+            .iter()
+            .position(|existing| existing.anime_id == item.anime_id && existing.episode == item.episode)
+        {
+            self.items.remove(pos);
+            replaced = true;
+        }
+        item.uid = self.alloc_uid();
+        self.items.push_front(item);
+        EnqueueOutcome {
+            position: 1,
+            replaced,
+        }
+    }
+
+    /// Remove item at `idx`.
+    pub fn remove_at(&mut self, idx: usize) -> Option<QueueItem> {
+        self.items.remove(idx)
+    }
+
+    /// Swap item at `idx` toward the front; returns new cursor index.
+    pub fn move_up(&mut self, idx: usize) -> usize {
+        if idx > 0 && idx < self.items.len() {
+            self.items.swap(idx, idx - 1);
+            idx - 1
+        } else {
+            idx.min(self.items.len().saturating_sub(1))
+        }
+    }
+
+    /// Swap item at `idx` toward the tail; returns new cursor index.
+    pub fn move_down(&mut self, idx: usize) -> usize {
+        if idx + 1 < self.items.len() {
+            self.items.swap(idx, idx + 1);
+            idx + 1
+        } else {
+            idx.min(self.items.len().saturating_sub(1))
+        }
+    }
+
+    /// Clear all queued items (leaves `auto_advance`, `loop_mode`, and `active_item` intact).
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Fisher-Yates shuffle without external RNG dependencies.
+    pub fn shuffle(&mut self) {
+        let len = self.items.len();
+        if len <= 1 {
+            return;
+        }
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        seed ^= len as u64 ^ 0x9E37_79B9_7F4A_7C15;
+
+        for i in (1..len).rev() {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let j = (z as usize) % (i + 1);
+            self.items.swap(i, j);
+        }
+    }
+
+    /// Pop the next episode to play; if `loop_mode` is active, rotate finished `active_item` to the tail.
+    pub fn pop_next_for_advance(&mut self) -> Option<QueueItem> {
+        if self.loop_mode {
+            if let Some(finished) = self.active_item.take() {
+                let mut recycled = finished.item;
+                recycled.uid = self.alloc_uid();
+                recycled.resolving = false;
+                recycled.prefetch = None;
+                self.items.push_back(recycled);
+            }
+        } else {
+            self.active_item = None;
+        }
+        self.items.pop_front()
+    }
+
+    /// Return the next un-warmed or expired front item to background-prefetch.
+    pub fn next_prefetch_target(&self, now_unix: u64) -> Option<QueueItem> {
+        let head = self.items.front()?;
+        if head.resolving {
+            return None;
+        }
+        let is_fresh = head
+            .prefetch
+            .as_ref()
+            .is_some_and(|p| p.is_fresh(now_unix));
+        if is_fresh {
+            None
+        } else {
+            Some(head.clone())
+        }
+    }
+
+    /// Mark an item by `uid` as actively resolving or idle.
+    pub fn set_resolving(&mut self, uid: u64, resolving: bool) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.uid == uid) {
+            item.resolving = resolving;
+        }
+    }
+
+    /// Store resolved prefetch payload onto matching `uid` item.
+    pub fn apply_prefetch_result(&mut self, uid: u64, prefetch: Option<ResolvedPrefetch>) -> bool {
+        if let Some(item) = self.items.iter_mut().find(|i| i.uid == uid) {
+            item.resolving = false;
+            if let Some(pre) = prefetch {
+                item.prefetch = Some(pre);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear expired cached prefetches so UI status and workers re-warm accurately.
+    pub fn invalidate_stale(&mut self, now_unix: u64) {
+        for item in &mut self.items {
+            if item
+                .prefetch
+                .as_ref()
+                .is_some_and(|p| !p.is_fresh(now_unix))
+            {
+                item.prefetch = None;
+            }
+        }
+    }
+}
+
+/// Sanitize a profile ID into a filesystem-safe token.
+fn safe_profile_token(profile_id: &str) -> String {
+    let cleaned: String = profile_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "default".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Path to the profile's temporary session queue file inside the OS cache directory.
+pub fn active_queue_path(profile_id: &str) -> Result<PathBuf> {
+    let token = safe_profile_token(profile_id);
+    Ok(Config::cache_dir()?.join(format!("active_queue_{token}.json")))
+}
+
+/// Best-effort save of the temp session queue to `<cache_dir>/active_queue_<profile>.json`.
+pub fn save_active_queue(profile_id: &str, queue: &WatchQueue) {
+    let Ok(path) = active_queue_path(profile_id) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(queue) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Load temp session queue for `profile_id`, purging stale links and resetting transient flags.
+pub fn load_active_queue(profile_id: &str, now_unix: u64) -> WatchQueue {
+    let Ok(path) = active_queue_path(profile_id) else {
+        return WatchQueue::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return WatchQueue::default();
+    };
+    let Ok(mut queue) = serde_json::from_str::<WatchQueue>(&raw) else {
+        return WatchQueue::default();
+    };
+    queue.normalize_uids();
+    queue.invalidate_stale(now_unix);
+    queue
+}
+
+/// Delete a profile's temp session queue file when deleting that profile.
+pub fn remove_active_queue_file(profile_id: &str) {
+    if let Ok(path) = active_queue_path(profile_id) {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Portable JSON playlist export/share envelope (`profiles/<id>/playlists/<slug>.json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortablePlaylist {
+    #[serde(default = "default_schema")]
+    pub schema:       u32,
+    pub name:         String,
+    #[serde(default)]
+    pub loop_default: bool,
+    pub items:        Vec<PlaylistItemDraft>,
+}
+
+fn default_schema() -> u32 {
+    1
+}
+
+/// Profile-scoped directory for exported JSON playlist packs.
+pub fn playlists_export_dir(profile_id: &str) -> Result<PathBuf> {
+    let token = safe_profile_token(profile_id);
+    Ok(Config::config_dir()?
+        .join("profiles")
+        .join(token)
+        .join("playlists"))
+}
+
+fn slugify_playlist_name(name: &str) -> String {
+    let mut slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "playlist".to_string()
+    } else {
+        trimmed.chars().take(48).collect()
+    }
+}
+
+/// Export a saved playlist as a portable JSON file for sharing watch-party packs.
+pub fn export_playlist_json(
+    profile_id:   &str,
+    name:         &str,
+    loop_default: bool,
+    items:        &[PlaylistItemDraft],
+) -> Result<PathBuf> {
+    let dir = playlists_export_dir(profile_id)?;
+    std::fs::create_dir_all(&dir)?;
+    let slug = slugify_playlist_name(name);
+    let path = dir.join(format!("{slug}.json"));
+    let envelope = PortablePlaylist {
+        schema: 1,
+        name: name.to_string(),
+        loop_default,
+        items: items.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&envelope)
+        .map_err(|e| AppError::Config(format!("Failed to serialize playlist: {e}")))?;
+    std::fs::write(&path, json)?;
+    Ok(path)
+}
+
+/// Read and parse a portable playlist JSON file from disk.
+pub fn import_playlist_json(path: &Path) -> Result<PortablePlaylist> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str::<PortablePlaylist>(&raw)
+        .map_err(|e| AppError::Config(format!("Invalid playlist JSON: {e}")))
+}
+
+/// Scan the profile's `playlists/` directory for `.json` watch-party packs.
+pub fn scan_portable_playlists(profile_id: &str) -> Vec<PortablePlaylist> {
+    let Ok(dir) = playlists_export_dir(profile_id) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut imported = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(pack) = import_playlist_json(&path) {
+                if !pack.items.is_empty() {
+                    imported.push(pack);
+                }
+            }
+        }
+    }
+    imported
+}
+
+/// Parse single numbers or dash ranges (`"5"`, `"3-8"`) bounded to `max_aired`.
+pub fn parse_batch_queue_input(input: &str, max_aired: u32) -> Vec<u32> {
+    parse_episode_range(input, max_aired.max(1), &[])
+}
+
+/// Resolve stream URL, subtitle track (including optional auto-sync), and Era-Adaptive GLSL shaders
+/// for a queued episode. Used by both the background `N+1` prefetch worker and direct queue launches.
+pub async fn resolve_item_prefetch(
+    item:         &QueueItem,
+    anime4k_mode: Anime4KMode,
+    sub_style:    SubtitleStyleConfig,
+    resolved_at:  u64,
+) -> Option<ResolvedPrefetch> {
+    let stream_info = fetch_stream_info_with_mal(
+        item.anime_id,
+        item.mal_id,
+        &item.query,
+        item.episode,
+        item.dub,
+    )
+    .await;
+
+    let stream_url = stream_info
+        .qualities
+        .iter()
+        .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
+        .or_else(|| stream_info.qualities.first())
+        .map(|q| q.url.clone())
+        .filter(|u| !u.is_empty())
+        .or_else(|| stream_info.master_url.clone());
+
+    let pref_lower = item.sub_lang.to_lowercase();
+    let chosen_sub = stream_info
+        .subtitles
+        .iter()
+        .find(|s| {
+            s.name.to_lowercase().contains(&pref_lower)
+                || s.code.to_lowercase().starts_with(&pref_lower)
+                || s.lang_keyword().eq_ignore_ascii_case(&item.sub_lang)
+        })
+        .or_else(|| stream_info.subtitles.first());
+
+    let sub_lang = chosen_sub
+        .map(|s| s.lang_keyword().to_string())
+        .or_else(|| Some(item.sub_lang.clone()));
+    let mut sub_url = chosen_sub
+        .map(|s| s.url.clone())
+        .filter(|u| !u.is_empty());
+    let mut sub_synced = false;
+
+    let needs_subsync = chosen_sub.is_some_and(|s| {
+        s.stream_label.contains("[Auto-Synced]")
+            && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+    });
+
+    if needs_subsync {
+        if let Some(ref raw_sub_url) = sub_url {
+            let code = sub_lang.as_deref().unwrap_or("sub");
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            let ref_sub_url = stream_info
+                .subtitles
+                .iter()
+                .find(|s| {
+                    !s.stream_label.contains("[Auto-Synced]")
+                        && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+                })
+                .map(|s| s.url.as_str());
+            if let Ok((cached_path, res)) = tokio::time::timeout(
+                Duration::from_secs(4),
+                ensure_synchronized_subtitle(
+                    &client,
+                    raw_sub_url,
+                    ref_sub_url,
+                    stream_url.as_deref(),
+                    item.anime_id,
+                    item.episode,
+                    code,
+                ),
+            )
+            .await
+            {
+                sub_url = Some(cached_path);
+                sub_synced = res.is_some_and(|r| r.applied);
+            }
+        }
+    }
+
+    let glsl_shaders = if anime4k_mode != Anime4KMode::Off {
+        build_shader_arg_for_year(anime4k_mode, item.season_year)
+    } else {
+        None
+    };
+
+    let options = PlayOptions {
+        title: item.query.clone(),
+        episode: item.episode,
+        quality: item.quality.clone(),
+        dub: item.dub,
+        player: item.player.clone(),
+        sub_lang,
+        sub_url,
+        stream_url,
+        ipc_socket: None,
+        start_pos: None,
+        glsl_shaders,
+        sub_style: Some(sub_style),
+        loading_image: None,
+    };
+
+    Some(ResolvedPrefetch {
+        options,
+        resolved_at,
+        sub_synced,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_item(anime_id: i64, title: &str, ep: u32) -> QueueItem {
+        QueueItem::new(
+            anime_id,
+            None,
+            Some(2023),
+            title.to_string(),
+            title.to_string(),
+            ep,
+            "1080p".to_string(),
+            false,
+            "English".to_string(),
+            "mpv".to_string(),
+        )
+    }
+
+    fn mk_prefetch(resolved_at: u64) -> ResolvedPrefetch {
+        ResolvedPrefetch {
+            options: PlayOptions {
+                title: "Frieren".to_string(),
+                episode: 1,
+                quality: "1080p".to_string(),
+                dub: false,
+                player: "mpv".to_string(),
+                sub_lang: Some("English".to_string()),
+                sub_url: None,
+                stream_url: Some("https://cdn.example.com/1080.m3u8".to_string()),
+                ipc_socket: None,
+                start_pos: None,
+                glsl_shaders: None,
+                sub_style: None,
+                loading_image: None,
+            },
+            resolved_at,
+            sub_synced: false,
+        }
+    }
+
+    #[test]
+    fn test_enqueue_back_dedup_and_enqueue_next_priority() {
+        let mut q = WatchQueue::default();
+        assert_eq!(q.enqueue_back(mk_item(1, "Frieren", 1)), EnqueueOutcome { position: 1, replaced: false });
+        assert_eq!(q.enqueue_back(mk_item(1, "Frieren", 2)), EnqueueOutcome { position: 2, replaced: false });
+        // Duplicate replaces in-place instead of creating duplicate entries
+        assert_eq!(q.enqueue_back(mk_item(1, "Frieren", 1)), EnqueueOutcome { position: 1, replaced: true });
+        assert_eq!(q.len(), 2);
+
+        // Queue Next promotes ep 2 to front
+        let res = q.enqueue_next(mk_item(1, "Frieren", 2));
+        assert_eq!(res, EnqueueOutcome { position: 1, replaced: true });
+        assert_eq!(q.items[0].episode, 2);
+        assert_eq!(q.items[1].episode, 1);
+    }
+
+    #[test]
+    fn test_loop_mode_rotates_finished_item_and_advance() {
+        let mut q = WatchQueue::default();
+        q.loop_mode = true;
+        q.enqueue_back(mk_item(1, "Bebop", 1));
+        q.enqueue_back(mk_item(2, "Frieren", 2));
+
+        let first = q.pop_next_for_advance().unwrap();
+        assert_eq!(first.episode, 1);
+        q.active_item = Some(ActiveNowItem {
+            item: first,
+            used_prefetched: false,
+            retried_once: false,
+        });
+
+        let second = q.pop_next_for_advance().unwrap();
+        assert_eq!(second.episode, 2);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.items[0].episode, 1); // Active item rotated to tail
+    }
+
+    #[test]
+    fn test_prefetch_ttl_expiration_and_status_badges() {
+        let pre = mk_prefetch(1_000);
+        assert!(pre.is_fresh(1_000));
+        assert!(pre.is_fresh(1_000 + PREFETCH_TTL_SECS - 1));
+        assert!(!pre.is_fresh(1_000 + PREFETCH_TTL_SECS));
+
+        let mut item = mk_item(1, "Frieren", 1);
+        assert_eq!(item.status(1_500), PrefetchStatus::Queued);
+        item.resolving = true;
+        assert_eq!(item.status(1_500), PrefetchStatus::Resolving);
+        item.resolving = false;
+        item.prefetch = Some(pre);
+        assert_eq!(item.status(1_500), PrefetchStatus::Ready);
+        assert_eq!(item.status(5_000), PrefetchStatus::Stale);
+    }
+
+    #[test]
+    fn test_move_up_down_and_json_roundtrip_clears_transient_flags() {
+        let mut q = WatchQueue::default();
+        q.enqueue_back(mk_item(1, "A", 1));
+        q.enqueue_back(mk_item(2, "B", 2));
+        q.enqueue_back(mk_item(3, "C", 3));
+        q.items[0].resolving = true;
+        q.manual_stop = true;
+
+        assert_eq!(q.move_down(0), 1);
+        assert_eq!(q.items[1].title, "A");
+        assert_eq!(q.move_up(2), 1);
+        assert_eq!(q.items[1].title, "C");
+
+        let json = serde_json::to_string(&q).unwrap();
+        let mut decoded: WatchQueue = serde_json::from_str(&json).unwrap();
+        decoded.normalize_uids();
+        assert!(!decoded.manual_stop);
+        assert!(!decoded.items[1].resolving);
+        assert_eq!(decoded.items.len(), 3);
+    }
+
+    #[test]
+    fn test_batch_range_parser_and_portable_playlist_json() {
+        assert_eq!(parse_batch_queue_input("3-6", 24), vec![3, 4, 5, 6]);
+        assert_eq!(parse_batch_queue_input("10", 12), vec![10]);
+        assert_eq!(parse_batch_queue_input("10-20", 12), vec![10, 11, 12]);
+
+        let tmp = std::env::temp_dir().join("solus_test_portable_playlist.json");
+        let pack = PortablePlaylist {
+            schema: 1,
+            name: "Party Mix".to_string(),
+            loop_default: true,
+            items: vec![mk_item(1, "Cowboy Bebop", 5).to_draft()],
+        };
+        std::fs::write(&tmp, serde_json::to_string_pretty(&pack).unwrap()).unwrap();
+        let loaded = import_playlist_json(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded, pack);
+    }
+}

@@ -62,6 +62,8 @@ const PLAYBACK_BINDINGS: &[BindingRow] = &[
 const FEATURES_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "a", desc: "Taste Analytics Bento Hub" },
     BindingRow { key: "w", desc: "Tailored recommendation wizard" },
+    BindingRow { key: "Q / Ctrl+Q", desc: "Watch Session Queue & Playlists" },
+    BindingRow { key: "e / E", desc: "Enqueue ep / Batch ep range" },
     BindingRow { key: "c", desc: "Weekly airing calendar" },
     BindingRow { key: "m", desc: "Mobile LAN remote & QR" },
     BindingRow { key: "C", desc: "LAN Cast Deck & DLNA stream" },
@@ -75,7 +77,7 @@ const SYSTEM_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "!", desc: "Open System Doctor & Pipeline" },
     BindingRow { key: "U", desc: "Check or install self-update" },
     BindingRow { key: "X", desc: "Stop active player process" },
-    BindingRow { key: "Q", desc: "Quit Solus immediately" },
+    BindingRow { key: "q / Esc", desc: "Go back or quit confirmation" },
 ];
 
 /// Returns the responsive modal `(percent_x, percent_y)` matching `render_overlay`.
@@ -107,6 +109,7 @@ fn active_section(screen: &Screen) -> HelpSection {
         | Screen::UpdateModal
         | Screen::AniListLogin
         | Screen::ProfileModal
+        | Screen::QueueModal
         | Screen::Help => HelpSection::System,
     }
 }
@@ -127,6 +130,7 @@ fn context_label(screen: &Screen) -> &'static str {
         Screen::UpdateModal => "SELF-UPDATE",
         Screen::AniListLogin => "ANILIST AUTH",
         Screen::ProfileModal => "PROFILE SWITCHER",
+        Screen::QueueModal => "QUEUE & PLAYLISTS",
         Screen::Help => "COMMAND MATRIX",
     }
 }

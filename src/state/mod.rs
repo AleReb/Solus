@@ -47,6 +47,8 @@ pub enum Screen {
     Calendar,
     /// Multi-user "Who's Watching?" profile switcher & manager (`[P]`)
     ProfileModal,
+    /// Watch Session Queue & Profile-Scoped Saved Playlists Hub (`[Q]` / `[Ctrl+Q]`)
+    QueueModal,
 }
 
 /// Active inline text input mode inside the Profile Switcher modal (`[P]`).
@@ -596,6 +598,22 @@ pub struct AppState {
     pub profile_name_input: String,
     pub profile_avatar_cursor: usize,
     pub profile_audio_dub: bool,
+
+    /// Watch Session Queue & Saved Playlists Hub (`[Q]`)
+    pub queue:                   crate::services::queue::WatchQueue,
+    pub saved_playlists:         Vec<crate::db::playlists::SavedPlaylistSummary>,
+    pub playlist_preview_items:  Vec<crate::db::playlists::SavedPlaylistItem>,
+    pub queue_focus_pane:        usize,
+    pub queue_cursor:            usize,
+    pub playlist_cursor:         usize,
+    pub queue_save_mode:         bool,
+    pub queue_save_input:        String,
+
+    /// Detail Screen Batch Quick-Queue modal (`[E]`)
+    pub is_batch_queue_modal_open: bool,
+    pub batch_queue_mode:          usize,
+    pub batch_queue_range:         String,
+    pub batch_queue_dub:           bool,
 }
 
 impl AppState {
@@ -766,6 +784,18 @@ impl AppState {
             profile_name_input: String::new(),
             profile_avatar_cursor: 0,
             profile_audio_dub: false,
+            queue: crate::services::queue::WatchQueue::default(),
+            saved_playlists: Vec::new(),
+            playlist_preview_items: Vec::new(),
+            queue_focus_pane: 0,
+            queue_cursor: 0,
+            playlist_cursor: 0,
+            queue_save_mode: false,
+            queue_save_input: String::new(),
+            is_batch_queue_modal_open: false,
+            batch_queue_mode: 0,
+            batch_queue_range: String::new(),
+            batch_queue_dub: false,
         }
     }
 
@@ -896,7 +926,10 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal | Screen::QueueModal => {
+                if self.screen == Screen::QueueModal {
+                    self.queue_save_mode = false;
+                }
                 if self.overlay_base == self.screen {
                     Screen::Home
                 } else {
@@ -960,6 +993,9 @@ impl AppState {
         self.is_download_modal_open = false;
         self.download_modal_mode = 0;
         self.download_range_input.clear();
+        self.is_batch_queue_modal_open = false;
+        self.batch_queue_mode = 0;
+        self.batch_queue_range.clear();
         self.detail_recommendations = Vec::new();
         self.detail_recommendation_reasons = HashMap::new();
         self.detail_focus = DetailFocus::Episodes;
@@ -997,6 +1033,46 @@ impl AppState {
     pub fn open_setup(&mut self) {
         self.overlay_base = self.current_base_screen();
         self.screen = Screen::Setup;
+    }
+
+    /// Open the Watch Session Queue & Saved Playlists Hub (`[Q]` / `[Ctrl+Q]`).
+    pub fn open_queue_modal(&mut self, playlists: Vec<crate::db::playlists::SavedPlaylistSummary>) {
+        if self.screen != Screen::QueueModal {
+            self.overlay_base = self.current_base_screen();
+        }
+        self.saved_playlists = playlists;
+        self.queue_save_mode = false;
+        self.queue_save_input.clear();
+        if self.queue_cursor >= self.queue.len() {
+            self.queue_cursor = self.queue.len().saturating_sub(1);
+        }
+        if self.playlist_cursor >= self.saved_playlists.len() {
+            self.playlist_cursor = self.saved_playlists.len().saturating_sub(1);
+        }
+        if self.queue.is_empty() && !self.saved_playlists.is_empty() {
+            self.queue_focus_pane = 1;
+        }
+        self.screen = Screen::QueueModal;
+    }
+
+    /// Open the Detail batch quick-queue preset / range modal (`[E]`).
+    pub fn open_batch_queue_modal(&mut self, default_dub: bool) {
+        let ep = self.selected_episode.unwrap_or(1);
+        let max_aired = self
+            .selected_anime
+            .as_ref()
+            .map(|a| a.aired_episodes())
+            .unwrap_or(1)
+            .max(1);
+        let end_sample = (ep + 2).min(max_aired);
+        self.is_batch_queue_modal_open = true;
+        self.batch_queue_mode = 1; // Default to Append selected episode
+        self.batch_queue_range = if ep < end_sample {
+            format!("{ep}-{end_sample}")
+        } else {
+            format!("{ep}")
+        };
+        self.batch_queue_dub = default_dub;
     }
 
     /// Open the in-app update modal dialog.
@@ -1348,7 +1424,7 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar | Screen::ProfileModal | Screen::QueueModal => self.overlay_base.clone(),
             Screen::CastDeck => Screen::Detail,
             Screen::Home => Screen::Home,
         }

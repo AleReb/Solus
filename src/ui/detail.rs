@@ -56,6 +56,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Span::raw(format!("{} ", view_mode_label)),
         Span::styled("w", Style::default().fg(Color::Rgb(180, 0, 255))),
         Span::raw(" Watched  "),
+        Span::styled("e/E", Style::default().fg(Color::Rgb(80, 250, 123))),
+        Span::raw(" Queue  "),
+        Span::styled("Q", Style::default().fg(Color::Rgb(251, 191, 36))),
+        Span::raw(" Playlists  "),
         Span::styled("p", Style::default().fg(Color::Rgb(180, 0, 255))),
         Span::raw(" Options  "),
         Span::styled("D", Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
@@ -887,6 +891,11 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
             Span::styled(
                 if is_watched { " [ w Mark Unwatched ] " } else { " [ w Mark Watched ] " },
                 Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 55)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ e +Queue ] ",
+                Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(" [ v List View ] ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),

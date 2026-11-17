@@ -10,7 +10,10 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, RwLock,
+};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{self, Sender, UnboundedSender};
@@ -102,19 +105,34 @@ async fn connect_ipc(sock_path: &str) -> Option<IpcStream> {
     }
 }
 
+/// Atomic exit classification written by IPC monitor & checked when `mpv` exits.
+pub const PLAYBACK_EXIT_UNKNOWN: u8 = 0;
+pub const PLAYBACK_EXIT_NATURAL_EOF: u8 = 1;
+pub const PLAYBACK_EXIT_USER_QUIT: u8 = 2;
+
 /// Configuration for launching an mpv IPC monitoring session.
 pub struct IpcMonitorConfig {
-    pub anime_id:        i64,
-    pub mal_id:          Option<i64>,
-    pub episode:         u32,
-    pub sock_path:       String,
-    pub pool:            SqlitePool,
-    pub tx:              Sender<AppMessage>,
-    pub auth:            crate::config::AuthConfig,
-    pub trackers:        crate::config::TrackersConfig,
-    pub skip_intervals:  Vec<SkipResult>,
-    pub auto_skip_intro: bool,
+    pub anime_id:           i64,
+    pub mal_id:             Option<i64>,
+    pub episode:            u32,
+    pub sock_path:          String,
+    pub pool:               SqlitePool,
+    pub tx:                 Sender<AppMessage>,
+    pub auth:               crate::config::AuthConfig,
+    pub trackers:           crate::config::TrackersConfig,
+    pub skip_intervals:     Vec<SkipResult>,
+    pub auto_skip_intro:    bool,
     pub has_loading_screen: bool,
+    pub playback_exit_kind: Option<Arc<AtomicU8>>,
+}
+
+/// Parse `end-file` event reason from mpv JSON-RPC (`"eof"`, `"quit"`, `"stop"`, `"error"`).
+pub fn parse_end_file_reason(line: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? == "end-file" {
+        return parsed.get("reason")?.as_str().map(|s| s.to_string());
+    }
+    None
 }
 
 /// Parse `playlist-pos` property changes from mpv JSON-RPC.
@@ -396,6 +414,7 @@ where
         skip_intervals,
         auto_skip_intro,
         has_loading_screen,
+        playback_exit_kind,
     } = config;
 
     let (reader_half, mut writer_half) = tokio::io::split(stream);
@@ -470,6 +489,16 @@ where
                 if let Some(pos) = parse_playlist_pos_change(&line) {
                     if pos >= 1 {
                         stream_started = true;
+                    }
+                }
+
+                if let Some(reason) = parse_end_file_reason(&line) {
+                    if let Some(ref kind) = playback_exit_kind {
+                        if reason == "quit" {
+                            kind.store(PLAYBACK_EXIT_USER_QUIT, Ordering::Relaxed);
+                        } else if reason == "eof" && stream_started && !in_loading_screen {
+                            kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -720,6 +749,7 @@ mod tests {
             skip_intervals: Vec::new(),
             auto_skip_intro: false,
             has_loading_screen: false,
+            playback_exit_kind: None,
         };
 
         let task = tokio::spawn(async move {
@@ -800,5 +830,13 @@ mod tests {
         assert!(osd.contains("STREAM LOADER"));
         assert!(!osd.contains("Y2K"));
         assert!(osd.contains("0.6s"));
+        assert_eq!(
+            parse_end_file_reason(r#"{"event":"end-file","reason":"eof"}"#).as_deref(),
+            Some("eof")
+        );
+        assert_eq!(
+            parse_end_file_reason(r#"{"event":"end-file","reason":"quit"}"#).as_deref(),
+            Some("quit")
+        );
     }
 }

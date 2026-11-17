@@ -40,8 +40,14 @@ enum AppMessage {
     HomeData(Box<ui::home::HomeData>),
     /// A log line from ani-cli stdout or stderr
     PlaybackLog(String),
-    /// ani-cli process exited
-    PlaybackDone(u64),
+    /// Playback process exited
+    PlaybackDone {
+        gen:          u64,
+        exited_ok:    bool,
+        natural_eof:  bool,
+        user_quit:    bool,
+        elapsed_secs: u64,
+    },
     /// AniList search results
     SearchResults(Vec<db::cache::Anime>),
     /// Cover image downloaded and decoded (anime_id, image)
@@ -174,6 +180,17 @@ enum AppMessage {
     AudioTracksUpdated(Vec<services::remote::RemoteAudioTrack>),
     /// Remote touch companion toggled or selected Anime4K shader mode
     RemoteAnime4K(config::Anime4KMode),
+    /// Background `N+1` queue prefetch completed
+    QueuePrefetchReady {
+        uid:      u64,
+        prefetch: Option<services::queue::ResolvedPrefetch>,
+    },
+    /// Mobile companion tapped Skip Next in Queue drawer
+    RemoteQueueSkip,
+    /// Mobile companion tapped a specific queued item index to play now
+    RemoteQueuePlayIndex(usize),
+    /// Mobile companion toggled Queue Auto-Advance
+    RemoteQueueToggleAuto,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -365,10 +382,14 @@ async fn main() -> anyhow::Result<()> {
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
+    state.queue = services::queue::load_active_queue(&state.active_profile_id, boot_now as u64);
     {
         let mut st = state.remote_state.write().await;
         st.active_profile = state.active_profile_name.clone();
         st.profile_icon = state.active_profile_icon.clone();
+        st.queue_auto_advance = state.queue.auto_advance;
+        st.queue_loop = state.queue.loop_mode;
+        st.queue = build_remote_queue_snapshot(&state.queue, boot_now as u64);
     }
 
     // ── Instant Stale-While-Revalidate startup: load cached catalog (<15ms) ────
@@ -488,11 +509,18 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::PlaybackLog(line) => {
                     state.push_log(line);
                 }
-                AppMessage::PlaybackDone(gen) => {
+                AppMessage::PlaybackDone {
+                    gen,
+                    exited_ok,
+                    natural_eof,
+                    user_quit,
+                    elapsed_secs,
+                } => {
                     // Ignore completion events from superseded players (episode switches)
                     if gen != state.playback_gen {
                         continue;
                     }
+                    let active_snapshot = state.queue.active_item.clone();
                     state.now_playing = None;
                     state.player_stop = None;
                     services::ipc::set_active_ipc_sender(None);
@@ -507,6 +535,43 @@ async fn main() -> anyhow::Result<()> {
                     });
                     #[cfg(unix)]
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+
+                    // Self-healing retry once if a prefetched CDN URL failed quickly on launch
+                    if !exited_ok && !user_quit && elapsed_secs < 10 {
+                        if let Some(mut active) = active_snapshot
+                            .as_ref()
+                            .filter(|a| a.used_prefetched && !a.retried_once)
+                            .cloned()
+                        {
+                            active.item.prefetch = None;
+                            state.show_toast(
+                                format!(
+                                    "❖ Cached link expired — re-resolving {} Ep {}...",
+                                    active.item.title, active.item.episode
+                                ),
+                                unix_now(),
+                            );
+                            play_queue_item(&mut state, active.item, false, true, &pool, &cfg, &tx).await;
+                            continue;
+                        }
+                    }
+
+                    // Auto-advance next queued item on natural EOF / clean completion
+                    let natural_finish = natural_eof || (exited_ok && !user_quit && elapsed_secs >= 15);
+                    if natural_finish && !state.queue.manual_stop && state.queue.auto_advance {
+                        if let Some(next_item) = state.queue.pop_next_for_advance() {
+                            if state.queue_cursor >= state.queue.len() {
+                                state.queue_cursor = state.queue.len().saturating_sub(1);
+                            }
+                            let label = format!("{} · Ep {}", next_item.title, next_item.episode);
+                            state.show_toast(format!("◈ Up Next: {}", label), unix_now());
+                            play_queue_item(&mut state, next_item, false, false, &pool, &cfg, &tx).await;
+                            continue;
+                        }
+                    }
+
+                    state.queue.active_item = None;
+                    services::queue::save_active_queue(&state.active_profile_id, &state.queue);
                     if state.screen == Screen::Playback {
                         state.screen = Screen::Detail;
                     }
@@ -1201,6 +1266,49 @@ async fn main() -> anyhow::Result<()> {
                     let _ = cfg.save();
                     state.show_toast(format!("❖ Anime4K: {}", mode.as_str()), unix_now());
                 }
+                AppMessage::QueuePrefetchReady { uid, prefetch } => {
+                    if state.queue.apply_prefetch_result(uid, prefetch) {
+                        services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+                    }
+                    sync_remote_queue_snapshot(&state);
+                }
+                AppMessage::RemoteQueueSkip => {
+                    if let Some(next_item) = state.queue.pop_next_for_advance() {
+                        state.queue.manual_stop = false;
+                        state.show_toast(
+                            format!("◈ Remote Skip -> {} · Ep {}", next_item.title, next_item.episode),
+                            unix_now(),
+                        );
+                        play_queue_item(&mut state, next_item, false, false, &pool, &cfg, &tx).await;
+                    } else {
+                        state.show_toast("Queue is empty", unix_now());
+                    }
+                }
+                AppMessage::RemoteQueuePlayIndex(idx) => {
+                    if let Some(item) = state.queue.remove_at(idx) {
+                        state.queue.manual_stop = false;
+                        if state.queue_cursor >= state.queue.len() {
+                            state.queue_cursor = state.queue.len().saturating_sub(1);
+                        }
+                        state.show_toast(
+                            format!("◈ Remote Playing: {} · Ep {}", item.title, item.episode),
+                            unix_now(),
+                        );
+                        play_queue_item(&mut state, item, false, false, &pool, &cfg, &tx).await;
+                    }
+                }
+                AppMessage::RemoteQueueToggleAuto => {
+                    state.queue.auto_advance = !state.queue.auto_advance;
+                    services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+                    sync_remote_queue_snapshot(&state);
+                    state.show_toast(
+                        format!(
+                            "◈ Queue Auto-Advance: {}",
+                            if state.queue.auto_advance { "ON" } else { "OFF" }
+                        ),
+                        unix_now(),
+                    );
+                }
             }
         }
 
@@ -1232,7 +1340,12 @@ async fn main() -> anyhow::Result<()> {
                             ui::home::render(frame, &mut state, &home_data);
                         }
                     }
-                    Screen::Detail   => ui::detail::render(frame, &mut state),
+                    Screen::Detail => {
+                        ui::detail::render(frame, &mut state);
+                        if state.is_batch_queue_modal_open {
+                            ui::queue::render_batch_queue_modal(frame, &state, &cfg);
+                        }
+                    }
                     Screen::PlaybackQuery => {
                         ui::detail::render(frame, &mut state);
                         ui::play_query::render_overlay(frame, &state);
@@ -1297,6 +1410,10 @@ async fn main() -> anyhow::Result<()> {
                     Screen::ProfileModal => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::profile::render_overlay(frame, &state);
+                    }
+                    Screen::QueueModal => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::queue::render_overlay(frame, &state);
                     }
                 }
                 if state.watchlist_target_prompt.is_some() {
@@ -1383,6 +1500,16 @@ async fn handle_key(
         return;
     }
 
+    // Ctrl+Q toggles the Watch Session Queue & Saved Playlists Hub anywhere
+    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.screen == Screen::QueueModal {
+            state.go_back();
+        } else if !state.is_loading {
+            open_queue_hub(state, pool).await;
+        }
+        return;
+    }
+
     if state.exit_confirm_open {
         handle_exit_confirm_modal(key, state);
         return;
@@ -1428,6 +1555,7 @@ async fn handle_key(
         Screen::UpdateModal => handle_update_modal(key, state, tx).await,
         Screen::Calendar => handle_calendar(key, state, home_data, pool, cfg, tx).await,
         Screen::ProfileModal => handle_profile_modal(key, state, home_data, pool, cfg, tx).await,
+        Screen::QueueModal => handle_queue_modal(key, state, pool, cfg, tx).await,
     }
 }
 
@@ -1735,6 +1863,7 @@ async fn handle_mouse(
                         use ui::home::HomeFooterAction::*;
                         let code = match action {
                             Search => KeyCode::Char('/'),
+                            Queue => KeyCode::Char('Q'),
                             Calendar => KeyCode::Char('c'),
                             Wizard => KeyCode::Char('w'),
                             Analytics => KeyCode::Char('a'),
@@ -2128,6 +2257,27 @@ async fn handle_home(
             }
             state.screen = Screen::RemoteModal;
         }
+        KeyCode::Char('Q') => {
+            open_queue_hub(state, pool).await;
+        }
+        KeyCode::Char('e') => {
+            if let Some(anime) = active_anime(state, home_data) {
+                let next_ep = home_data
+                    .resume_next
+                    .get(&anime.id)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1);
+                let default_dub = anime.has_dub() && cfg.audio_mode == config::AudioMode::Dub;
+                let item = build_queue_item_for_anime(&anime, next_ep, default_dub, cfg, state);
+                let label = format!("{} · Ep {}", item.title, item.episode);
+                let outcome = state.queue.enqueue_back(item);
+                state.queue_cursor = state.queue.len().saturating_sub(1);
+                persist_and_warm_queue(state, cfg, tx);
+                let verb = if outcome.replaced { "Refreshed in queue" } else { "Queued" };
+                state.show_toast(format!("◆ {}: {} (#{})", verb, label, outcome.position), unix_now());
+            }
+        }
         KeyCode::Char('/') => state.open_search(),
         KeyCode::Char('c') | KeyCode::Char('C') => {
             open_and_fetch_calendar(state, pool, tx).await;
@@ -2228,6 +2378,7 @@ async fn handle_home(
                     trigger_watchlist_remove_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
                 }
             } else if state.now_playing.is_some() {
+                state.queue.manual_stop = true;
                 state.stop_player();
                 state.show_toast("Playback stopped", unix_now());
             }
@@ -2235,6 +2386,7 @@ async fn handle_home(
 
         KeyCode::Char('X') => {
             if state.now_playing.is_some() {
+                state.queue.manual_stop = true;
                 state.stop_player();
                 state.show_toast("Playback stopped", unix_now());
             }
@@ -2865,6 +3017,11 @@ async fn handle_detail(
         return;
     }
 
+    if state.is_batch_queue_modal_open {
+        handle_batch_queue_modal(key, state, cfg, tx).await;
+        return;
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             state.go_back();
@@ -2973,6 +3130,47 @@ async fn handle_detail(
             state.download_range_input.clear();
         }
 
+        KeyCode::Char('Q') => {
+            open_queue_hub(state, pool).await;
+        }
+
+        KeyCode::Char('e') => {
+            if let Some(anime) = state.selected_anime.clone() {
+                let ep = state.selected_episode.unwrap_or(1);
+                let max_aired = anime.aired_episodes();
+                if ep > max_aired && max_aired > 0 {
+                    state.show_toast(
+                        format!("Episode {} is locked — not yet aired", ep),
+                        unix_now(),
+                    );
+                } else {
+                    let default_audio = db::user::get_audio_mode(pool, anime.id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| cfg.audio_mode.clone());
+                    let dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
+                    let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
+                    let label = format!("{} · Ep {}", item.title, item.episode);
+                    let outcome = state.queue.enqueue_back(item);
+                    state.queue_cursor = state.queue.len().saturating_sub(1);
+                    persist_and_warm_queue(state, cfg, tx);
+                    let verb = if outcome.replaced { "Refreshed in queue" } else { "Queued" };
+                    state.show_toast(format!("◆ {}: {} (#{})", verb, label, outcome.position), unix_now());
+                }
+            }
+        }
+
+        KeyCode::Char('E') => {
+            if let Some(ref anime) = state.selected_anime {
+                let default_audio = db::user::get_audio_mode(pool, anime.id)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| cfg.audio_mode.clone());
+                let dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
+                state.open_batch_queue_modal(dub);
+            }
+        }
+
         // Install available update if present
         KeyCode::Char('U') => {
             if let Some(ref info) = state.available_update.clone() {
@@ -3057,6 +3255,7 @@ async fn handle_detail(
 
         KeyCode::Char('x') | KeyCode::Char('X') => {
             if state.now_playing.is_some() {
+                state.queue.manual_stop = true;
                 state.stop_player();
                 state.show_toast("Playback stopped", unix_now());
             }
@@ -5106,11 +5305,19 @@ async fn apply_profile_switch(
     };
     let _ = cfg.save();
 
+    let prev_profile_id = state.active_profile_id.clone();
+    services::queue::save_active_queue(&prev_profile_id, &state.queue);
+
     state.active_profile_id = target_profile.id.clone();
     state.active_profile_name = target_profile.display_name.clone();
     state.active_profile_icon = target_profile.avatar_icon.clone();
     state.theme_index = (target_profile.theme_index.max(0) as usize) % ui::theme::THEMES.len();
     state.auth = config::AuthConfig::load_for_profile(&target_profile.id);
+    state.queue = services::queue::load_active_queue(&target_profile.id, now as u64);
+    state.queue_cursor = 0;
+    state.playlist_cursor = 0;
+    state.saved_playlists.clear();
+    state.playlist_preview_items.clear();
 
     state.analytics_data = None;
     state.merge_report = None;
@@ -5124,11 +5331,17 @@ async fn apply_profile_switch(
     let r_state = state.remote_state.clone();
     let p_name = state.active_profile_name.clone();
     let p_icon = state.active_profile_icon.clone();
+    let p_queue = build_remote_queue_snapshot(&state.queue, now as u64);
+    let p_auto = state.queue.auto_advance;
+    let p_loop = state.queue.loop_mode;
     tokio::spawn(async move {
         {
             let mut st = r_state.write().await;
             st.active_profile = p_name;
             st.profile_icon = p_icon;
+            st.queue = p_queue;
+            st.queue_auto_advance = p_auto;
+            st.queue_loop = p_loop;
         }
         services::remote::broadcast_state(&r_state).await;
     });
@@ -5410,6 +5623,7 @@ async fn handle_profile_modal(
                 }
                 if db::user::delete_profile(pool, &pid).await.unwrap_or(false) {
                     config::AuthConfig::remove_profile_dir(&pid);
+                    services::queue::remove_active_queue_file(&pid);
                     if pid == state.active_profile_id {
                         if let Ok(def) = db::user::get_active_profile(pool).await {
                             apply_profile_switch(&def, state, home_data, pool, cfg, tx).await;
@@ -5424,6 +5638,715 @@ async fn handle_profile_modal(
                         format!("Removed profile: {}", summary.profile.display_name),
                         unix_now(),
                     );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── Watch Session Queue & Saved Playlists Hub ────────────────────────────────
+
+fn build_remote_queue_snapshot(
+    queue: &services::queue::WatchQueue,
+    now_unix: u64,
+) -> Vec<services::remote::RemoteQueueItem> {
+    queue
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| services::remote::RemoteQueueItem {
+            index: idx,
+            title: item.title.clone(),
+            episode: item.episode,
+            status: item.status(now_unix).remote_badge().to_string(),
+            quality: item.quality.clone(),
+            dub: item.dub,
+        })
+        .collect()
+}
+
+fn sync_remote_queue_snapshot(state: &AppState) {
+    let r_state = state.remote_state.clone();
+    let snapshot = build_remote_queue_snapshot(&state.queue, unix_now() as u64);
+    let auto_adv = state.queue.auto_advance;
+    let loop_m = state.queue.loop_mode;
+    tokio::spawn(async move {
+        {
+            let mut st = r_state.write().await;
+            st.queue = snapshot;
+            st.queue_auto_advance = auto_adv;
+            st.queue_loop = loop_m;
+        }
+        services::remote::broadcast_state(&r_state).await;
+    });
+}
+
+fn persist_and_warm_queue(
+    state: &mut AppState,
+    cfg:   &config::Config,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let now = unix_now() as u64;
+    state.queue.invalidate_stale(now);
+    services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+    if let Some(target) = state.queue.next_prefetch_target(now) {
+        state.queue.set_resolving(target.uid, true);
+        let a4k = state.anime4k_mode;
+        let sub_style = cfg.subtitle_style.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let resolved =
+                services::queue::resolve_item_prefetch(&target, a4k, sub_style, unix_now() as u64)
+                    .await;
+            let _ = tx2
+                .send(AppMessage::QueuePrefetchReady {
+                    uid: target.uid,
+                    prefetch: resolved,
+                })
+                .await;
+        });
+    }
+    sync_remote_queue_snapshot(state);
+}
+
+async fn refresh_playlist_preview(state: &mut AppState, pool: &sqlx::SqlitePool) {
+    if let Some(pl) = state.saved_playlists.get(state.playlist_cursor) {
+        state.playlist_preview_items =
+            db::playlists::get_playlist_items(pool, pl.id).await.unwrap_or_default();
+    } else {
+        state.playlist_preview_items.clear();
+    }
+}
+
+async fn open_queue_hub(state: &mut AppState, pool: &sqlx::SqlitePool) {
+    let lists = db::playlists::list_playlists_for_profile(pool, &state.active_profile_id)
+        .await
+        .unwrap_or_default();
+    state.open_queue_modal(lists);
+    refresh_playlist_preview(state, pool).await;
+}
+
+fn build_queue_item_for_anime(
+    anime: &db::cache::Anime,
+    ep:    u32,
+    dub:   bool,
+    cfg:   &config::Config,
+    state: &AppState,
+) -> services::queue::QueueItem {
+    let mal_id = state
+        .anime_mal_ids
+        .get(&anime.id)
+        .copied()
+        .or(anime.mal_id);
+    services::queue::QueueItem::new(
+        anime.id,
+        mal_id,
+        anime.season_year,
+        anime.display_title().to_string(),
+        anime.playback_query(),
+        ep,
+        cfg.quality.as_str().to_string(),
+        dub,
+        cfg.default_sub_lang.clone(),
+        state.selected_player().as_str().to_string(),
+    )
+}
+
+async fn play_queue_item(
+    state:          &mut AppState,
+    item:           services::queue::QueueItem,
+    _used_prefetch: bool,
+    retried_once:   bool,
+    pool:           &sqlx::SqlitePool,
+    cfg:            &config::Config,
+    tx:             &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let need_switch = state
+        .selected_anime
+        .as_ref()
+        .is_none_or(|a| a.id != item.anime_id);
+    if need_switch {
+        let target_anime = match db::cache::get_anime(pool, item.anime_id).await {
+            Ok(Some(a)) => a,
+            _ => {
+                let mut fallback = db::cache::Anime::default();
+                fallback.id = item.anime_id;
+                fallback.mal_id = item.mal_id;
+                fallback.season_year = item.season_year;
+                fallback.title_romaji = item.title.clone();
+                fallback.title_english = Some(item.title.clone());
+                fallback.episodes = Some(item.episode.max(1) as i64);
+                fallback
+            }
+        };
+        open_detail_from_anime(state, target_anime, pool, tx).await;
+    }
+
+    state.selected_episode = Some(item.episode);
+    let now = unix_now() as u64;
+    let cached_opt = item
+        .prefetch
+        .as_ref()
+        .filter(|p| p.is_fresh(now))
+        .map(|p| p.options.clone());
+
+    let (mut opts, actually_prefetched) = if let Some(cached) = cached_opt {
+        (cached, true)
+    } else {
+        let resolved = services::queue::resolve_item_prefetch(
+            &item,
+            state.anime4k_mode,
+            cfg.subtitle_style.clone(),
+            now,
+        )
+        .await;
+        let opts = resolved.map(|r| r.options).unwrap_or_else(|| api::player::PlayOptions {
+            title: item.query.clone(),
+            episode: item.episode,
+            quality: item.quality.clone(),
+            dub: item.dub,
+            player: item.player.clone(),
+            sub_lang: Some(item.sub_lang.clone()),
+            sub_url: None,
+            stream_url: None,
+            ipc_socket: None,
+            start_pos: None,
+            glsl_shaders: None,
+            sub_style: Some(cfg.subtitle_style.clone()),
+            loading_image: None,
+        });
+        (opts, false)
+    };
+
+    opts.ipc_socket = None;
+    opts.loading_image = None;
+    opts.sub_style = Some(cfg.subtitle_style.clone());
+    if state.anime4k_mode != config::Anime4KMode::Off {
+        opts.glsl_shaders =
+            services::shaders::build_shader_arg_for_year(state.anime4k_mode, item.season_year);
+    }
+
+    state.queue.active_item = Some(services::queue::ActiveNowItem {
+        item: item.clone(),
+        used_prefetched: actually_prefetched,
+        retried_once,
+    });
+    state.queue.manual_stop = false;
+
+    let display_title = item.title.clone();
+    let ep = item.episode;
+    start_playback(state, opts, display_title, ep, tx, pool, cfg).await;
+}
+
+async fn handle_batch_queue_modal(
+    key:   event::KeyEvent,
+    state: &mut AppState,
+    cfg:   &config::Config,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let Some(anime) = state.selected_anime.clone() else {
+        state.is_batch_queue_modal_open = false;
+        return;
+    };
+    let ep = state.selected_episode.unwrap_or(1);
+    let max_aired = anime.aired_episodes().max(1);
+
+    if state.batch_queue_mode == 4 {
+        match key.code {
+            KeyCode::Esc => {
+                state.is_batch_queue_modal_open = false;
+                return;
+            }
+            KeyCode::Tab => {
+                if anime.has_dub() {
+                    state.batch_queue_dub = !state.batch_queue_dub;
+                }
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.batch_queue_mode = 3;
+                return;
+            }
+            KeyCode::Backspace => {
+                state.batch_queue_range.pop();
+                return;
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
+                if state.batch_queue_range.len() < 12 {
+                    state.batch_queue_range.push(c);
+                }
+                return;
+            }
+            KeyCode::Enter => {}
+            _ => return,
+        }
+    }
+
+    let exec_mode: Option<usize> = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.is_batch_queue_modal_open = false;
+            return;
+        }
+        KeyCode::Tab => {
+            if anime.has_dub() {
+                state.batch_queue_dub = !state.batch_queue_dub;
+            }
+            return;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.batch_queue_mode = (state.batch_queue_mode + 1).min(4);
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.batch_queue_mode = state.batch_queue_mode.saturating_sub(1);
+            return;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            state.batch_queue_mode = 4;
+            return;
+        }
+        KeyCode::Char('1') => Some(0),
+        KeyCode::Char('2') => Some(1),
+        KeyCode::Char('3') => Some(2),
+        KeyCode::Char('4') => Some(3),
+        KeyCode::Enter => Some(state.batch_queue_mode),
+        _ => None,
+    };
+
+    let Some(mode) = exec_mode else {
+        return;
+    };
+    state.is_batch_queue_modal_open = false;
+
+    let dub = anime.has_dub() && state.batch_queue_dub;
+    match mode {
+        0 => {
+            let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
+            state.queue.enqueue_next(item);
+            state.queue_cursor = 0;
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!("◆ Queued NEXT: {} · Ep {}", anime.display_title(), ep),
+                unix_now(),
+            );
+        }
+        1 => {
+            let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
+            let outcome = state.queue.enqueue_back(item);
+            state.queue_cursor = state.queue.len().saturating_sub(1);
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!(
+                    "◆ Queued: {} · Ep {} (#{})",
+                    anime.display_title(),
+                    ep,
+                    outcome.position
+                ),
+                unix_now(),
+            );
+        }
+        2 => {
+            let end = (ep + 2).min(max_aired);
+            let eps: Vec<u32> = (ep..=end).collect();
+            let count = eps.len();
+            for e in eps {
+                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
+                state.queue.enqueue_back(item);
+            }
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!("◆ Queued {} eps ({}..{}) of {}", count, ep, end, anime.display_title()),
+                unix_now(),
+            );
+        }
+        3 => {
+            let start = ep.min(max_aired);
+            let eps: Vec<u32> = (start..=max_aired).collect();
+            let count = eps.len();
+            for e in eps {
+                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
+                state.queue.enqueue_back(item);
+            }
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!(
+                    "◆ Queued remaining {} eps ({}..{}) of {}",
+                    count,
+                    start,
+                    max_aired,
+                    anime.display_title()
+                ),
+                unix_now(),
+            );
+        }
+        4 => {
+            let eps = services::queue::parse_batch_queue_input(&state.batch_queue_range, max_aired);
+            if eps.is_empty() {
+                state.show_toast(
+                    format!("No valid episodes in range \"{}\"", state.batch_queue_range),
+                    unix_now(),
+                );
+                return;
+            }
+            let count = eps.len();
+            for e in eps {
+                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
+                state.queue.enqueue_back(item);
+            }
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!(
+                    "◆ Queued {} episode(s) [{}] of {}",
+                    count,
+                    state.batch_queue_range,
+                    anime.display_title()
+                ),
+                unix_now(),
+            );
+        }
+        _ => {}
+    }
+}
+
+async fn handle_queue_modal(
+    key:   event::KeyEvent,
+    state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    cfg:   &config::Config,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if state.queue_save_mode {
+        match key.code {
+            KeyCode::Esc => {
+                state.queue_save_mode = false;
+                state.queue_save_input.clear();
+            }
+            KeyCode::Backspace => {
+                state.queue_save_input.pop();
+            }
+            KeyCode::Char(c) => {
+                if !c.is_control() && state.queue_save_input.chars().count() < 36 {
+                    state.queue_save_input.push(c);
+                }
+            }
+            KeyCode::Enter => {
+                let drafts: Vec<db::playlists::PlaylistItemDraft> = state
+                    .queue
+                    .items
+                    .iter()
+                    .map(services::queue::QueueItem::to_draft)
+                    .collect();
+                if drafts.is_empty() {
+                    state.queue_save_mode = false;
+                    state.show_toast("Queue is empty — nothing to save", unix_now());
+                    return;
+                }
+                let name = state.queue_save_input.trim().to_string();
+                let final_name = if name.is_empty() {
+                    format!("Watch Mix ({} items)", drafts.len())
+                } else {
+                    name
+                };
+                let now = unix_now();
+                match db::playlists::save_playlist(
+                    pool,
+                    &state.active_profile_id,
+                    &final_name,
+                    state.queue.loop_mode,
+                    &drafts,
+                    now,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        state.queue_save_mode = false;
+                        state.queue_save_input.clear();
+                        state.saved_playlists = db::playlists::list_playlists_for_profile(
+                            pool,
+                            &state.active_profile_id,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        state.playlist_cursor = 0;
+                        refresh_playlist_preview(state, pool).await;
+                        state.show_toast(format!("❖ Saved playlist: \"{}\"", final_name), now);
+                    }
+                    Err(e) => {
+                        state.show_toast(format!("Playlist save failed: {e}"), now);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            state.go_back();
+        }
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+            state.queue_focus_pane = 1 - (state.queue_focus_pane % 2);
+            if state.queue_focus_pane == 1 {
+                refresh_playlist_preview(state, pool).await;
+            }
+        }
+        KeyCode::Char(' ') => {
+            state.queue.auto_advance = !state.queue.auto_advance;
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!(
+                    "◆ Queue Auto-Advance: {}",
+                    if state.queue.auto_advance { "ON" } else { "OFF" }
+                ),
+                unix_now(),
+            );
+        }
+        KeyCode::Char('L') => {
+            state.queue.loop_mode = !state.queue.loop_mode;
+            persist_and_warm_queue(state, cfg, tx);
+            state.show_toast(
+                format!("◆ Queue Loop: {}", if state.queue.loop_mode { "ON" } else { "OFF" }),
+                unix_now(),
+            );
+        }
+        KeyCode::Char('R') => {
+            if state.queue.len() > 1 {
+                state.queue.shuffle();
+                state.queue_cursor = 0;
+                persist_and_warm_queue(state, cfg, tx);
+                state.show_toast("◆ Shuffled session queue", unix_now());
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if !state.queue.is_empty() {
+                state.queue.clear();
+                state.queue_cursor = 0;
+                persist_and_warm_queue(state, cfg, tx);
+                state.show_toast("Cleared session queue", unix_now());
+            }
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if state.queue.is_empty() {
+                state.show_toast("Add episodes to the queue before saving a playlist", unix_now());
+            } else {
+                state.queue_save_mode = true;
+                state.queue_save_input.clear();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.queue_focus_pane == 0 {
+                if state.queue_cursor + 1 < state.queue.len() {
+                    state.queue_cursor += 1;
+                }
+            } else if state.playlist_cursor + 1 < state.saved_playlists.len() {
+                state.playlist_cursor += 1;
+                refresh_playlist_preview(state, pool).await;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if state.queue_focus_pane == 0 {
+                state.queue_cursor = state.queue_cursor.saturating_sub(1);
+            } else if state.playlist_cursor > 0 {
+                state.playlist_cursor -= 1;
+                refresh_playlist_preview(state, pool).await;
+            }
+        }
+        KeyCode::Char('J') => {
+            if state.queue_focus_pane == 0 && !state.queue.is_empty() {
+                state.queue_cursor = state.queue.move_down(state.queue_cursor);
+                persist_and_warm_queue(state, cfg, tx);
+            }
+        }
+        KeyCode::Char('K') => {
+            if state.queue_focus_pane == 0 && !state.queue.is_empty() {
+                state.queue_cursor = state.queue.move_up(state.queue_cursor);
+                persist_and_warm_queue(state, cfg, tx);
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+            if state.queue_focus_pane == 0 {
+                if let Some(removed) = state.queue.remove_at(state.queue_cursor) {
+                    if state.queue_cursor >= state.queue.len() {
+                        state.queue_cursor = state.queue.len().saturating_sub(1);
+                    }
+                    persist_and_warm_queue(state, cfg, tx);
+                    state.show_toast(
+                        format!("Removed {} · Ep {}", removed.title, removed.episode),
+                        unix_now(),
+                    );
+                }
+            } else if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
+                if db::playlists::delete_playlist(pool, &state.active_profile_id, pl.id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    state.saved_playlists = db::playlists::list_playlists_for_profile(
+                        pool,
+                        &state.active_profile_id,
+                    )
+                    .await
+                    .unwrap_or_default();
+                    if state.playlist_cursor >= state.saved_playlists.len() {
+                        state.playlist_cursor = state.saved_playlists.len().saturating_sub(1);
+                    }
+                    refresh_playlist_preview(state, pool).await;
+                    state.show_toast(format!("Deleted playlist \"{}\"", pl.name), unix_now());
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            if state.queue_focus_pane == 1 {
+                if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
+                    if db::playlists::delete_playlist(pool, &state.active_profile_id, pl.id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        state.saved_playlists = db::playlists::list_playlists_for_profile(
+                            pool,
+                            &state.active_profile_id,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        if state.playlist_cursor >= state.saved_playlists.len() {
+                            state.playlist_cursor = state.saved_playlists.len().saturating_sub(1);
+                        }
+                        refresh_playlist_preview(state, pool).await;
+                        state.show_toast(format!("Deleted playlist \"{}\"", pl.name), unix_now());
+                    }
+                }
+            }
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if state.queue_focus_pane == 1 {
+                if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
+                    let items = db::playlists::get_playlist_items(pool, pl.id)
+                        .await
+                        .unwrap_or_default();
+                    let count = items.len();
+                    for saved in &items {
+                        state
+                            .queue
+                            .enqueue_back(services::queue::QueueItem::from_saved(saved));
+                    }
+                    persist_and_warm_queue(state, cfg, tx);
+                    state.show_toast(
+                        format!("◆ Appended {} items from \"{}\"", count, pl.name),
+                        unix_now(),
+                    );
+                }
+            }
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            if state.queue_focus_pane == 1 {
+                if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
+                    let items = db::playlists::get_playlist_items(pool, pl.id)
+                        .await
+                        .unwrap_or_default();
+                    let drafts: Vec<db::playlists::PlaylistItemDraft> = items
+                        .iter()
+                        .map(|s| services::queue::QueueItem::from_saved(s).to_draft())
+                        .collect();
+                    match services::queue::export_playlist_json(
+                        &state.active_profile_id,
+                        &pl.name,
+                        pl.loop_default,
+                        &drafts,
+                    ) {
+                        Ok(path) => {
+                            state.show_toast(
+                                format!("❖ Exported playlist -> {}", path.display()),
+                                unix_now(),
+                            );
+                        }
+                        Err(e) => {
+                            state.show_toast(format!("Export error: {e}"), unix_now());
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            let packs = services::queue::scan_portable_playlists(&state.active_profile_id);
+            if packs.is_empty() {
+                let dir_hint = services::queue::playlists_export_dir(&state.active_profile_id)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "profiles/<id>/playlists/".to_string());
+                state.show_toast(format!("No JSON playlists found in {}", dir_hint), unix_now());
+            } else {
+                let existing_names: std::collections::HashSet<String> = state
+                    .saved_playlists
+                    .iter()
+                    .map(|p| p.name.to_lowercase())
+                    .collect();
+                let mut imported_count = 0usize;
+                let now = unix_now();
+                for pack in packs {
+                    if existing_names.contains(&pack.name.to_lowercase()) {
+                        continue;
+                    }
+                    if db::playlists::save_playlist(
+                        pool,
+                        &state.active_profile_id,
+                        &pack.name,
+                        pack.loop_default,
+                        &pack.items,
+                        now,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        imported_count += 1;
+                    }
+                }
+                state.saved_playlists =
+                    db::playlists::list_playlists_for_profile(pool, &state.active_profile_id)
+                        .await
+                        .unwrap_or_default();
+                refresh_playlist_preview(state, pool).await;
+                state.show_toast(
+                    format!("❖ Imported {} playlist(s) from profile folder", imported_count),
+                    now,
+                );
+            }
+        }
+        KeyCode::Enter => {
+            if state.queue_focus_pane == 0 {
+                if let Some(item) = state.queue.remove_at(state.queue_cursor) {
+                    if state.queue_cursor >= state.queue.len() {
+                        state.queue_cursor = state.queue.len().saturating_sub(1);
+                    }
+                    state.queue.manual_stop = false;
+                    state.show_toast(
+                        format!("▶ Playing {} · Ep {}", item.title, item.episode),
+                        unix_now(),
+                    );
+                    play_queue_item(state, item, false, false, pool, cfg, tx).await;
+                }
+            } else if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
+                let items = db::playlists::get_playlist_items(pool, pl.id)
+                    .await
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    state.show_toast("Playlist is empty", unix_now());
+                    return;
+                }
+                state.queue.clear();
+                state.queue.loop_mode = pl.loop_default;
+                state.queue.auto_advance = true;
+                for saved in &items {
+                    state
+                        .queue
+                        .enqueue_back(services::queue::QueueItem::from_saved(saved));
+                }
+                state.queue_cursor = 0;
+                if let Some(first) = state.queue.pop_next_for_advance() {
+                    state.show_toast(
+                        format!("▶ Loaded \"{}\" — {} · Ep {}", pl.name, first.title, first.episode),
+                        unix_now(),
+                    );
+                    play_queue_item(state, first, false, false, pool, cfg, tx).await;
                 }
             }
         }
@@ -6486,6 +7409,7 @@ async fn start_playback(
     // Instantly shut down any previous player (incl. detached IINA) and drop its stale IPC stream
     services::remote::quit_active_player().await;
     state.stop_player();
+    state.queue.manual_stop = false;
     state.playback_gen = state.playback_gen.wrapping_add(1);
     let my_gen = state.playback_gen;
     state.playback_logs.clear();
@@ -6510,6 +7434,34 @@ async fn start_playback(
     state.last_play_options = Some(opts.clone());
     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
     let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
+    let mal_for_queue = state
+        .anime_mal_ids
+        .get(&anime_id)
+        .copied()
+        .or_else(|| state.selected_anime.as_ref().and_then(|a| a.mal_id));
+    if state
+        .queue
+        .active_item
+        .as_ref()
+        .is_none_or(|a| a.item.anime_id != anime_id || a.item.episode != episode)
+    {
+        state.queue.active_item = Some(services::queue::ActiveNowItem {
+            item: services::queue::QueueItem::new(
+                anime_id,
+                mal_for_queue,
+                season_year,
+                title.clone(),
+                opts.title.clone(),
+                episode,
+                opts.quality.clone(),
+                opts.dub,
+                opts.sub_lang.clone().unwrap_or_else(|| cfg.default_sub_lang.clone()),
+                opts.player.clone(),
+            ),
+            used_prefetched: false,
+            retried_once: false,
+        });
+    }
     let era = services::shaders::AnimeEra::from_year(season_year);
 
     // Ensure shaders are Era-Adaptive if Anime4K is enabled
@@ -6610,6 +7562,9 @@ async fn start_playback(
     let r_era_badge = era.short_badge().to_string();
     let r_profile_name = state.active_profile_name.clone();
     let r_profile_icon = state.active_profile_icon.clone();
+    let r_queue_snapshot = build_remote_queue_snapshot(&state.queue, unix_now() as u64);
+    let r_queue_auto = state.queue.auto_advance;
+    let r_queue_loop = state.queue.loop_mode;
 
     tokio::spawn(async move {
         {
@@ -6633,6 +7588,9 @@ async fn start_playback(
             st.audio_tracks = r_audio_tracks;
             st.active_profile = r_profile_name;
             st.profile_icon = r_profile_icon;
+            st.queue = r_queue_snapshot;
+            st.queue_auto_advance = r_queue_auto;
+            st.queue_loop = r_queue_loop;
         }
         services::remote::broadcast_state(&remote_state_init).await;
     });
@@ -6737,7 +7695,14 @@ async fn start_playback(
         });
     }
 
-    // 7. Spawn mpv IPC monitor for live tracking, auto-scrobble, and auto-skip
+    // 7. Spawn mpv IPC monitor for live tracking, auto-scrobble, auto-skip, and EOF classification
+    let has_mpv_ipc = opts.stream_url.is_some()
+        && api::player::resolve_player(&opts.player)
+            .to_lowercase()
+            .contains("mpv");
+    let playback_exit_kind = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+        services::ipc::PLAYBACK_EXIT_UNKNOWN,
+    ));
     let ipc_cfg = services::ipc::IpcMonitorConfig {
         anime_id,
         mal_id: mal_id_opt,
@@ -6750,14 +7715,19 @@ async fn start_playback(
         skip_intervals: Vec::new(),
         auto_skip_intro: cfg.auto_skip_intro,
         has_loading_screen,
+        playback_exit_kind: Some(playback_exit_kind.clone()),
     };
     services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
+
+    // Trigger background N+1 prefetch if any episodes wait in the Watch Queue
+    persist_and_warm_queue(state, cfg, tx);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     state.player_stop = Some(stop_tx);
+    let launch_started = tokio::time::Instant::now();
 
     if let Some(out) = stdout {
         let tx2 = tx.clone();
@@ -6783,19 +7753,50 @@ async fn start_playback(
     tokio::spawn(async move {
         tokio::select! {
             status = child.wait() => {
+                if has_mpv_ipc
+                    && playback_exit_kind.load(std::sync::atomic::Ordering::Relaxed)
+                        == services::ipc::PLAYBACK_EXIT_UNKNOWN
+                {
+                    // Allow IPC reader task a brief flush so final `end-file` reason settles
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                let kind = playback_exit_kind.load(std::sync::atomic::Ordering::Relaxed);
+                let elapsed_secs = launch_started.elapsed().as_secs();
+                let exited_ok = matches!(&status, Ok(st) if st.success());
                 let msg = match status {
                     Ok(st) if !st.success() => format!("Player exited with error: {}", st),
                     Ok(st) => format!("Player exited: {}", st),
                     Err(e) => format!("Player wait error: {}", e),
                 };
                 let _ = tx4.send(AppMessage::PlaybackLog(msg)).await;
-                let _ = tx4.send(AppMessage::PlaybackDone(my_gen)).await;
+                let _ = tx4
+                    .send(AppMessage::PlaybackDone {
+                        gen: my_gen,
+                        exited_ok,
+                        natural_eof: kind == services::ipc::PLAYBACK_EXIT_NATURAL_EOF,
+                        user_quit: kind == services::ipc::PLAYBACK_EXIT_USER_QUIT,
+                        elapsed_secs,
+                    })
+                    .await;
             }
             _ = stop_rx       => {
+                playback_exit_kind.store(
+                    services::ipc::PLAYBACK_EXIT_USER_QUIT,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let elapsed_secs = launch_started.elapsed().as_secs();
                 let kill_res = child.kill().await;
                 let msg = format!("manual stop — kill result: {:?}", kill_res);
                 let _ = tx4.send(AppMessage::PlaybackLog(msg)).await;
-                let _ = tx4.send(AppMessage::PlaybackDone(my_gen)).await;
+                let _ = tx4
+                    .send(AppMessage::PlaybackDone {
+                        gen: my_gen,
+                        exited_ok: false,
+                        natural_eof: false,
+                        user_quit: true,
+                        elapsed_secs,
+                    })
+                    .await;
             }
         }
     });

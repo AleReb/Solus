@@ -10,7 +10,7 @@ use std::{
 use tokio::process::{Child, Command};
 
 /// Options passed to ani-cli when launching playback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlayOptions {
     /// Title to pass to ani-cli as the search query
     pub title:   String,

@@ -78,6 +78,21 @@ pub struct RemoteEpisodeItem {
     pub is_current: bool,
 }
 
+/// Queued item exposed to the mobile companion Queue drawer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteQueueItem {
+    pub index:   usize,
+    pub title:   String,
+    pub episode: u32,
+    pub status:  String,
+    pub quality: String,
+    pub dub:     bool,
+}
+
+fn default_remote_true() -> bool {
+    true
+}
+
 /// Shared live playback state visible to the mobile companion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotePlaybackState {
@@ -112,6 +127,12 @@ pub struct RemotePlaybackState {
     pub active_profile: String,
     #[serde(default)]
     pub profile_icon: String,
+    #[serde(default)]
+    pub queue: Vec<RemoteQueueItem>,
+    #[serde(default = "default_remote_true")]
+    pub queue_auto_advance: bool,
+    #[serde(default)]
+    pub queue_loop: bool,
 }
 
 impl Default for RemotePlaybackState {
@@ -180,12 +201,15 @@ impl Default for RemotePlaybackState {
             era_badge: "MODERN HD".to_string(),
             active_profile: "Default".to_string(),
             profile_icon: "◈".to_string(),
+            queue: Vec::new(),
+            queue_auto_advance: true,
+            queue_loop: false,
         }
     }
 }
 
 /// Action payload sent from the mobile touch companion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteActionRequest {
     pub action: String,
     pub delta: Option<f64>,
@@ -199,6 +223,8 @@ pub struct RemoteActionRequest {
     pub speed: Option<f64>,
     pub preset: Option<String>,
     pub mode: Option<String>,
+    #[serde(default)]
+    pub queue_index: Option<usize>,
 }
 
 /// Resolves the host machine's primary local LAN IP address.
@@ -1002,6 +1028,27 @@ async fn handle_remote_action(
             let cmd = serde_json::json!({ "command": ["cycle", "fullscreen"] });
             let _ = send_mpv_json_command(sock_path, cmd).await;
         }
+        "queue_skip" => {
+            if let Some(tx) = tx_app {
+                let _ = tx.send(crate::AppMessage::RemoteQueueSkip).await;
+            }
+        }
+        "queue_play" => {
+            if let Some(idx) = req.queue_index {
+                if let Some(tx) = tx_app {
+                    let _ = tx.send(crate::AppMessage::RemoteQueuePlayIndex(idx)).await;
+                }
+            }
+        }
+        "queue_toggle_auto" => {
+            {
+                let mut st = state.write().await;
+                st.queue_auto_advance = !st.queue_auto_advance;
+            }
+            if let Some(tx) = tx_app {
+                let _ = tx.send(crate::AppMessage::RemoteQueueToggleAuto).await;
+            }
+        }
         _ => {}
     }
 }
@@ -1440,6 +1487,9 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     <button class="nav-btn" onclick="openDrawer('audio')">
       <span class="nav-icon">✦</span>Audio & Speed
     </button>
+    <button class="nav-btn" onclick="openDrawer('queue')">
+      <span class="nav-icon">◆</span>Queue <span id="queue-count-badge"></span>
+    </button>
   </div>
 
   <!-- Backdrop for Drawers -->
@@ -1520,6 +1570,25 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 4. Watch Queue Drawer -->
+  <div class="drawer" id="drawer-queue">
+    <div class="drawer-handle"></div>
+    <div class="drawer-header">
+      <div class="drawer-title">◆ Watch Session Queue</div>
+      <button class="drawer-close" onclick="closeAllDrawers()">✕</button>
+    </div>
+    <div class="drawer-content">
+      <div class="btn-group" style="margin-bottom:12px;">
+        <button class="btn-pill active" id="queue-auto-btn" onclick="sendAction('queue_toggle_auto', {})">Auto-Next: ON</button>
+        <button class="btn-pill" onclick="skipQueueNext()">Skip Next >></button>
+      </div>
+      <div class="section-label">UP NEXT IN SESSION</div>
+      <div class="item-list" id="queue-list">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+  </div>
+
   <script>
     let ws = null;
     let isDragging = false;
@@ -1531,6 +1600,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     let lastSubtitlesKey = '';
     let lastAudioTracksKey = '';
     let lastEpisodesKey = '';
+    let lastQueueKey = '';
     let lastSeekSent = 0;
     let lastVolSent = 0;
     let wsGeneration = 0;
@@ -1718,6 +1788,50 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       updateSpeedPills(data.speed || 1.0);
       updatePresetPills(data.sub_preset || 'Studio Minimal');
       updateA4kPills(data.anime4k || 'off');
+
+      // Watch Session Queue
+      const qItems = data.queue || [];
+      const qCountBadge = document.getElementById('queue-count-badge');
+      if (qCountBadge) qCountBadge.innerText = qItems.length > 0 ? `(${qItems.length})` : '';
+      const qAutoBtn = document.getElementById('queue-auto-btn');
+      if (qAutoBtn) {
+        const autoOn = data.queue_auto_advance !== false;
+        qAutoBtn.innerText = `Auto-Next: ${autoOn ? 'ON' : 'OFF'}`;
+        qAutoBtn.classList.toggle('active', autoOn);
+      }
+      const qKey = JSON.stringify([data.queue_auto_advance, qItems]);
+      if (qKey !== lastQueueKey) {
+        lastQueueKey = qKey;
+        renderQueueList(qItems);
+      }
+    }
+
+    function renderQueueList(items) {
+      const container = document.getElementById('queue-list');
+      if (!container) return;
+      if (!items || items.length === 0) {
+        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">Queue is empty. Add shows with [e] or [Q] in Solus.</div>';
+        return;
+      }
+      container.innerHTML = items.map(q => `
+        <div class="list-item" onclick="playQueueIndex(${q.index})">
+          <div class="item-left">
+            <span class="check-mark">${q.index + 1}.</span>
+            <span>${q.title} · Ep ${q.episode}</span>
+          </div>
+          <span class="lang-code">${q.status}</span>
+        </div>
+      `).join('');
+    }
+
+    function playQueueIndex(idx) {
+      sendAction('queue_play', { queue_index: idx });
+      closeAllDrawers();
+    }
+
+    function skipQueueNext() {
+      sendAction('queue_skip', {});
+      closeAllDrawers();
     }
 
     function renderSubtitlesList(subs) {
@@ -1999,6 +2113,7 @@ mod tests {
             speed: None,
             preset: None,
             mode: Some("balanced".to_string()),
+            queue_index: None,
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2022,6 +2137,7 @@ mod tests {
             speed: None,
             preset: None,
             mode: None,
+            queue_index: None,
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2048,6 +2164,7 @@ mod tests {
             speed: None,
             preset: Some("Netflix Clean".to_string()),
             mode: None,
+            queue_index: None,
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2103,6 +2220,7 @@ mod tests {
             speed: None,
             preset: None,
             mode: None,
+            queue_index: None,
         };
 
         // Select English (aid 4), click English repeatedly, then switch back to Japanese (aid 1) and Spanish (aid 2)
@@ -2151,5 +2269,33 @@ mod tests {
 
         crate::services::ipc::set_active_ipc_sender(None);
         crate::services::ipc::set_active_socket_path(None);
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_action_queue_toggle_and_serialization() {
+        let _guard = crate::services::ipc::test_ipc_lock().lock().await;
+        let mut init = RemotePlaybackState::default();
+        init.queue.push(RemoteQueueItem {
+            index: 0,
+            title: "Frieren".to_string(),
+            episode: 13,
+            status: "READY".to_string(),
+            quality: "1080p".to_string(),
+            dub: false,
+        });
+        assert!(init.queue_auto_advance);
+
+        let json = serde_json::to_string(&init).unwrap();
+        assert!(json.contains("Frieren"));
+        assert!(json.contains("READY"));
+
+        let state = Arc::new(RwLock::new(init));
+        let req = RemoteActionRequest {
+            action: "queue_toggle_auto".to_string(),
+            ..Default::default()
+        };
+        handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
+        let st = state.read().await;
+        assert!(!st.queue_auto_advance);
     }
 }

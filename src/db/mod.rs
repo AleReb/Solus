@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod playlists;
 pub mod sync;
 pub mod user;
 
@@ -396,6 +397,54 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // Schema v3: Profile-scoped Watch Session Saved Playlists
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS playlists (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id   TEXT    NOT NULL DEFAULT 'default',
+            name         TEXT    NOT NULL,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            loop_default INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS playlist_items (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            position    INTEGER NOT NULL,
+            anime_id    INTEGER NOT NULL,
+            mal_id      INTEGER,
+            title       TEXT    NOT NULL,
+            query       TEXT    NOT NULL,
+            episode     INTEGER NOT NULL,
+            season_year INTEGER,
+            quality     TEXT    NOT NULL,
+            dub         INTEGER NOT NULL DEFAULT 0,
+            sub_lang    TEXT    NOT NULL,
+            player      TEXT    NOT NULL
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_playlists_profile ON playlists(profile_id, updated_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_playlist_items_order ON playlist_items(playlist_id, position ASC);",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("PRAGMA user_version = 3;").execute(pool).await;
+
     Ok(())
 }
 
@@ -428,6 +477,8 @@ mod tests {
         assert!(tables.contains(&"sync_meta".to_string()));
         assert!(tables.contains(&"id_crosswalk".to_string()));
         assert!(tables.contains(&"tracker_entries".to_string()));
+        assert!(tables.contains(&"playlists".to_string()));
+        assert!(tables.contains(&"playlist_items".to_string()));
     }
 
     #[tokio::test]

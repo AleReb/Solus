@@ -40,6 +40,7 @@ pub const FOOTER_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeFooterAction {
     Search,
+    Queue,
     Calendar,
     Wizard,
     Analytics,
@@ -95,6 +96,7 @@ fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
             Screen::RemoteModal => (64, 76),
             Screen::CastModal => (68, 55),
             Screen::ProfileModal => crate::ui::profile::modal_pct(frame_area),
+            Screen::QueueModal => crate::ui::queue::modal_pct(frame_area),
             Screen::Help => crate::ui::help::modal_pct(frame_area),
             Screen::Setup => crate::ui::setup::modal_pct(frame_area),
             Screen::AniListLogin => crate::ui::login::modal_pct(frame_area),
@@ -352,11 +354,16 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
         ),
         (false, false) => "󰍂 Guest".to_string(),
     };
+    let queue_badge = if state.queue.is_empty() {
+        String::new()
+    } else {
+        format!("◆ Queue: {}  ·  ", state.queue.len())
+    };
     let profile_badge = format!(
         "{} {} [P]",
         state.active_profile_icon, state.active_profile_name
     );
-    let right_text = format!("{}  ·  {}  ·  ◈ {} ", profile_badge, user_badge, theme.name);
+    let right_text = format!("{}{}  ·  {}  ·  ◈ {} ", queue_badge, profile_badge, user_badge, theme.name);
     let right_width = right_text.chars().count() as u16 + 2;
 
     for (num, row, label) in top_bar_shelves(data) {
@@ -392,6 +399,15 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
         } else {
             theme.text_dim
         };
+        if !queue_badge.is_empty() {
+            spans.push(Span::styled(
+                format!("◆ Queue: {}", state.queue.len()),
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+        }
         spans.push(Span::styled(
             profile_badge,
             Style::default()
@@ -638,6 +654,20 @@ fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockR
             priority: 0,
             bg: None,
             action: Some(HomeFooterAction::Search),
+        },
+        DockChip {
+            icon: "◆",
+            key: "[Q]",
+            label: if state.queue.is_empty() {
+                "Queue".to_string()
+            } else {
+                format!("Queue ({})", state.queue.len())
+            },
+            key_color: theme.accent,
+            label_color: theme.text,
+            priority: 2,
+            bg: None,
+            action: Some(HomeFooterAction::Queue),
         },
         DockChip {
             icon: "󰃭",
@@ -2858,6 +2888,29 @@ mod tests {
         assert!(row0.contains("✦ Brother [P]  ·  "));
         assert!(!row0.contains("[P]Guest"));
         assert!(!row0.contains("SOLUSTrending"));
+
+        // Non-empty queue renders Queue pill with explicit divider spacing
+        state.queue.enqueue_back(crate::services::queue::QueueItem::new(
+            1,
+            None,
+            Some(2023),
+            "Frieren".to_string(),
+            "Frieren".to_string(),
+            5,
+            "1080p".to_string(),
+            false,
+            "English".to_string(),
+            "mpv".to_string(),
+        ));
+        terminal
+            .draw(|f| render_top_bar(f, area, &state, &data))
+            .unwrap();
+        let buf2 = terminal.backend().buffer();
+        let mut row0_q = String::new();
+        for x in 0..140 {
+            row0_q.push_str(buf2[(x, 0)].symbol());
+        }
+        assert!(row0_q.contains("◆ Queue: 1  ·  ✦ Brother [P]"));
     }
 
     #[test]

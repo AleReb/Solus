@@ -335,6 +335,17 @@ pub async fn delete_profile(pool: &SqlitePool, profile_id: &str) -> Result<bool>
         sqlx::query(&q).bind(profile_id).execute(&mut *tx).await?;
     }
 
+    sqlx::query(
+        "DELETE FROM playlist_items WHERE playlist_id IN (SELECT id FROM playlists WHERE profile_id = ?)",
+    )
+    .bind(profile_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM playlists WHERE profile_id = ?")
+        .bind(profile_id)
+        .execute(&mut *tx)
+        .await?;
+
     let deleted = sqlx::query("DELETE FROM profiles WHERE id = ?")
         .bind(profile_id)
         .execute(&mut *tx)
