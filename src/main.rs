@@ -3449,6 +3449,7 @@ async fn handle_playback_options(
                     start_pos:  None,
                     glsl_shaders,
                     sub_style:  Some(cfg.subtitle_style.clone()),
+                    loading_image: None,
                 };
                 start_playback(state, opts, title, ep, tx, pool, cfg).await;
             }
@@ -6467,6 +6468,7 @@ async fn launch_remote_stream_switch(
         start_pos: resume_pos,
         glsl_shaders,
         sub_style: Some(cfg.subtitle_style.clone()),
+        loading_image: None,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
 }
@@ -6698,8 +6700,21 @@ async fn start_playback(
         }
     }
 
-    // 5. Spawn player immediately; AniSkip intervals are resolved concurrently by the IPC monitor
+    // 5. Generate rotating Y2K loading screen for mpv and spawn player immediately;
+    // AniSkip intervals are resolved concurrently by the IPC monitor.
     let mal_id_opt = state.anime_mal_ids.get(&anime_id).copied();
+
+    if opts.stream_url.is_some()
+        && api::player::resolve_player(&opts.player)
+            .to_lowercase()
+            .contains("mpv")
+    {
+        let variant = services::loading_art::next_loading_variant_index();
+        opts.loading_image =
+            services::loading_art::generate_y2k_loading_screen(&title, episode, variant)
+                .map(|p| p.to_string_lossy().into_owned());
+    }
+    let has_loading_screen = opts.loading_image.is_some();
 
     let mut child = match api::player::spawn_async(&opts) {
         Ok(c) => c,
@@ -6734,6 +6749,7 @@ async fn start_playback(
         trackers: cfg.trackers.clone(),
         skip_intervals: Vec::new(),
         auto_skip_intro: cfg.auto_skip_intro,
+        has_loading_screen,
     };
     services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
 

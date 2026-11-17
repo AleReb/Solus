@@ -114,6 +114,33 @@ pub struct IpcMonitorConfig {
     pub trackers:        crate::config::TrackersConfig,
     pub skip_intervals:  Vec<SkipResult>,
     pub auto_skip_intro: bool,
+    pub has_loading_screen: bool,
+}
+
+/// Parse `playlist-pos` property changes from mpv JSON-RPC.
+pub fn parse_playlist_pos_change(line: &str) -> Option<i64> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? == "property-change"
+        && parsed.get("name")?.as_str()? == "playlist-pos"
+    {
+        return parsed.get("data")?.as_i64();
+    }
+    None
+}
+
+/// Format a live Y2K-styled buffering progress bar for mpv OSD while the stream connects.
+pub fn format_y2k_loader_osd(elapsed_ms: u64) -> String {
+    let pct = ((elapsed_ms as f64 / 1350.0).clamp(0.0, 1.0) * 100.0).round() as usize;
+    let filled = (pct * 10 / 100).min(10);
+    let empty = 10usize.saturating_sub(filled);
+    let secs = elapsed_ms as f64 / 1000.0;
+    format!(
+        "◈ SOLUS // Y2K STREAM LOADER  [{}{}]  {}%  ({:.1}s)",
+        "■".repeat(filled),
+        "□".repeat(empty),
+        pct,
+        secs
+    )
 }
 
 /// Helper to parse property change data from mpv JSON-RPC.
@@ -355,6 +382,7 @@ where
         trackers,
         skip_intervals,
         auto_skip_intro,
+        has_loading_screen,
     } = config;
 
     let (reader_half, mut writer_half) = tokio::io::split(stream);
@@ -362,11 +390,12 @@ where
     set_active_socket_path(Some(sock_path.clone()));
     set_active_ipc_sender(Some(cmd_tx.clone()));
 
-    // Subscribe to time-pos, duration, and live track-list property changes
+    // Subscribe to time-pos, duration, track-list, and playlist-pos property changes
     let observe_cmds = [
         r#"{"command": ["observe_property", 1, "time-pos"]}"#,
         r#"{"command": ["observe_property", 2, "duration"]}"#,
         r#"{"command": ["observe_property", 3, "track-list"]}"#,
+        r#"{"command": ["observe_property", 4, "playlist-pos"]}"#,
     ];
     for cmd in observe_cmds {
         let _ = writer_half.write_all(format!("{}\n", cmd).as_bytes()).await;
@@ -381,6 +410,10 @@ where
     let mut scrobbled = false;
     let mut skipped_intervals: HashSet<String> = HashSet::new();
     let mut last_audio_tracks: Vec<crate::services::remote::RemoteAudioTrack> = Vec::new();
+    let mut in_loading_screen = has_loading_screen;
+    let mut switched_to_stream = false;
+    let loader_start = tokio::time::Instant::now();
+    let mut loader_tick = tokio::time::interval(Duration::from_millis(150));
 
     loop {
         tokio::select! {
@@ -402,10 +435,33 @@ where
                     None => break,
                 }
             }
+            _ = loader_tick.tick(), if in_loading_screen => {
+                let elapsed_ms = loader_start.elapsed().as_millis() as u64;
+                let osd_text = format_y2k_loader_osd(elapsed_ms);
+                let osd_cmd = serde_json::json!({ "command": ["show-text", osd_text, 300] });
+                let _ = writer_half.write_all(format!("{osd_cmd}\n").as_bytes()).await;
+                if elapsed_ms >= 1350 && !switched_to_stream {
+                    switched_to_stream = true;
+                    let _ = writer_half.write_all(b"{\"command\":[\"playlist-next\"]}\n").await;
+                }
+                let _ = writer_half.flush().await;
+            }
             line_res = reader.next_line() => {
                 let Ok(Some(line)) = line_res else {
                     break;
                 };
+
+                if let Some(pos) = parse_playlist_pos_change(&line) {
+                    if pos >= 1 && in_loading_screen {
+                        in_loading_screen = false;
+                        let _ = writer_half.write_all(b"{\"command\":[\"show-text\",\"\",1]}\n").await;
+                        let _ = writer_half.flush().await;
+                    }
+                }
+
+                if in_loading_screen {
+                    continue;
+                }
 
                 if let Some(tracks) = parse_audio_tracks_from_property_change(&line) {
                     if tracks != last_audio_tracks {
@@ -635,6 +691,7 @@ mod tests {
             trackers: crate::config::TrackersConfig::default(),
             skip_intervals: Vec::new(),
             auto_skip_intro: false,
+            has_loading_screen: false,
         };
 
         let task = tokio::spawn(async move {
@@ -644,13 +701,15 @@ mod tests {
         let (server_read, _server_write) = tokio::io::split(server_io);
         let mut lines = BufReader::new(server_read).lines();
 
-        // First three commands must be observe_property subscriptions
+        // First four commands must be observe_property subscriptions
         let l1 = lines.next_line().await.unwrap().unwrap();
         let l2 = lines.next_line().await.unwrap().unwrap();
         let l3 = lines.next_line().await.unwrap().unwrap();
+        let l4 = lines.next_line().await.unwrap().unwrap();
         assert!(l1.contains("observe_property"));
         assert!(l2.contains("observe_property"));
         assert!(l3.contains("observe_property"));
+        assert!(l4.contains("observe_property"));
         assert_eq!(
             get_active_socket_path().as_deref(),
             Some(r"\\.\pipe\solus-mpv-1-1")
@@ -658,8 +717,8 @@ mod tests {
 
         // Send a command through the active monitor channel
         assert!(try_send_via_active_monitor(r#"{"command":["cycle","pause"]}"#));
-        let l4 = lines.next_line().await.unwrap().unwrap();
-        assert_eq!(l4, r#"{"command":["cycle","pause"]}"#);
+        let l5 = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(l5, r#"{"command":["cycle","pause"]}"#);
 
         drop(lines);
         drop(_server_write);
@@ -701,5 +760,16 @@ mod tests {
         assert_eq!(tracks[3].mpv_aid, Some(2));
         assert_eq!(tracks[4].code, "fra");
         assert_eq!(tracks[4].mpv_aid, Some(4));
+    }
+
+    #[test]
+    fn test_parse_playlist_pos_change_and_loader_osd() {
+        let ev0 = r#"{"event":"property-change","id":4,"name":"playlist-pos","data":0}"#;
+        let ev1 = r#"{"event":"property-change","id":4,"name":"playlist-pos","data":1}"#;
+        assert_eq!(parse_playlist_pos_change(ev0), Some(0));
+        assert_eq!(parse_playlist_pos_change(ev1), Some(1));
+        let osd = format_y2k_loader_osd(675);
+        assert!(osd.contains("Y2K STREAM LOADER"));
+        assert!(osd.contains("50%"));
     }
 }

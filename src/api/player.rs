@@ -36,6 +36,8 @@ pub struct PlayOptions {
     pub glsl_shaders: Option<String>,
     /// Optional cinema-grade subtitle styling and collision configuration
     pub sub_style: Option<crate::services::substyler::SubtitleStyleConfig>,
+    /// Optional Y2K loading screen image shown in `mpv` while the stream prefetches
+    pub loading_image: Option<String>,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -573,6 +575,142 @@ fn derive_master_playlist_url(video_link: &str) -> Option<String> {
     Some(format!("{}/master.m3u8", parent_of_parent))
 }
 
+const YOUTUBE_INPUT_CONF: &str = r#"# Solus YouTube-Style Player Keybindings
+k cycle pause
+K cycle pause
+SPACE cycle pause
+j seek -10
+J seek -10
+l seek 10
+L seek 10
+LEFT seek -5
+RIGHT seek 5
+UP add volume 5
+DOWN add volume -5
+m cycle mute
+M cycle mute
+f cycle fullscreen
+F cycle fullscreen
+c cycle sub-visibility
+C cycle sub-visibility
+0 seek 0 absolute-percent
+1 seek 10 absolute-percent
+2 seek 20 absolute-percent
+3 seek 30 absolute-percent
+4 seek 40 absolute-percent
+5 seek 50 absolute-percent
+6 seek 60 absolute-percent
+7 seek 70 absolute-percent
+8 seek 80 absolute-percent
+9 seek 90 absolute-percent
+< multiply speed 0.8
+> multiply speed 1.25
+. frame-step
+, frame-back-step
+"#;
+
+/// Ensure Solus's YouTube-style `mpv` keybindings file exists on disk and return its path.
+pub fn ensure_youtube_input_conf() -> Option<PathBuf> {
+    let dir = crate::config::Config::cache_dir()
+        .unwrap_or_else(|_| env::temp_dir().join("solus-cache"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join("youtube-input.conf");
+    let needs_write = std::fs::read_to_string(&path)
+        .map(|cur| cur != YOUTUBE_INPUT_CONF)
+        .unwrap_or(true);
+    if needs_write && std::fs::write(&path, YOUTUBE_INPUT_CONF).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
+/// Build direct `mpv` arguments, wrapping the stream in `--{ ... --}` when a Y2K loading screen precedes it.
+pub fn build_mpv_direct_args(
+    opts: &PlayOptions,
+    direct_url: &str,
+    youtube_conf: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--ytdl=no".to_string(),
+        "--force-window=immediate".to_string(),
+        "--referrer=https://zokoanime.video/".to_string(),
+        "--input-terminal=no".to_string(),
+    ];
+
+    if let Some(conf_path) = youtube_conf {
+        args.push(format!("--input-conf={}", conf_path.display()));
+    }
+    if let Some(ref sock) = opts.ipc_socket {
+        args.push(format!("--input-ipc-server={}", sock));
+    }
+
+    let has_loading = opts
+        .loading_image
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+
+    if has_loading {
+        args.push("--image-display-duration=inf".to_string());
+        args.push("--prefetch-playlist=yes".to_string());
+        args.push("--loop-playlist=no".to_string());
+        if let Some(ref loading_img) = opts.loading_image {
+            args.push("--{".to_string());
+            args.push(loading_img.clone());
+            args.push("--}".to_string());
+        }
+        args.push("--{".to_string());
+    }
+
+    args.push(format!(
+        "--force-media-title={} Episode {}",
+        opts.title, opts.episode
+    ));
+
+    if let Some(ref url) = opts.sub_url {
+        if !url.is_empty() {
+            args.push(format!("--sub-file={}", url));
+            args.push("--sub-visibility=yes".to_string());
+            args.push("--sub-auto=fuzzy".to_string());
+        }
+    }
+    if let Some(master_url) = derive_master_playlist_url(direct_url) {
+        args.push(format!("--audio-file={}", master_url));
+    }
+    args.push("--audio-file-auto=all".to_string());
+    if opts.dub {
+        args.push("--alang=en,eng,English".to_string());
+    } else {
+        args.push("--alang=ja,jpn,Japanese".to_string());
+    }
+    if let Some(pos) = opts.start_pos {
+        args.push(format!("--start={}", pos));
+    }
+    if let Some(ref shaders) = opts.glsl_shaders {
+        args.push(format!("--glsl-shaders={}", shaders));
+        args.push("--scale=ewa_lanczossharp".to_string());
+        args.push("--cscale=ewa_lanczossharp".to_string());
+        args.push("--dscale=mitchell".to_string());
+        args.push("--correct-downscaling=yes".to_string());
+        args.push("--linear-downscaling=yes".to_string());
+        args.push("--sigmoid-upscaling=yes".to_string());
+        args.push("--deband=yes".to_string());
+        args.push("--deband-iterations=2".to_string());
+        args.push("--deband-threshold=35".to_string());
+        args.push("--deband-range=16".to_string());
+    }
+    if let Some(ref style) = opts.sub_style {
+        args.extend(style.to_mpv_flags());
+    }
+
+    args.push(direct_url.to_string());
+    if has_loading {
+        args.push("--}".to_string());
+    }
+    args
+}
+
 /// Spawn ani-cli asynchronously. stdout + stderr are piped for log streaming.
 /// The player is detached by default (ani-cli default behaviour).
 /// Returns a tokio Child — caller is responsible for reading I/O and waiting.
@@ -592,27 +730,18 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "solus-mpv".to_string());
 
+    let yt_conf = ensure_youtube_input_conf();
+
     // 1. Direct stream playback:
-    // If we resolved the exact verified stream URL (.m3u8), launch the player directly
-    // through solus-mpv. This eliminates ani-cli fuzzy text searches, guaranteeing 100%
+    // If we resolved the exact verified stream URL (.m3u8), launch the player directly.
+    // This eliminates ani-cli fuzzy text searches, guaranteeing 100%
     // frame-perfect subtitle synchronization, accurate resolution, and sub-100ms launch.
     if let Some(ref direct_url) = opts.stream_url {
         if !direct_url.is_empty() {
             let is_vlc = player.to_lowercase().contains("vlc");
             let is_iina = player.to_lowercase().contains("iina");
 
-            let mut cmd = if is_vlc || is_iina {
-                Command::new(&player)
-            } else {
-                #[cfg(windows)]
-                {
-                    Command::new(&player)
-                }
-                #[cfg(not(windows))]
-                {
-                    Command::new(&wrapper_path)
-                }
-            };
+            let mut cmd = Command::new(&player);
 
             if is_vlc {
                 // VLC-native arguments:
@@ -643,6 +772,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--no-stdin");
                 cmd.arg("--mpv-ytdl=no");
                 cmd.arg("--mpv-force-window=immediate");
+                if let Some(ref conf_path) = yt_conf {
+                    cmd.arg(format!("--mpv-input-conf={}", conf_path.display()));
+                }
                 cmd.arg("--mpv-referrer=https://zokoanime.video/");
                 cmd.arg("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
@@ -685,64 +817,19 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // Media URL is placed strictly trailing
                 cmd.arg(direct_url);
             } else {
-                // Standard MPV engine arguments
-                cmd.arg("--ytdl=no");
-                cmd.arg("--force-window=immediate");
-                cmd.arg("--referrer=https://zokoanime.video/");
-                cmd.arg("--input-terminal=no");
-                cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));
-
-                #[cfg(windows)]
-                {
-                    if let Some(ref url) = opts.sub_url {
-                        if !url.is_empty() {
-                            cmd.arg(format!("--sub-file={}", url));
-                            cmd.arg("--sub-visibility=yes");
-                            cmd.arg("--sub-auto=fuzzy");
-                        }
-                    }
-                    if let Some(master_url) = derive_master_playlist_url(direct_url) {
-                        cmd.arg(format!("--audio-file={}", master_url));
-                    }
-                    cmd.arg("--audio-file-auto=all");
-                    if opts.dub {
-                        cmd.arg("--alang=en,eng,English");
-                    } else {
-                        cmd.arg("--alang=ja,jpn,Japanese");
-                    }
-                }
-
+                // Standard MPV engine arguments (shared across Windows/macOS/Linux)
                 if let Some(ref sock) = opts.ipc_socket {
                     cmd.env("SOLUS_IPC_SOCKET", sock);
-                    cmd.arg(format!("--input-ipc-server={}", sock));
                 }
                 if let Some(pos) = opts.start_pos {
                     cmd.env("SOLUS_START_POS", pos.to_string());
-                    cmd.arg(format!("--start={}", pos));
                 }
-
                 if let Some(ref shaders) = opts.glsl_shaders {
                     cmd.env("SOLUS_SHADERS", shaders);
-                    cmd.arg(format!("--glsl-shaders={}", shaders));
-                    cmd.arg("--scale=ewa_lanczossharp");
-                    cmd.arg("--cscale=ewa_lanczossharp");
-                    cmd.arg("--dscale=mitchell");
-                    cmd.arg("--correct-downscaling=yes");
-                    cmd.arg("--linear-downscaling=yes");
-                    cmd.arg("--sigmoid-upscaling=yes");
-                    cmd.arg("--deband=yes");
-                    cmd.arg("--deband-iterations=2");
-                    cmd.arg("--deband-threshold=35");
-                    cmd.arg("--deband-range=16");
                 }
-
-                if let Some(ref style) = opts.sub_style {
-                    for flag in style.to_mpv_flags() {
-                        cmd.arg(&flag);
-                    }
+                for arg in build_mpv_direct_args(opts, direct_url, yt_conf.as_deref()) {
+                    cmd.arg(arg);
                 }
-
-                cmd.arg(direct_url);
             }
 
             let mut current_paths = match env::var_os("PATH") {
@@ -889,6 +976,13 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     } else {
         player_flags.push("--input-terminal=no".to_string());
     }
+    if let Some(ref conf_path) = yt_conf {
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-input-conf={}", conf_path.display()));
+        } else if !player.contains("vlc") {
+            player_flags.push(format!("--input-conf={}", conf_path.display()));
+        }
+    }
 
     if let Some(ref sock) = opts.ipc_socket {
         cmd.env("SOLUS_IPC_SOCKET", sock);
@@ -977,6 +1071,7 @@ mod tests {
             start_pos:  None,
             glsl_shaders: None,
             sub_style: None,
+            loading_image: None,
         }
     }
 
@@ -1038,6 +1133,7 @@ mod tests {
             start_pos:  None,
             glsl_shaders: None,
             sub_style: None,
+            loading_image: None,
         });
         assert_eq!(
             args,
@@ -1071,6 +1167,7 @@ mod tests {
             start_pos:  None,
             glsl_shaders: None,
             sub_style: None,
+            loading_image: None,
         });
         assert_eq!(
             args,
@@ -1129,5 +1226,40 @@ mod tests {
             derive_master_playlist_url("https://cdn.example.com/hls/master.m3u8"),
             None
         );
+    }
+
+    #[test]
+    fn test_ensure_youtube_input_conf_contains_youtube_bindings() {
+        let path = ensure_youtube_input_conf().expect("youtube-input.conf path");
+        assert!(path.is_file());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("k cycle pause"));
+        assert!(text.contains("j seek -10"));
+        assert!(text.contains("l seek 10"));
+        assert!(text.contains("m cycle mute"));
+        assert!(text.contains("f cycle fullscreen"));
+        assert!(text.contains("c cycle sub-visibility"));
+        assert!(text.contains("5 seek 50 absolute-percent"));
+    }
+
+    #[test]
+    fn test_build_mpv_direct_args_wraps_loading_screen_and_stream_per_file() {
+        let mut o = opts("Serial Experiments Lain", 1, "1080p", false);
+        o.loading_image = Some("/tmp/solus_y2k_0.jpg".to_string());
+        let yt_conf = PathBuf::from("/tmp/youtube-input.conf");
+        let args = build_mpv_direct_args(
+            &o,
+            "https://cdn.example.com/hls/v1/1080/index.m3u8",
+            Some(&yt_conf),
+        );
+        assert!(args.contains(&"--prefetch-playlist=yes".to_string()));
+        assert!(args.contains(&"--image-display-duration=inf".to_string()));
+        assert!(args.contains(&"--input-conf=/tmp/youtube-input.conf".to_string()));
+        assert!(args.contains(&"--audio-file=https://cdn.example.com/hls/v1/master.m3u8".to_string()));
+        let first_group = args.iter().position(|a| a == "--{").unwrap();
+        assert_eq!(args[first_group + 1], "/tmp/solus_y2k_0.jpg");
+        assert_eq!(args[first_group + 2], "--}");
+        assert_eq!(args[first_group + 3], "--{");
+        assert_eq!(args.last().unwrap(), "--}");
     }
 }

@@ -3,6 +3,7 @@ pub mod cast;
 pub mod downloader;
 pub mod importer;
 pub mod ipc;
+pub mod loading_art;
 pub mod oauth;
 pub mod remote;
 pub mod scrobble;
