@@ -136,7 +136,7 @@ pub struct Config {
     pub auto_skip_intro:  bool,
     #[serde(default = "default_anime4k")]
     pub anime4k_mode:     Anime4KMode,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub ambilight_enabled: bool,
     #[serde(default)]
     pub update:           UpdateConfig,
@@ -167,7 +167,7 @@ impl Default for Config {
             default_sub_lang: default_sub_lang_val(),
             auto_skip_intro:  default_auto_skip_intro(),
             anime4k_mode:     default_anime4k(),
-            ambilight_enabled: default_true(),
+            ambilight_enabled: false,
             update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
@@ -175,7 +175,7 @@ impl Default for Config {
             cast:             CastConfig::default(),
             trackers:         TrackersConfig::default(),
             active_profile:   default_active_profile(),
-            config_version:   1,
+            config_version:   2,
         }
     }
 }
@@ -372,18 +372,22 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Upgrade legacy v1.0.6 update settings once cleanly while preserving future user choices.
+    /// Upgrade legacy v1 defaults once cleanly while preserving explicit future user choices.
     pub fn migrate_legacy_defaults(&mut self) -> bool {
-        if self.config_version >= 1 {
+        if self.config_version >= 2 {
             return false;
         }
-        if self.update.check_on_startup && !self.update.auto_install && self.update.check_interval == 14400 {
-            self.update.auto_install = true;
-            self.update.check_interval = 0;
-        } else if self.update.check_interval == 14400 {
-            self.update.check_interval = 0;
+        if self.config_version == 0 {
+            if self.update.check_on_startup && !self.update.auto_install && self.update.check_interval == 14400 {
+                self.update.auto_install = true;
+                self.update.check_interval = 0;
+            } else if self.update.check_interval == 14400 {
+                self.update.check_interval = 0;
+            }
         }
-        self.config_version = 1;
+        // Keep Detail screen consistent with the user's chosen `[T]` palette unless explicitly re-enabled
+        self.ambilight_enabled = false;
+        self.config_version = 2;
         true
     }
 
@@ -864,7 +868,8 @@ detail_ttl = 3600
         assert!(cfg.migrate_legacy_defaults());
         assert!(cfg.update.auto_install);
         assert_eq!(cfg.update.check_interval, 0);
-        assert_eq!(cfg.config_version, 1);
+        assert!(!cfg.ambilight_enabled);
+        assert_eq!(cfg.config_version, 2);
 
         // User opting back out after migration must not be overridden on subsequent loads.
         cfg.update.auto_install = false;

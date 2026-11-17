@@ -1424,7 +1424,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
-                    ui::help::render_toast(frame, msg);
+                    ui::help::render_toast(frame, msg, &state.theme());
                 }
             })
             .map(|_| ());
@@ -1541,7 +1541,7 @@ async fn handle_key(
         Screen::PlaybackOptions => handle_playback_options(key, state, pool, cfg, tx).await,
         Screen::Playback => handle_playback(key, state, pool, cfg, tx).await,
         Screen::Search   => handle_search(key, state, pool, tx).await,
-        Screen::Help     => handle_help(key, state),
+        Screen::Help     => handle_help(key, state, pool, cfg),
         Screen::Settings => handle_settings(key, state, pool, cfg, tx).await,
         Screen::Setup    => handle_setup(key, state, cfg),
         Screen::AniListLogin => handle_login(key, state, home_data, pool, cfg, tx).await,
@@ -1997,37 +1997,42 @@ async fn handle_mouse(
                     false
                 }
                 Screen::Detail => {
-                    // Hint bar / back
-                    if my == 0 {
-                        if mx < 8 {
-                            state.go_back();
-                            return true;
-                        } else if mx < 25 {
-                            begin_playback_flow(state, pool, cfg, false, tx).await;
-                            return true;
-                        } else if mx < 45 {
-                            state.episode_view_mode = match state.episode_view_mode {
-                                state::EpisodeViewMode::List => state::EpisodeViewMode::Split,
-                                state::EpisodeViewMode::Split => state::EpisodeViewMode::List,
-                            };
-                            return true;
-                        } else if mx < 60 {
-                            let q = state.selected_anime.as_ref().map(|a| a.playback_query()).unwrap_or_default();
-                            let ep = state.selected_episode.unwrap_or(1);
-                            let dub = cfg.audio_mode == config::AudioMode::Dub;
-                            let player = cfg.player;
-                            state.open_playback_options(q, 0, dub, player);
-                            if let Some(ref anime) = state.selected_anime {
-                                trigger_stream_detection(anime, ep, dub, tx);
-                            }
-                            return true;
-                        }
+                    // Context Top Bar: Back pill click
+                    if my == 0 && mx < 14 {
+                        state.go_back();
+                        return true;
                     }
-                    // Episodes
+                    // Bottom 2-Row Command Dock
+                    if let Some(action) = ui::detail::footer_action_at(state, term_w, term_h, mx, my) {
+                        use ui::detail::DetailFooterAction::*;
+                        let code = match action {
+                            Play => KeyCode::Enter,
+                            Enqueue => KeyCode::Char('e'),
+                            BatchQueue => KeyCode::Char('E'),
+                            Options => KeyCode::Char('p'),
+                            Download => KeyCode::Char('D'),
+                            QueueHub => KeyCode::Char('Q'),
+                            Remote => KeyCode::Char('m'),
+                            Cast => KeyCode::Char('c'),
+                            ToggleView => KeyCode::Char('v'),
+                            MarkWatched => KeyCode::Char('w'),
+                            Watchlist => KeyCode::Char('+'),
+                            NextEp => KeyCode::Char('n'),
+                            Drop => KeyCode::Backspace,
+                            Theme => KeyCode::Char('T'),
+                            Search => KeyCode::Char('/'),
+                            Help => KeyCode::Char('?'),
+                            Back => KeyCode::Esc,
+                        };
+                        handle_detail(event::KeyEvent::from(code), state, pool, cfg, tx).await;
+                        return true;
+                    }
+                    // Episodes (above Detail Command Dock)
+                    let content_bottom = term_h.saturating_sub(ui::detail::DETAIL_FOOTER_HEIGHT);
                     match state.episode_view_mode {
                         state::EpisodeViewMode::List => {
-                            if my >= 16 {
-                                let inner_h = term_h.saturating_sub(17);
+                            if my >= 16 && my < content_bottom {
+                                let inner_h = content_bottom.saturating_sub(16);
                                 let card_h = if inner_h >= 21 { 7 } else if inner_h >= 14 { 6 } else { 5 };
                                 let visible_cards = (inner_h / card_h).max(1) as usize;
                                 let card_idx = ((my - 16) / card_h) as usize;
@@ -2048,9 +2053,9 @@ async fn handle_mouse(
                         state::EpisodeViewMode::Split => {
                             if mx < 44 {
                                 // Left Queue
-                                if my >= 17 {
+                                if my >= 17 && my < content_bottom {
                                     let rel_line = (my - 17) as usize;
-                                    let visible_rows = term_h.saturating_sub(19) as usize;
+                                    let visible_rows = content_bottom.saturating_sub(19) as usize;
                                     if rel_line < visible_rows {
                                         let ep_idx = state.episode_offset + rel_line;
                                         if ep_idx < state.episode_list.len() {
@@ -2064,7 +2069,7 @@ async fn handle_mouse(
                                         }
                                     }
                                 }
-                            } else if my >= 16 {
+                            } else if my >= 16 && my < content_bottom {
                                 // Right Inspector Theater
                                 begin_playback_flow(state, pool, cfg, false, tx).await;
                                 return true;
@@ -2183,12 +2188,37 @@ async fn handle_mouse(
 
 // ── Home screen ───────────────────────────────────────────────────────────────
 
+/// Cycle UI theme cleanly across Home, Detail, and Overlays while disabling silent Ambilight override.
+fn cycle_active_theme(
+    state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    cfg:   &mut config::Config,
+) {
+    state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
+    if state.ambilight_enabled {
+        state.ambilight_enabled = false;
+        cfg.ambilight_enabled = false;
+        let _ = cfg.save();
+    }
+    let theme_name = state.theme().name;
+    let pool2 = pool.clone();
+    let pid = state.active_profile_id.clone();
+    let pname = state.active_profile_name.clone();
+    let picon = state.active_profile_icon.clone();
+    let tidx = state.theme_index;
+    let audio = if cfg.audio_mode == config::AudioMode::Dub { "dub" } else { "sub" };
+    tokio::spawn(async move {
+        let _ = db::user::update_profile(&pool2, &pid, &pname, &picon, tidx, audio).await;
+    });
+    state.show_toast(format!("◈ Theme: {}", theme_name), unix_now());
+}
+
 async fn handle_home(
     key:       event::KeyEvent,
     state:     &mut AppState,
     home_data: &mut ui::home::HomeData,
     pool:      &sqlx::SqlitePool,
-    cfg:       &config::Config,
+    cfg:       &mut config::Config,
     tx:        &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     match key.code {
@@ -2296,18 +2326,7 @@ async fn handle_home(
             state.open_profile_modal(summaries);
         }
         KeyCode::Char('t') | KeyCode::Char('T') => {
-            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
-            let theme_name = state.theme().name;
-            let pool2 = pool.clone();
-            let pid = state.active_profile_id.clone();
-            let pname = state.active_profile_name.clone();
-            let picon = state.active_profile_icon.clone();
-            let tidx = state.theme_index;
-            let audio = if cfg.audio_mode == config::AudioMode::Dub { "dub" } else { "sub" };
-            tokio::spawn(async move {
-                let _ = db::user::update_profile(&pool2, &pid, &pname, &picon, tidx, audio).await;
-            });
-            state.show_toast(format!("Theme: {}", theme_name), unix_now());
+            cycle_active_theme(state, pool, cfg);
         }
         KeyCode::Char('U') => {
             if let Some(ref info) = state.available_update.clone() {
@@ -3009,7 +3028,7 @@ async fn handle_detail(
     key:   event::KeyEvent,
     state: &mut AppState,
     pool:  &sqlx::SqlitePool,
-    cfg:   &config::Config,
+    cfg:   &mut config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     if state.is_download_modal_open {
@@ -3043,6 +3062,7 @@ async fn handle_detail(
         KeyCode::Char('/')                => state.open_search(),
         KeyCode::Char('?')               => state.open_help(),
         KeyCode::Char('s')               => state.open_settings(),
+        KeyCode::Char('t') | KeyCode::Char('T') => cycle_active_theme(state, pool, cfg),
         KeyCode::Char('m') | KeyCode::Char('M') => {
             state.overlay_base = Screen::Detail;
             if state.remote_qr.is_none() {
@@ -3966,17 +3986,17 @@ async fn execute_hub_action(
 }
 
 fn handle_help(
-    key: event::KeyEvent,
+    key:   event::KeyEvent,
     state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    cfg:   &mut config::Config,
 ) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => state.go_back(),
         KeyCode::Char('s') => state.open_settings(),
         KeyCode::Char('!') => state.open_setup(),
         KeyCode::Char('t') | KeyCode::Char('T') => {
-            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
-            let name = state.theme().name;
-            state.show_toast(format!("Theme: {}", name), unix_now());
+            cycle_active_theme(state, pool, cfg);
         }
         _ => {}
     }

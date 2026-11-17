@@ -8,11 +8,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::state::AppState;
+use crate::{state::AppState, ui::theme::ThemePalette};
 
 /// Render the playback screen.
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+    let theme = state.theme();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -23,30 +24,30 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ])
         .split(area);
 
-    render_header(frame, chunks[0], state);
-    render_logs(frame, chunks[1], state);
-    render_controls(frame, chunks[2]);
+    render_header(frame, chunks[0], state, &theme);
+    render_logs(frame, chunks[1], state, &theme);
+    render_controls(frame, chunks[2], &theme);
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState, theme: &ThemePalette) {
     let title = state
         .now_playing
         .as_deref()
         .unwrap_or("Starting playback...");
 
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" ", Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(60, 60, 80))),
+            .border_style(Style::default().fg(theme.border_idle)),
     );
     frame.render_widget(header, area);
 }
 
-fn render_logs(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+fn render_logs(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState, theme: &ThemePalette) {
     // Show last N lines that fit in the area
     let visible = area.height.saturating_sub(2) as usize;
     let logs    = &state.playback_logs;
@@ -58,7 +59,7 @@ fn render_logs(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
             let style = if line.contains("error") || line.contains("Error") {
                 Style::default().fg(Color::Rgb(255, 80, 80))
             } else if line.contains("›") || line.starts_with('[') {
-                Style::default().fg(Color::Rgb(180, 0, 255))
+                Style::default().fg(theme.primary)
             } else {
                 Style::default().fg(Color::Rgb(180, 180, 180))
             };
@@ -70,27 +71,27 @@ fn render_logs(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
         Block::default()
             .title(Span::styled(
                 " Output ",
-                Style::default().fg(Color::Rgb(160, 160, 160)),
+                Style::default().fg(theme.text_dim),
             ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(40, 40, 60))),
+            .border_style(Style::default().fg(theme.border_idle)),
     );
     frame.render_widget(log_list, area);
 }
 
-fn render_controls(frame: &mut Frame, area: ratatui::layout::Rect) {
+fn render_controls(frame: &mut Frame, area: ratatui::layout::Rect, theme: &ThemePalette) {
     let controls = Paragraph::new(Line::from(vec![
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
-        Span::styled(" Stop    ", Style::default().fg(Color::Rgb(180, 180, 180))),
-        Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)),
-        Span::styled(" Next Ep    ", Style::default().fg(Color::Rgb(180, 180, 180))),
-        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)),
-        Span::styled(" Return", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(" q ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Stop    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" n ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
+        Span::styled(" Next Ep    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
+        Span::styled(" Return", Style::default().fg(theme.text_dim)),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(40, 40, 60))),
+            .border_style(Style::default().fg(theme.border_idle)),
     );
     frame.render_widget(controls, area);
 }

@@ -13,8 +13,8 @@ pub struct ThemePalette {
     pub divider: Color,      // Horizontal rail rules and internal separators
 }
 
-pub const THEMES: [ThemePalette; 6] = [
-    // 0: Anime Violet / Synth (Default for Anime TUI)
+pub const THEMES: [ThemePalette; 14] = [
+    // 0: Anime Violet / Synth (Default for Solus)
     ThemePalette {
         name: "Anime Violet",
         primary: Color::Rgb(189, 147, 249),    // Lavender Purple
@@ -74,7 +74,7 @@ pub const THEMES: [ThemePalette; 6] = [
         text_dim: Color::Rgb(145, 160, 180),
         divider: Color::Rgb(65, 78, 100),
     },
-    // 5: OLED Monochrome (Crisp white and platinum minimalist)
+    // 5: OLED Platinum (Crisp white and platinum minimalist)
     ThemePalette {
         name: "OLED Platinum",
         primary: Color::Rgb(236, 239, 244),    // Pure Platinum
@@ -85,6 +85,102 @@ pub const THEMES: [ThemePalette; 6] = [
         text: Color::White,
         text_dim: Color::Rgb(140, 145, 160),
         divider: Color::Rgb(70, 75, 85),
+    },
+    // 6: Lain Wired Y2K (CRT phosphor green, silver static, phosphor amber)
+    ThemePalette {
+        name: "Lain Wired Y2K",
+        primary: Color::Rgb(110, 255, 168),    // CRT Phosphor Green
+        secondary: Color::Rgb(185, 224, 210),  // Pale Terminal Static
+        accent: Color::Rgb(255, 208, 102),     // Amber Scanline
+        border_idle: Color::Rgb(36, 62, 48),   // Dim Cathode Frame
+        border_focus: Color::Rgb(110, 255, 168),
+        text: Color::Rgb(234, 252, 242),
+        text_dim: Color::Rgb(125, 168, 145),
+        divider: Color::Rgb(50, 84, 65),
+    },
+    // 7: Y2K Chrome Ice (Starlight blue-white, periwinkle chrome, metallic glint)
+    ThemePalette {
+        name: "Y2K Chrome Ice",
+        primary: Color::Rgb(178, 222, 255),    // Starlight Ice
+        secondary: Color::Rgb(148, 178, 255),  // Frosted Periwinkle
+        accent: Color::Rgb(255, 232, 168),     // Warm Halftone Gold
+        border_idle: Color::Rgb(46, 60, 88),   // Deep Cobalt Slate
+        border_focus: Color::Rgb(178, 222, 255),
+        text: Color::Rgb(242, 248, 255),
+        text_dim: Color::Rgb(142, 162, 198),
+        divider: Color::Rgb(62, 78, 110),
+    },
+    // 8: EVA Unit-01 (Obsidian NERV frame, LCL tangerine, bio-lime)
+    ThemePalette {
+        name: "EVA Unit-01",
+        primary: Color::Rgb(128, 255, 114),    // AT-Field Bio-Lime
+        secondary: Color::Rgb(255, 148, 64),   // LCL Warning Orange
+        accent: Color::Rgb(255, 224, 92),      // Sync Telemetry Yellow
+        border_idle: Color::Rgb(58, 44, 78),   // NERV Armor Slate
+        border_focus: Color::Rgb(128, 255, 114),
+        text: Color::Rgb(244, 245, 250),
+        text_dim: Color::Rgb(155, 148, 176),
+        divider: Color::Rgb(74, 58, 96),
+    },
+    // 9: Akira Neo-Tokyo (Ashen midnight, Kaneda crimson red, steel cyan)
+    ThemePalette {
+        name: "Akira Neo-Tokyo",
+        primary: Color::Rgb(255, 78, 92),      // Kaneda Vermilion Red
+        secondary: Color::Rgb(125, 214, 255),  // Neon Expressway Cyan
+        accent: Color::Rgb(255, 210, 80),      // Capsule Amber
+        border_idle: Color::Rgb(72, 42, 48),   // Dark Tarmac Iron
+        border_focus: Color::Rgb(255, 78, 92),
+        text: Color::Rgb(248, 244, 244),
+        text_dim: Color::Rgb(168, 142, 148),
+        divider: Color::Rgb(92, 54, 60),
+    },
+    // 10: Ghost in the Shell (Section-9 cyber teal, matrix emerald, cyber gold)
+    ThemePalette {
+        name: "Ghost in the Shell",
+        primary: Color::Rgb(72, 236, 218),     // Section-9 Aqua
+        secondary: Color::Rgb(98, 255, 168),   // Cybernetic Emerald
+        accent: Color::Rgb(255, 204, 102),     // Hologram Gold
+        border_idle: Color::Rgb(36, 64, 74),   // Deep Optical Navy
+        border_focus: Color::Rgb(72, 236, 218),
+        text: Color::Rgb(234, 249, 250),
+        text_dim: Color::Rgb(128, 166, 176),
+        divider: Color::Rgb(48, 82, 92),
+    },
+    // 11: Monogatari Crimson (Sumi ink, crimson rose, warm champagne parchment)
+    ThemePalette {
+        name: "Monogatari Crimson",
+        primary: Color::Rgb(242, 95, 132),     // Crimson Rose
+        secondary: Color::Rgb(244, 212, 166),  // Champagne Parchment
+        accent: Color::Rgb(255, 198, 92),      // Shrine Lantern Gold
+        border_idle: Color::Rgb(72, 44, 54),   // Ink Burgundy
+        border_focus: Color::Rgb(242, 95, 132),
+        text: Color::Rgb(252, 244, 246),
+        text_dim: Color::Rgb(176, 145, 155),
+        divider: Color::Rgb(92, 56, 68),
+    },
+    // 12: Catppuccin Mocha (Espresso dark, pastel mauve, sapphire, peach)
+    ThemePalette {
+        name: "Catppuccin Mocha",
+        primary: Color::Rgb(203, 166, 247),    // Mocha Mauve
+        secondary: Color::Rgb(116, 199, 236),  // Mocha Sapphire
+        accent: Color::Rgb(250, 179, 135),     // Warm Peach
+        border_idle: Color::Rgb(69, 71, 90),   // Surface1
+        border_focus: Color::Rgb(203, 166, 247),
+        text: Color::Rgb(205, 214, 244),
+        text_dim: Color::Rgb(147, 153, 178),
+        divider: Color::Rgb(88, 91, 112),
+    },
+    // 13: Gruvbox Dark (Warm charcoal, burnt tangerine, sage aqua, ochre)
+    ThemePalette {
+        name: "Gruvbox Dark",
+        primary: Color::Rgb(254, 128, 25),     // Bright Orange
+        secondary: Color::Rgb(142, 192, 124),  // Studio Aqua
+        accent: Color::Rgb(250, 189, 47),      // Yellow Ochre
+        border_idle: Color::Rgb(80, 73, 69),   // Dark2 Charcoal
+        border_focus: Color::Rgb(254, 128, 25),
+        text: Color::Rgb(235, 219, 178),
+        text_dim: Color::Rgb(168, 153, 132),
+        divider: Color::Rgb(102, 92, 84),
     },
 ];
 

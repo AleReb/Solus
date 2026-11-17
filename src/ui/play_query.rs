@@ -14,6 +14,7 @@ use crate::state::AppState;
 pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(62, 52, frame.area());
     frame.render_widget(Clear, area);
+    let theme = state.theme();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -33,11 +34,11 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             .title(Span::styled(
                 "  Playback Query ",
                 Style::default()
-                    .fg(Color::Rgb(180, 0, 255))
+                    .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(180, 0, 255))),
+            .border_style(Style::default().fg(theme.border_focus)),
     );
     frame.render_widget(header, chunks[0]);
 
@@ -48,7 +49,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .map(|(i, query)| {
             let style = if i == state.playback_query_cursor {
                 Style::default()
-                    .fg(Color::Rgb(180, 0, 255))
+                    .fg(theme.primary)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Rgb(205, 205, 215))
@@ -63,7 +64,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         List::new(items).block(
             Block::default()
                 .borders(Borders::LEFT | Borders::RIGHT)
-                .border_style(Style::default().fg(Color::Rgb(180, 0, 255))),
+                .border_style(Style::default().fg(theme.border_focus)),
         ),
         chunks[1],
         &mut list_state,
@@ -74,13 +75,13 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::raw(" Play  "),
         Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Rgb(90, 90, 110))),
         Span::raw(" Back  "),
-        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255))),
+        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(theme.primary)),
         Span::raw(" Change query"),
     ]))
     .block(
         Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::Rgb(180, 0, 255))),
+            .border_style(Style::default().fg(theme.border_focus)),
     );
     frame.render_widget(footer, chunks[2]);
 }

@@ -44,6 +44,7 @@ struct SectionSpec {
 const BROWSING_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "Enter/Click", desc: "Open anime detail stage" },
     BindingRow { key: "h/j/k/l", desc: "Navigate shelves & posters" },
+    BindingRow { key: "1-6", desc: "Jump directly to shelf row" },
     BindingRow { key: "r", desc: "Resume next episode" },
     BindingRow { key: "/", desc: "Instant anime search" },
     BindingRow { key: "+ / x", desc: "Add or remove watchlist" },
@@ -51,41 +52,65 @@ const BROWSING_BINDINGS: &[BindingRow] = &[
 ];
 
 const PLAYBACK_BINDINGS: &[BindingRow] = &[
-    BindingRow { key: "Enter/Space", desc: "Launch episode playback" },
-    BindingRow { key: "d", desc: "Toggle Sub / Dub audio" },
-    BindingRow { key: "q", desc: "Cycle resolution (720p+)" },
-    BindingRow { key: "p", desc: "Switch player (mpv/iina/vlc)" },
-    BindingRow { key: "u", desc: "Cycle Anime4K shader (2x/4K)" },
-    BindingRow { key: "i / w / Esc", desc: "Status / Web / Go back" },
+    BindingRow { key: "Enter/Space", desc: "Launch highlighted episode" },
+    BindingRow { key: "e / E", desc: "Enqueue ep / Batch ep range" },
+    BindingRow { key: "v", desc: "Toggle Split / List ep view" },
+    BindingRow { key: "w / +", desc: "Mark watched / Watchlist" },
+    BindingRow { key: "p / D", desc: "Stream opts / Offline vault" },
+    BindingRow { key: "n / c", desc: "Next aired ep / LAN Cast" },
+    BindingRow { key: "Esc / q", desc: "Return to previous screen" },
 ];
 
 const FEATURES_BINDINGS: &[BindingRow] = &[
+    BindingRow { key: "Q / Ctrl+Q", desc: "Watch Session Queue & Playlists" },
     BindingRow { key: "a", desc: "Taste Analytics Bento Hub" },
     BindingRow { key: "w", desc: "Tailored recommendation wizard" },
-    BindingRow { key: "Q / Ctrl+Q", desc: "Watch Session Queue & Playlists" },
-    BindingRow { key: "e / E", desc: "Enqueue ep / Batch ep range" },
     BindingRow { key: "c", desc: "Weekly airing calendar" },
     BindingRow { key: "m", desc: "Mobile LAN remote & QR" },
-    BindingRow { key: "C", desc: "LAN Cast Deck & DLNA stream" },
-    BindingRow { key: "L", desc: "AniList OAuth connect / sync" },
+    BindingRow { key: "C", desc: "AirPlay / DLNA Cast Deck" },
+    BindingRow { key: "L", desc: "Trackers OAuth & Merge Hub" },
+    BindingRow { key: "t / T", desc: "Cycle UI theme on Home & Detail" },
 ];
 
 const SYSTEM_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "P", desc: "Switch / manage user profiles" },
     BindingRow { key: "s", desc: "Open Settings Control Hub" },
-    BindingRow { key: "t / T", desc: "Cycle active UI theme" },
+    BindingRow { key: "t / T", desc: "Cycle active UI theme palette" },
     BindingRow { key: "!", desc: "Open System Doctor & Pipeline" },
     BindingRow { key: "U", desc: "Check or install self-update" },
     BindingRow { key: "X", desc: "Stop active player process" },
+    BindingRow { key: "Ctrl+C", desc: "Immediate emergency exit" },
     BindingRow { key: "q / Esc", desc: "Go back or quit confirmation" },
 ];
 
-/// Returns the responsive modal `(percent_x, percent_y)` matching `render_overlay`.
+/// Returns the responsive modal `(percent_x, percent_y)` matching `Home` backdrop clearing.
 pub fn modal_pct(area: Rect) -> (u16, u16) {
-    if area.width >= 100 && area.height >= 32 {
-        (86, 84)
+    let rect = help_modal_rect(area);
+    let px = ((rect.width as u32 * 100) / area.width.max(1) as u32).clamp(50, 98) as u16;
+    let py = ((rect.height as u32 * 100) / area.height.max(1) as u32).clamp(50, 98) as u16;
+    (px, py)
+}
+
+/// Content-fitted centered modal rectangle eliminating empty lower deadspace on wide/tall terminals.
+fn help_modal_rect(area: Rect) -> Rect {
+    let target_w = if area.width >= 88 {
+        area.width.saturating_sub(4).min(108)
     } else {
-        (96, 92)
+        area.width.saturating_sub(2).max(20)
+    };
+    let top_h = BROWSING_BINDINGS.len().max(PLAYBACK_BINDINGS.len()) as u16 + 3;
+    let bot_h = FEATURES_BINDINGS.len().max(SYSTEM_BINDINGS.len()) as u16 + 3;
+    let player_bar_h: u16 = if area.height >= 28 { 3 } else { 0 };
+    let desired_h = 2 + 2 + top_h + bot_h + player_bar_h + 2; // borders + header + cards + player + dock
+    let target_h = desired_h.min(area.height.saturating_sub(2)).max(12);
+
+    let x = area.x + area.width.saturating_sub(target_w) / 2;
+    let y = area.y + area.height.saturating_sub(target_h) / 2;
+    Rect {
+        x,
+        y,
+        width: target_w.min(area.width),
+        height: target_h.min(area.height),
     }
 }
 
@@ -137,9 +162,7 @@ fn context_label(screen: &Screen) -> &'static str {
 
 /// Render the contextual 2x2 Bento command matrix modal overlay.
 pub fn render_overlay(frame: &mut Frame, state: &AppState) {
-    let frame_area = frame.area();
-    let (pct_x, pct_y) = modal_pct(frame_area);
-    let area = centered_rect(pct_x, pct_y, frame_area);
+    let area = help_modal_rect(frame.area());
     frame.render_widget(Clear, area);
 
     let theme = state.theme();
@@ -186,9 +209,11 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         height: inner.height,
     };
 
-    let show_header_rule = padded.height >= 25;
+    let show_header_rule = padded.height >= 24;
     let show_dock_rule = padded.height >= 22;
+    let show_player_strip = padded.height >= 25;
     let header_h = if show_header_rule { 2 } else { 1 };
+    let player_h = if show_player_strip { 3 } else { 0 };
     let dock_h = if show_dock_rule { 2 } else { 1 };
 
     let rows = Layout::default()
@@ -196,6 +221,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .constraints([
             Constraint::Length(header_h),
             Constraint::Min(0),
+            Constraint::Length(player_h),
             Constraint::Length(dock_h),
         ])
         .split(padded);
@@ -212,25 +238,28 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         SectionSpec {
             section: HelpSection::Playback,
             title: "Detail & Playback",
-            subtitle: "Streams, audio & shaders",
+            subtitle: "Episodes, queue & stream setup",
             bindings: PLAYBACK_BINDINGS,
         },
         SectionSpec {
             section: HelpSection::Features,
             title: "Intelligence & Companion",
-            subtitle: "Analytics, calendar & LAN",
+            subtitle: "Queue, analytics, calendar & LAN",
             bindings: FEATURES_BINDINGS,
         },
         SectionSpec {
             section: HelpSection::System,
             title: "System & Quick Bridges",
-            subtitle: "Hub, doctor & runtime",
+            subtitle: "Hub, profiles, doctor & runtime",
             bindings: SYSTEM_BINDINGS,
         },
     ];
 
     render_bento_cards(frame, rows[1], &sections, focused_section, &theme);
-    render_action_dock(frame, rows[2], &theme, show_dock_rule);
+    if show_player_strip {
+        render_player_strip(frame, rows[2], &theme);
+    }
+    render_action_dock(frame, rows[3], &theme, show_dock_rule);
 }
 
 fn render_header(
@@ -299,9 +328,14 @@ fn render_bento_cards(
 ) {
     // 2x2 Bento matrix when horizontal budget avoids label truncation; 1-column fallback on narrow panes.
     if area.width >= 76 && area.height >= 16 {
+        let top_rows = (sections[0].bindings.len().max(sections[1].bindings.len()) + 3) as u16;
+        let bot_rows = (sections[2].bindings.len().max(sections[3].bindings.len()) + 3) as u16;
         let grid_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Length(top_rows.min(area.height / 2)),
+                Constraint::Min(bot_rows.min(area.height.saturating_sub(top_rows.min(area.height / 2)))),
+            ])
             .split(area);
 
         let top_cols = Layout::default()
@@ -428,6 +462,38 @@ fn render_section_card(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
+    let block = Block::default()
+        .title(Span::styled(
+            "  In-Player (mpv YouTube Keys) ",
+            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_idle))
+        .style(Style::default().bg(BG_CARD));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line = Line::from(vec![
+        dock_pill("Space/k", "Pause", theme.primary),
+        Span::raw("   "),
+        dock_pill("j/l", "Seek +-10s", theme.accent),
+        Span::raw("   "),
+        dock_pill("0-9", "Jump %", theme.secondary),
+        Span::raw("   "),
+        dock_pill("f", "Fullscreen", FG_PRIMARY),
+        Span::raw("   "),
+        dock_pill("m", "Mute", FG_PRIMARY),
+        Span::raw("   "),
+        dock_pill("c", "Subtitles", theme.primary),
+        Span::raw("   "),
+        dock_pill("q", "Exit Player", FG_MUTED),
+    ])
+    .alignment(Alignment::Center);
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
 fn render_action_dock(frame: &mut Frame, area: Rect, theme: &ThemePalette, show_rule: bool) {
     let rows = if show_rule && area.height >= 2 {
         Layout::default()
@@ -478,7 +544,7 @@ fn dock_pill(key: &str, label: &str, accent: Color) -> Span<'static> {
 }
 
 /// Render the toast notification bar at the bottom of the screen.
-pub fn render_toast(frame: &mut Frame, message: &str) {
+pub fn render_toast(frame: &mut Frame, message: &str, theme: &ThemePalette) {
     let area = frame.area();
     let height = 1u16;
     let toast_area = Rect {
@@ -492,30 +558,10 @@ pub fn render_toast(frame: &mut Frame, message: &str) {
         format!("  ✓ {}", message),
         Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(180, 0, 255))
+            .bg(theme.primary)
             .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(toast, toast_area);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vert[1])[1]
 }
 
 #[cfg(test)]
@@ -565,6 +611,10 @@ mod tests {
             );
             assert!(text.contains("Settings Hub"), "missing Settings action dock at {}x{}", w, h);
             assert!(text.contains("System Doctor"), "missing Doctor action dock at {}x{}", w, h);
+            assert!(text.contains("Watch Session Queue"), "missing Queue keybind in help matrix");
+            if h >= 32 {
+                assert!(text.contains("In-Player (mpv YouTube Keys)"), "missing player bar");
+            }
         }
     }
 

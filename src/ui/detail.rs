@@ -11,8 +11,36 @@ use ratatui::{
 use crate::{
     db::cache::Anime,
     state::{AppState, EpisodeViewMode},
-    ui::components::cover::HalfblockCover,
+    ui::components::{
+        cover::HalfblockCover,
+        dock::{build_dock_row_plan, DockChip, DockRowPlan},
+    },
 };
+
+/// Height of the 2-row symmetrical Detail Command Dock (1 top divider + 2 balanced rows).
+pub const DETAIL_FOOTER_HEIGHT: u16 = 3;
+
+/// Interactive actions exposed by clicking pills in the Detail Bottom Command Dock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailFooterAction {
+    Play,
+    Enqueue,
+    BatchQueue,
+    Options,
+    Download,
+    QueueHub,
+    Remote,
+    Cast,
+    ToggleView,
+    MarkWatched,
+    Watchlist,
+    NextEp,
+    Drop,
+    Theme,
+    Search,
+    Help,
+    Back,
+}
 
 /// Helper to format miniature progress bar: [━━━━━━────]
 pub fn format_mini_bar(pos: f64, dur: f64, width: usize) -> String {
@@ -32,69 +60,362 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     };
 
     let area = frame.area();
-    let action_label = match state.selected_episode.unwrap_or(1) {
-        1 => " Start E1 ".to_string(),
-        ep => format!(" Continue E{} ", ep),
-    };
-
-    let view_mode_label = match state.episode_view_mode {
-        EpisodeViewMode::List => " View: List (v) ",
-        EpisodeViewMode::Split => " View: Split (v) ",
-    };
-
-    // Back hint
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" ← Esc", Style::default().fg(Color::Rgb(120, 120, 120))),
-        Span::raw("  "),
-        Span::styled("Enter", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" "),
-        Span::styled(action_label, Style::default().fg(Color::Rgb(220, 220, 220))),
-        Span::raw("  "),
-        Span::styled("j/k", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Navigate  "),
-        Span::styled("v", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(format!("{} ", view_mode_label)),
-        Span::styled("w", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Watched  "),
-        Span::styled("e/E", Style::default().fg(Color::Rgb(80, 250, 123))),
-        Span::raw(" Queue  "),
-        Span::styled("Q", Style::default().fg(Color::Rgb(251, 191, 36))),
-        Span::raw(" Playlists  "),
-        Span::styled("p", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Options  "),
-        Span::styled("D", Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
-        Span::raw(" Download  "),
-        Span::styled("+", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Watchlist  "),
-        Span::styled("󰅖 Backspace", Style::default().fg(Color::Rgb(255, 85, 85))),
-        Span::raw(" Drop/Remove  "),
-        Span::styled("/", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Search  "),
-        Span::styled("?", Style::default().fg(Color::Rgb(180, 0, 255))),
-        Span::raw(" Help"),
-        if state.available_update.is_some() {
-            Span::styled("  󰚰 U Update", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD))
-        } else {
-            Span::raw("")
-        },
-    ]));
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // hint bar
-            Constraint::Length(14), // top info panel
-            Constraint::Min(0),     // Netflix-style episode browser
+            Constraint::Length(1),                    // Clean context top bar
+            Constraint::Length(14),                   // Cover + editorial metadata
+            Constraint::Min(0),                       // Episode browser
+            Constraint::Length(DETAIL_FOOTER_HEIGHT), // 2-row symmetrical Command Dock
         ])
         .split(area);
 
-    frame.render_widget(hint, chunks[0]);
+    render_top_bar(frame, chunks[0], state, &anime);
     render_info(frame, chunks[1], state, &anime);
     render_episodes(frame, chunks[2], state, &anime);
+    render_footer(frame, chunks[3], state);
 
     if state.is_download_modal_open {
         crate::ui::download::render_download_modal(frame, state);
     }
+}
+
+fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anime) {
+    let theme = state.theme();
+    let right_queue = if state.queue.is_empty() {
+        String::new()
+    } else {
+        format!("◆ Queue: {}  ·  ", state.queue.len())
+    };
+    let profile_text = format!("{} {} [P]", state.active_profile_icon, state.active_profile_name);
+    let theme_text = format!("◈ {} [T] ", theme.name);
+    let right_total = format!("{}{}  ·  {}", right_queue, profile_text, theme_text);
+    let right_w = right_total.chars().count() as u16 + 1;
+
+    let back_badge = " ← Esc Back ";
+    let ctx_badge = " ◈ DETAIL ";
+    let fixed_left_w = back_badge.chars().count() as u16 + ctx_badge.chars().count() as u16 + 4;
+    let title_budget = area
+        .width
+        .saturating_sub(fixed_left_w + right_w + 2)
+        .max(8) as usize;
+    let clamped_title = crate::ui::queue::clamp_text(anime.display_title(), title_budget);
+
+    let mut spans = vec![
+        Span::styled(
+            back_badge,
+            Style::default()
+                .fg(theme.text)
+                .bg(theme.border_idle)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            ctx_badge,
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            clamped_title.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    let used_left = fixed_left_w + clamped_title.chars().count() as u16;
+    let gap = area.width.saturating_sub(used_left + right_w) as usize;
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    if area.width >= used_left + right_w {
+        if !state.queue.is_empty() {
+            spans.push(Span::styled(
+                format!("◆ Queue: {}", state.queue.len()),
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+        }
+        spans.push(Span::styled(
+            profile_text,
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+        spans.push(Span::styled(
+            theme_text,
+            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn build_detail_dock_rows(
+    state: &AppState,
+    width: usize,
+) -> (DockRowPlan<DetailFooterAction>, DockRowPlan<DetailFooterAction>) {
+    let theme = state.theme();
+    let emerald = Color::Rgb(80, 250, 123);
+    let ep_label = match state.selected_episode.unwrap_or(1) {
+        1 => "Start E1".to_string(),
+        ep => format!("Play E{}", ep),
+    };
+    let view_label = match state.episode_view_mode {
+        EpisodeViewMode::List => "View: List",
+        EpisodeViewMode::Split => "View: Split",
+    };
+
+    // Row 1: Playback, Queue & Companions
+    let playback_left = vec![
+        DockChip {
+            icon: "",
+            key: "[Enter]",
+            label: ep_label,
+            key_color: Color::White,
+            label_color: theme.text,
+            priority: 0,
+            bg: None,
+            action: Some(DetailFooterAction::Play),
+        },
+        DockChip {
+            icon: "◆",
+            key: "[e]",
+            label: "+Queue".to_string(),
+            key_color: emerald,
+            label_color: theme.text,
+            priority: 1,
+            bg: None,
+            action: Some(DetailFooterAction::Enqueue),
+        },
+        DockChip {
+            icon: "",
+            key: "[E]",
+            label: "Batch".to_string(),
+            key_color: emerald,
+            label_color: theme.text,
+            priority: 3,
+            bg: None,
+            action: Some(DetailFooterAction::BatchQueue),
+        },
+        DockChip {
+            icon: "󰗃",
+            key: "[p]",
+            label: "Options".to_string(),
+            key_color: theme.primary,
+            label_color: theme.text,
+            priority: 2,
+            bg: None,
+            action: Some(DetailFooterAction::Options),
+        },
+        DockChip {
+            icon: "󰇚",
+            key: "[D]",
+            label: "Download".to_string(),
+            key_color: theme.secondary,
+            label_color: theme.text,
+            priority: 4,
+            bg: None,
+            action: Some(DetailFooterAction::Download),
+        },
+    ];
+
+    let playback_right = vec![
+        DockChip {
+            icon: "◆",
+            key: "[Q]",
+            label: if state.queue.is_empty() {
+                "Queue".to_string()
+            } else {
+                format!("Queue ({})", state.queue.len())
+            },
+            key_color: theme.accent,
+            label_color: theme.text,
+            priority: 1,
+            bg: None,
+            action: Some(DetailFooterAction::QueueHub),
+        },
+        DockChip {
+            icon: "◎",
+            key: "[m]",
+            label: "Remote".to_string(),
+            key_color: theme.secondary,
+            label_color: theme.text_dim,
+            priority: 4,
+            bg: None,
+            action: Some(DetailFooterAction::Remote),
+        },
+        DockChip {
+            icon: "󰍂",
+            key: "[c]",
+            label: "Cast".to_string(),
+            key_color: theme.primary,
+            label_color: theme.text_dim,
+            priority: 5,
+            bg: None,
+            action: Some(DetailFooterAction::Cast),
+        },
+    ];
+
+    let row1 = build_dock_row_plan(
+        " PLAYBACK ",
+        theme.primary,
+        theme.border_idle,
+        playback_left,
+        playback_right,
+        width,
+    );
+
+    // Row 2: Episode Browser, Library & Help/Back
+    let browser_left = vec![
+        DockChip {
+            icon: "▸",
+            key: "[hjkl]",
+            label: "Ep".to_string(),
+            key_color: theme.secondary,
+            label_color: theme.text_dim,
+            priority: 2,
+            bg: None,
+            action: None,
+        },
+        DockChip {
+            icon: "",
+            key: "[v]",
+            label: view_label.to_string(),
+            key_color: theme.primary,
+            label_color: theme.text,
+            priority: 2,
+            bg: None,
+            action: Some(DetailFooterAction::ToggleView),
+        },
+        DockChip {
+            icon: "󰄬",
+            key: "[w]",
+            label: "Watched".to_string(),
+            key_color: emerald,
+            label_color: theme.text,
+            priority: 3,
+            bg: None,
+            action: Some(DetailFooterAction::MarkWatched),
+        },
+        DockChip {
+            icon: "󰋜",
+            key: "[+]",
+            label: if state.in_watchlist { "In List" } else { "Watchlist" }.to_string(),
+            key_color: theme.accent,
+            label_color: theme.text,
+            priority: 3,
+            bg: None,
+            action: Some(DetailFooterAction::Watchlist),
+        },
+        DockChip {
+            icon: "",
+            key: "[n]",
+            label: "Next Ep".to_string(),
+            key_color: theme.secondary,
+            label_color: theme.text_dim,
+            priority: 5,
+            bg: None,
+            action: Some(DetailFooterAction::NextEp),
+        },
+        DockChip {
+            icon: "󰅖",
+            key: "[Bksp]",
+            label: "Drop".to_string(),
+            key_color: Color::Rgb(255, 85, 85),
+            label_color: Color::Rgb(255, 130, 130),
+            priority: 6,
+            bg: None,
+            action: Some(DetailFooterAction::Drop),
+        },
+    ];
+
+    let browser_right = vec![
+        DockChip {
+            icon: "◈",
+            key: "[T]",
+            label: "Theme".to_string(),
+            key_color: theme.secondary,
+            label_color: theme.text,
+            priority: 2,
+            bg: None,
+            action: Some(DetailFooterAction::Theme),
+        },
+        DockChip {
+            icon: "",
+            key: "[/]",
+            label: "Search".to_string(),
+            key_color: theme.primary,
+            label_color: theme.text,
+            priority: 3,
+            bg: None,
+            action: Some(DetailFooterAction::Search),
+        },
+        DockChip {
+            icon: "",
+            key: "[?]",
+            label: "Help".to_string(),
+            key_color: theme.accent,
+            label_color: theme.text,
+            priority: 0,
+            bg: None,
+            action: Some(DetailFooterAction::Help),
+        },
+        DockChip {
+            icon: "←",
+            key: "[Esc]",
+            label: "Back".to_string(),
+            key_color: theme.text_dim,
+            label_color: theme.text_dim,
+            priority: 1,
+            bg: None,
+            action: Some(DetailFooterAction::Back),
+        },
+    ];
+
+    let row2 = build_dock_row_plan(
+        " BROWSER  ",
+        theme.secondary,
+        theme.border_idle,
+        browser_left,
+        browser_right,
+        width,
+    );
+
+    (row1, row2)
+}
+
+/// Hit-test a left-click inside the 2-row Detail Command Dock (`DETAIL_FOOTER_HEIGHT = 3`).
+pub fn footer_action_at(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    mx: u16,
+    my: u16,
+) -> Option<DetailFooterAction> {
+    let dock_top = height.saturating_sub(DETAIL_FOOTER_HEIGHT);
+    if my <= dock_top || my >= height {
+        return None;
+    }
+    let (row1, row2) = build_detail_dock_rows(state, width as usize);
+    let target = if my == dock_top + 1 { &row1 } else { &row2 };
+    target
+        .hitboxes
+        .iter()
+        .find(|(x0, x1, _)| mx >= *x0 && mx < *x1)
+        .map(|(_, _, act)| *act)
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+    let theme = state.theme();
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme.divider));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (row1, row2) = build_detail_dock_rows(state, inner.width as usize);
+    frame.render_widget(Paragraph::new(vec![row1.line, row2.line]), inner);
 }
 
 /// Top section: cover + metadata side by side.
@@ -108,10 +429,11 @@ fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anim
         ])
         .split(area);
 
+    let theme = state.theme();
     let cover_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(70, 70, 95)));
+        .border_style(Style::default().fg(theme.border_idle));
     let cover_inner = cover_block.inner(cols[0]);
     frame.render_widget(cover_block, cols[0]);
 
@@ -149,6 +471,7 @@ fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anim
 }
 
 fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anime) {
+    let theme = state.theme();
     let title   = anime.display_title();
     let score   = anime.score.map(|s| format!(" {:.1}", s as f32 / 10.0)).unwrap_or_else(|| " N/A".to_string());
     let max_aired = anime.aired_episodes();
@@ -213,10 +536,10 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
         lines.push(Line::from(vec![
             Span::styled(
                 " From ",
-                Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)),
+                Style::default().fg(Color::Black).bg(theme.primary),
             ),
             Span::raw(" "),
-            Span::styled(origin, Style::default().fg(Color::Rgb(180, 180, 200))),
+            Span::styled(origin, Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -227,11 +550,11 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
         )),
         Line::from(Span::styled(
             format!("{}  |  {}  |  {}  |  {} {}  |  {}{}", score, eps, fmt, season, year, status, dub_tag),
-            Style::default().fg(Color::Rgb(160, 160, 160)),
+            Style::default().fg(theme.text_dim),
         )),
-        Line::from(Span::styled(genres, Style::default().fg(Color::Rgb(180, 0, 255)))),
+        Line::from(Span::styled(genres, Style::default().fg(theme.primary))),
         Line::from(""),
-        Line::from(Span::styled(desc, Style::default().fg(Color::Rgb(215, 215, 225)))),
+        Line::from(Span::styled(desc, Style::default().fg(theme.text))),
     ]);
 
     let para = Paragraph::new(lines)
@@ -262,7 +585,7 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
                 " Playback ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Rgb(180, 0, 255))
+                    .bg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -284,6 +607,7 @@ fn render_episodes(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &
 /// Option 1: Netflix Vertical Episode List.
 /// Dense, scrollable stack of full-width horizontal cards with 16:9 thumbnails and rich metadata.
 fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+    let theme = state.theme();
     let max_aired = anime.aired_episodes();
     let total_eps = anime.episodes.map(|e| e as u32).unwrap_or(max_aired);
     let selected_ep = state.selected_episode.unwrap_or(1);
@@ -295,18 +619,18 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
         ),
         Span::styled(
             format!("[ {} Available · {} Total ]  ", max_aired, total_eps),
-            Style::default().fg(Color::Rgb(180, 0, 255)),
+            Style::default().fg(theme.primary),
         ),
         Span::styled(
             " [v] Split-Deck View ",
-            Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
         ),
     ]);
 
     let outer_block = Block::default()
         .title(title_span)
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+        .border_style(Style::default().fg(theme.divider));
 
     let inner = outer_block.inner(area);
     frame.render_widget(outer_block, area);
@@ -352,18 +676,18 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 
         // Render card frame
         let border_color = if is_selected {
-            Color::Rgb(180, 0, 255)
+            theme.border_focus
         } else if !is_aired {
             Color::Rgb(35, 35, 45)
         } else {
-            Color::Rgb(50, 50, 68)
+            theme.border_idle
         };
 
         let title_line = if is_selected {
             Line::from(vec![
                 Span::styled(
                     format!(" [  SELECTED • EPISODE {} ] ", ep),
-                    Style::default().fg(Color::Rgb(220, 150, 255)).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::styled(
@@ -518,7 +842,7 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 
         let mut lines = Vec::new();
         let mut title_spans = vec![
-            Span::styled(format!("{}. ", ep), Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}. ", ep), Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
             Span::styled(ep_title, title_style),
             Span::raw("   "),
             status_badge,
@@ -600,6 +924,7 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 /// Left column: rapid-scrolling Episode Queue.
 /// Right column: expansive 16:9 Thumbnail Theater + full episode inspector.
 fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+    let theme = state.theme();
     let max_aired = anime.aired_episodes();
     let total_eps = anime.episodes.map(|e| e as u32).unwrap_or(max_aired);
     let selected_ep = state.selected_episode.unwrap_or(1);
@@ -611,18 +936,18 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
         ),
         Span::styled(
             format!("[ {} / {} eps ]  ", max_aired, total_eps),
-            Style::default().fg(Color::Rgb(180, 0, 255)),
+            Style::default().fg(theme.primary),
         ),
         Span::styled(
             " [v] List View ",
-            Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
         ),
     ]);
 
     let outer_block = Block::default()
         .title(title_span)
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+        .border_style(Style::default().fg(theme.divider));
 
     let inner = outer_block.inner(area);
     frame.render_widget(outer_block, area);
@@ -637,10 +962,10 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
 
     // ── Left Column: Episode Queue ──
     let q_block = Block::default()
-        .title(Span::styled(" 󰗃 Episode Queue (j/k) ", Style::default().fg(Color::Rgb(200, 200, 215)).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(" 󰗃 Episode Queue (j/k) ", Style::default().fg(theme.text).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+        .border_style(Style::default().fg(theme.border_idle));
     let q_inner = q_block.inner(cols[0]);
     frame.render_widget(q_block, cols[0]);
 
@@ -715,13 +1040,13 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
 
         let mut spans = vec![
             Span::styled(format!("{ep_prefix}{truncated_title:<title_w$}"), if is_selected {
-                Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)
             } else if !is_aired {
                 Style::default().fg(Color::Rgb(85, 85, 100))
             } else if is_watched {
                 Style::default().fg(Color::Rgb(110, 180, 130))
             } else {
-                Style::default().fg(Color::Rgb(200, 200, 210))
+                Style::default().fg(theme.text)
             }),
         ];
         spans.extend(suffix_spans);
@@ -734,11 +1059,11 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     let insp_block = Block::default()
         .title(Span::styled(
             format!(" 󰄬 Episode {} Inspector ", selected_ep),
-            Style::default().fg(Color::Rgb(220, 220, 240)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(180, 0, 255)));
+        .border_style(Style::default().fg(theme.border_focus));
     let insp_inner = insp_block.inner(cols[1]);
     frame.render_widget(insp_block, cols[1]);
 
@@ -807,7 +1132,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
             Line::from(""),
             Line::from(Span::styled(
                 format!("  󰗃 EPISODE {} HIGH-DEF PREVIEW", selected_ep),
-                Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 if !is_aired { "  󰌾 Broadcast locked until air date" } else { "  1080p Master HLS Stream" },
@@ -831,7 +1156,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
             Style::default().fg(Color::Rgb(180, 180, 255))
         };
         let mut spec_lines = vec![
-            Line::from(Span::styled("❖ STREAM SPECIFICATION", Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("❖ STREAM SPECIFICATION", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))),
             Line::from(Span::styled("  Resolution: 1080p Master HLS", Style::default().fg(Color::Rgb(220, 220, 230)))),
             Line::from(Span::styled(format!("  Audio: {}", audio_label), Style::default().fg(Color::Rgb(190, 190, 210)))),
             Line::from(Span::styled("  Subtitles: English & Multi-Lang", Style::default().fg(Color::Rgb(160, 160, 180)))),
@@ -898,7 +1223,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
                 Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(" [ v List View ] ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+            Span::styled(" [ v List View ] ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         ]));
 
         let specs_p = Paragraph::new(spec_lines);
@@ -925,7 +1250,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
             } else {
                 "󰄮 Unwatched · 24m · 1080p Stream"
             },
-            Style::default().fg(if is_watched { Color::Rgb(60, 220, 130) } else if !is_aired { Color::Rgb(130, 130, 150) } else { Color::Rgb(180, 0, 255) }),
+            Style::default().fg(if is_watched { Color::Rgb(60, 220, 130) } else if !is_aired { Color::Rgb(130, 130, 150) } else { theme.secondary }),
         ),
     ]));
     details_lines.push(Line::from(""));
@@ -1471,5 +1796,44 @@ mod tests {
         assert_eq!(format_mini_bar(50.0, 100.0, 10), "[━━━━━─────]");
         assert_eq!(format_mini_bar(100.0, 100.0, 10), "[━━━━━━━━━━]");
         assert_eq!(format_mini_bar(0.0, 0.0, 10), "");
+    }
+
+    #[test]
+    fn test_detail_dock_never_clips_mid_word_and_honors_active_theme() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut anime = Anime::default();
+        anime.id = 154587;
+        anime.title_romaji = "Sousou no Frieren".to_string();
+        anime.title_english = Some("Frieren: Beyond Journey's End".to_string());
+        anime.episodes = Some(28);
+        anime.genres = serde_json::to_string(&vec!["Adventure", "Drama", "Fantasy"]).unwrap();
+
+        let mut state = AppState::new();
+        state.theme_index = 6; // Lain Wired Y2K (phosphor green)
+        state.ambilight_enabled = false;
+        state.open_detail(anime);
+
+        for (w, h) in [(100u16, 36u16), (132u16, 40u16)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &mut state)).unwrap();
+
+            let buf = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let cell = &buf[(x, y)];
+                    assert_ne!(cell.fg, Color::Rgb(180, 0, 255), "unexpected hardcoded purple fg at ({x},{y})");
+                    assert_ne!(cell.bg, Color::Rgb(180, 0, 255), "unexpected hardcoded purple bg at ({x},{y})");
+                    text.push_str(cell.symbol());
+                }
+                text.push('\n');
+            }
+            assert!(text.contains("PLAYBACK"), "missing PLAYBACK dock row");
+            assert!(text.contains("BROWSER "), "missing BROWSER dock row");
+            assert!(text.contains("[?] Help"), "Help must never clip mid-word at width {w}");
+            assert!(!text.contains("? He "), "must not slice '? Help'");
+            assert!(text.contains("Lain Wired Y2K"), "top bar must display active theme name");
+        }
     }
 }

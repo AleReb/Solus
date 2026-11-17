@@ -15,6 +15,7 @@ use crate::state::AppState;
 pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(84, 70, frame.area());
     frame.render_widget(Clear, area);
+    let theme = state.theme();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -61,7 +62,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Line::from(vec![
             Span::styled(
                 "  ",
-                Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 title_line,
@@ -72,23 +73,23 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Span::styled(era_text, era_style),
         ]),
         Line::from(vec![
-            Span::styled(" Player: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled(" Player: ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format!(" {} ", state.selected_player().as_str()),
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(140, 30, 200))
+                    .fg(Color::Black)
+                    .bg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled("([p] toggle)", Style::default().fg(Color::Rgb(120, 120, 135))),
+            Span::styled("([p] toggle)", Style::default().fg(theme.text_dim)),
             Span::raw("   "),
-            Span::styled("Audio: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled("Audio: ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format!(" {} ", audio_label),
                 Style::default()
-                    .fg(Color::White)
-                    .bg(if state.pending_dub { Color::Rgb(120, 40, 180) } else { Color::Rgb(40, 40, 60) })
+                    .fg(if state.pending_dub { Color::Black } else { Color::White })
+                    .bg(if state.pending_dub { theme.secondary } else { theme.border_idle })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -98,23 +99,23 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 } else {
                     "([a] toggle)"
                 },
-                Style::default().fg(if state.dub_available == Some(false) { Color::Rgb(220, 120, 80) } else { Color::Rgb(120, 120, 135) }),
+                Style::default().fg(if state.dub_available == Some(false) { Color::Rgb(220, 120, 80) } else { theme.text_dim }),
             ),
             Span::raw("   "),
-            Span::styled("Anime4K: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled("Anime4K: ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format!(" {} ", state.anime4k_mode.as_str()),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(if state.anime4k_mode == crate::config::Anime4KMode::Ultra { Color::Black } else { Color::White })
                     .bg(match state.anime4k_mode {
-                        crate::config::Anime4KMode::Off => Color::Rgb(50, 50, 65),
+                        crate::config::Anime4KMode::Off => theme.border_idle,
                         crate::config::Anime4KMode::Balanced => Color::Rgb(40, 120, 180),
-                        crate::config::Anime4KMode::Ultra => Color::Rgb(180, 0, 255),
+                        crate::config::Anime4KMode::Ultra => theme.primary,
                     })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled("([u] toggle)", Style::default().fg(Color::Rgb(120, 120, 135))),
+            Span::styled("([u] toggle)", Style::default().fg(theme.text_dim)),
         ]),
     ])
     .block(
@@ -122,12 +123,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             .title(Span::styled(
                 "  Playback Configuration ",
                 Style::default()
-                    .fg(Color::Rgb(180, 0, 255))
+                    .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(180, 0, 255))),
+            .border_style(Style::default().fg(theme.border_focus)),
     );
     frame.render_widget(header, chunks[0]);
 
@@ -145,9 +146,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     // ── Col 0: Media Player Selection ────────────────────────────────────
     let pl_focused = state.playback_focus_column == 0;
     let pl_border_style = if pl_focused {
-        Style::default().fg(Color::Rgb(180, 0, 255))
+        Style::default().fg(theme.border_focus)
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 100))
+        Style::default().fg(theme.border_idle)
     };
 
     let pl_block = Block::default()
@@ -190,9 +191,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             };
 
             let radio_style = if is_selected {
-                Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Rgb(100, 100, 115))
+                Style::default().fg(theme.text_dim)
             };
 
             ListItem::new(Line::from(vec![
@@ -208,9 +209,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     // ── Col 1: Streaming Provider Selection ──────────────────────────────
     let p_focused = state.playback_focus_column == 1;
     let p_border_style = if p_focused {
-        Style::default().fg(Color::Rgb(180, 0, 255))
+        Style::default().fg(theme.border_focus)
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 100))
+        Style::default().fg(theme.border_idle)
     };
 
     let p_block = Block::default()
@@ -251,9 +252,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     Style::default().fg(Color::Rgb(160, 160, 175))
                 };
                 let radio_style = if is_selected {
-                    Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(100, 100, 115))
+                    Style::default().fg(theme.text_dim)
                 };
                 let label = if is_unsupported_dub {
                     format!("{} (No Dub)", provider.name)
@@ -274,9 +275,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     // ── Col 2: Quality Selection ──────────────────────────────────────────
     let q_focused = state.playback_focus_column == 2;
     let q_border_style = if q_focused {
-        Style::default().fg(Color::Rgb(180, 0, 255))
+        Style::default().fg(theme.border_focus)
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 100))
+        Style::default().fg(theme.border_idle)
     };
 
     let q_block = Block::default()
@@ -296,12 +297,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Line::from(""),
             Line::from(Span::styled(
                 "  󰑮 Detecting resolutions...",
-                Style::default().fg(Color::Rgb(180, 0, 255)),
+                Style::default().fg(theme.primary),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Verifying stream codecs...",
-                Style::default().fg(Color::Rgb(130, 130, 145)),
+                Style::default().fg(theme.text_dim),
             )),
         ]);
         frame.render_widget(loading_q, q_inner);
@@ -330,9 +331,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     Style::default().fg(Color::Rgb(160, 160, 175))
                 };
                 let radio_style = if is_selected {
-                    Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(100, 100, 115))
+                    Style::default().fg(theme.text_dim)
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
@@ -348,9 +349,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     // ── Col 3: Subtitle Language Selection ───────────────────────────────
     let sub_focused = state.playback_focus_column == 3;
     let sub_border_style = if sub_focused {
-        Style::default().fg(Color::Rgb(180, 0, 255))
+        Style::default().fg(theme.border_focus)
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 100))
+        Style::default().fg(theme.border_idle)
     };
 
     let sub_block = Block::default()
@@ -370,12 +371,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Line::from(""),
             Line::from(Span::styled(
                 "  󰑮 Detecting stream languages...",
-                Style::default().fg(Color::Rgb(180, 0, 255)),
+                Style::default().fg(theme.primary),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Checking available subtitle tracks...",
-                Style::default().fg(Color::Rgb(130, 130, 145)),
+                Style::default().fg(theme.text_dim),
             )),
         ]);
         frame.render_widget(loading_p, sub_inner);
@@ -395,9 +396,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     Style::default().fg(Color::Rgb(170, 170, 185))
                 };
                 let radio_style = if is_selected {
-                    Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(100, 100, 115))
+                    Style::default().fg(theme.text_dim)
                 };
 
                 ListItem::new(Line::from(vec![
@@ -415,26 +416,26 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw(" Launch  "),
-        Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Column  "),
-        Span::styled(" 1-4 ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" 1-4 ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Jump  "),
-        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Select  "),
-        Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" p ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Player  "),
-        Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
-        Span::styled(" u ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" u ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Anime4K  "),
-        Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 65))),
+        Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(theme.border_idle)),
         Span::raw(" Back"),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(180, 0, 255))),
+            .border_style(Style::default().fg(theme.border_focus)),
     );
     frame.render_widget(footer, chunks[2]);
 }

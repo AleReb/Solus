@@ -742,7 +742,7 @@ impl AppState {
             active_download:  None,
             anime_mal_ids:    HashMap::new(),
             ambilight_theme:  None,
-            ambilight_enabled: true,
+            ambilight_enabled: false,
             anime4k_mode:     crate::config::Anime4KMode::Off,
             analytics_data:   None,
             analytics_podium_idx: 0,
@@ -856,13 +856,22 @@ impl AppState {
                 let key = (anime_id, cols, rows);
                 if !self.fitted_cover_cache.contains_key(&key) {
                     if let Some(raw) = self.cover_raw_cache.get(&anime_id) {
-                        let fitted = crate::ui::components::cover::scale_to_frame_cover(
-                            raw.clone(),
-                            cols,
-                            rows,
-                            picker.font_size,
-                            upper_bias,
-                        );
+                        let fitted = if raw.width() > raw.height() {
+                            crate::ui::components::cover::scale_to_frame_contain(
+                                raw.clone(),
+                                cols,
+                                rows,
+                                picker.font_size,
+                            )
+                        } else {
+                            crate::ui::components::cover::scale_to_frame_cover(
+                                raw.clone(),
+                                cols,
+                                rows,
+                                picker.font_size,
+                                upper_bias,
+                            )
+                        };
                         let proto =
                             crate::ui::components::cover::build_stateful_protocol(picker, fitted);
                         self.fitted_cover_cache.insert(key, proto);
@@ -1817,5 +1826,22 @@ mod tests {
         picker.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
         state.picker = Some(picker);
         assert!(state.has_image_support());
+    }
+
+    #[test]
+    fn test_resolve_cover_protocol_caches_per_card_dimensions_without_right_gap() {
+        let mut state = AppState::new();
+        let mut picker = Picker::new((12, 24));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+        state.picker = Some(picker);
+        state.cover_raw_cache.insert(
+            77,
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(400, 580)),
+        );
+
+        assert!(state.resolve_cover_protocol(77, 16, 11, 0.20, true).is_some());
+        assert!(state.resolve_cover_protocol(77, 19, 11, 0.20, true).is_some());
+        assert!(state.fitted_cover_cache.contains_key(&(77, 16, 11)));
+        assert!(state.fitted_cover_cache.contains_key(&(77, 19, 11)));
     }
 }

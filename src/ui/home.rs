@@ -15,7 +15,10 @@ use crate::{
     db::{cache::Anime, user::WatchlistSource},
     services::tailored::clean_synopsis_single_line,
     state::{AppState, CategoryRow, Screen, WatchlistPromptMode},
-    ui::components::cover::HalfblockCover,
+    ui::components::{
+        cover::HalfblockCover,
+        dock::{build_dock_row_plan, DockChip, DockRowPlan},
+    },
 };
 
 /// Width of each anime card in the row (chars)
@@ -429,217 +432,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-#[derive(Clone)]
-struct DockChip {
-    icon: &'static str,
-    key: &'static str,
-    label: String,
-    key_color: Color,
-    label_color: Color,
-    priority: u8,
-    bg: Option<Color>,
-    action: Option<HomeFooterAction>,
-}
-
-impl DockChip {
-    fn width(&self) -> usize {
-        let icon_w = if self.icon.is_empty() {
-            0
-        } else {
-            self.icon.chars().count() + 1
-        };
-        let key_w = self.key.chars().count();
-        let lbl_w = if self.label.is_empty() {
-            0
-        } else {
-            1 + self.label.chars().count()
-        };
-        let pad = if self.bg.is_some() { 2 } else { 0 };
-        icon_w + key_w + lbl_w + pad
-    }
-
-    fn push_spans(&self, spans: &mut Vec<Span<'static>>) {
-        if let Some(bg_col) = self.bg {
-            let mut text = String::from(" ");
-            if !self.icon.is_empty() {
-                text.push_str(self.icon);
-                text.push(' ');
-            }
-            text.push_str(self.key);
-            if !self.label.is_empty() {
-                text.push(' ');
-                text.push_str(&self.label);
-            }
-            text.push(' ');
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .fg(self.key_color)
-                    .bg(bg_col)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            return;
-        }
-
-        if !self.icon.is_empty() {
-            spans.push(Span::styled(
-                format!("{} ", self.icon),
-                Style::default().fg(self.key_color),
-            ));
-        }
-        spans.push(Span::styled(
-            self.key.to_string(),
-            Style::default().fg(self.key_color).add_modifier(Modifier::BOLD),
-        ));
-        if !self.label.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", self.label),
-                Style::default().fg(self.label_color),
-            ));
-        }
-    }
-}
-
-struct DockRowPlan {
-    line: Line<'static>,
-    hitboxes: Vec<(u16, u16, HomeFooterAction)>,
-}
-
-fn build_dock_row_plan(
-    badge_text: &str,
-    badge_fg: Color,
-    badge_bg: Color,
-    left_candidates: Vec<DockChip>,
-    right_candidates: Vec<DockChip>,
-    width: usize,
-) -> DockRowPlan {
-    let badge_w = badge_text.chars().count();
-    let gutter_w = if width >= 116 { 2usize } else { 1usize };
-    let gutter_str = if gutter_w == 2 { "  " } else { " " };
-    let trailing_w = 1usize;
-
-    // 1. Fit right-pinned cluster first (ordered highest priority last or explicit keep order)
-    let mut right_chosen = select_chips_by_priority(&right_candidates, width.saturating_sub(badge_w + 4), gutter_w);
-    if right_chosen.is_empty() && !right_candidates.is_empty() {
-        // Guarantee at least the highest-priority rightmost control if very narrow
-        if let Some(top) = right_candidates.iter().min_by_key(|c| c.priority) {
-            if badge_w + 3 + top.width() + trailing_w <= width {
-                right_chosen.push(top.clone());
-            }
-        }
-    }
-
-    let right_w: usize = if right_chosen.is_empty() {
-        0
-    } else {
-        right_chosen.iter().map(DockChip::width).sum::<usize>()
-            + gutter_w * right_chosen.len().saturating_sub(1)
-            + trailing_w
-    };
-
-    // 2. Fit left cluster strictly inside remaining budget so zero right-edge clipping can occur
-    let badge_gap = if width >= badge_w + 2 { 2usize } else { 0usize };
-    let min_center_gap = if right_w > 0 { gutter_w.max(2) } else { 0usize };
-    let left_budget = width.saturating_sub(badge_w + badge_gap + min_center_gap + right_w);
-    let left_chosen = select_chips_by_priority(&left_candidates, left_budget, gutter_w);
-
-    let left_w: usize = if left_chosen.is_empty() {
-        0
-    } else {
-        left_chosen.iter().map(DockChip::width).sum::<usize>()
-            + gutter_w * left_chosen.len().saturating_sub(1)
-    };
-
-    let center_gap = width.saturating_sub(badge_w + badge_gap + left_w + right_w);
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hitboxes: Vec<(u16, u16, HomeFooterAction)> = Vec::new();
-    let mut cursor_x = 0usize;
-
-    spans.push(Span::styled(
-        badge_text.to_string(),
-        Style::default()
-            .fg(badge_fg)
-            .bg(badge_bg)
-            .add_modifier(Modifier::BOLD),
-    ));
-    cursor_x += badge_w;
-
-    if badge_gap > 0 {
-        spans.push(Span::raw("  "));
-        cursor_x += badge_gap;
-    }
-
-    for (idx, chip) in left_chosen.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw(gutter_str));
-            cursor_x += gutter_w;
-        }
-        let w = chip.width();
-        if let Some(act) = chip.action {
-            hitboxes.push((cursor_x as u16, (cursor_x + w) as u16, act));
-        }
-        chip.push_spans(&mut spans);
-        cursor_x += w;
-    }
-
-    if center_gap > 0 {
-        spans.push(Span::raw(" ".repeat(center_gap)));
-        cursor_x += center_gap;
-    }
-
-    for (idx, chip) in right_chosen.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw(gutter_str));
-            cursor_x += gutter_w;
-        }
-        let w = chip.width();
-        if let Some(act) = chip.action {
-            hitboxes.push((cursor_x as u16, (cursor_x + w) as u16, act));
-        }
-        chip.push_spans(&mut spans);
-        cursor_x += w;
-    }
-
-    if !right_chosen.is_empty() {
-        spans.push(Span::raw(" "));
-    }
-
-    DockRowPlan {
-        line: Line::from(spans),
-        hitboxes,
-    }
-}
-
-/// Select highest-priority chips (`priority` 0 first) that fit cleanly inside `budget`, preserving display order.
-fn select_chips_by_priority(candidates: &[DockChip], budget: usize, sep_w: usize) -> Vec<DockChip> {
-    if budget == 0 || candidates.is_empty() {
-        return Vec::new();
-    }
-    let mut order: Vec<usize> = (0..candidates.len()).collect();
-    order.sort_by_key(|&i| (candidates[i].priority, i));
-
-    let mut chosen = vec![false; candidates.len()];
-    let mut used = 0usize;
-    let mut count = 0usize;
-
-    for idx in order {
-        let extra = candidates[idx].width() + if count > 0 { sep_w } else { 0 };
-        if used + extra <= budget {
-            chosen[idx] = true;
-            used += extra;
-            count += 1;
-        }
-    }
-
-    candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| if chosen[i] { Some(c.clone()) } else { None })
-        .collect()
-}
-
-fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockRowPlan) {
+fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan<HomeFooterAction>, DockRowPlan<HomeFooterAction>) {
     let theme = state.theme();
     let emerald = Color::Rgb(80, 250, 123);
 
@@ -712,7 +505,7 @@ fn build_footer_dock_rows(state: &AppState, width: usize) -> (DockRowPlan, DockR
     ];
 
     // If room permits cleanly, include Update chip inside Row 1 status or Remote right cluster
-    let mut explore_right: Vec<DockChip> = Vec::new();
+    let mut explore_right: Vec<DockChip<HomeFooterAction>> = Vec::new();
     if let Some(ref track) = state.now_playing {
         let short_track: String = track.chars().take(18).collect();
         explore_right.push(DockChip {
@@ -1670,8 +1463,8 @@ fn fit_watchlist_slice(
     show_dividers: bool,
     data: &HomeData,
 ) -> (usize, u16) {
-    let min_card_w: u16 = 20;
-    let max_card_w: u16 = 25;
+    let min_card_w: u16 = CARD_WIDTH;
+    let max_card_w: u16 = 21;
     let avail = data.watchlist.len().saturating_sub(start);
     if avail == 0 || usable_w < min_card_w {
         return (1.min(avail), usable_w.min(max_card_w));
@@ -2071,7 +1864,14 @@ fn render_card_with_source(
     let cover_occluded = active_modal_rect(frame.area(), state)
         .is_some_and(|m| m.intersects(cover_inner));
     if state.has_image_support() && !cover_occluded {
-        if let Some(cover) = state.cover_cache.get_mut(&anime.id) {
+        let default_inner_w = CARD_WIDTH.saturating_sub(2);
+        let default_inner_h = CARD_FRAME_HEIGHT.saturating_sub(2);
+        let fitted = if cover_inner.width == default_inner_w && cover_inner.height == default_inner_h {
+            state.cover_cache.get_mut(&anime.id)
+        } else {
+            state.resolve_cover_protocol(anime.id, cover_inner.width, cover_inner.height, 0.20, true)
+        };
+        if let Some(cover) = fitted {
             frame.render_stateful_widget(
                 crate::ui::components::cover::hd_image_widget(),
                 cover_inner,

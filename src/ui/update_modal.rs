@@ -20,9 +20,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(64, 45, frame.area());
     frame.render_widget(Clear, area);
 
-    let _theme = state.theme();
+    let theme = state.theme();
     let border_color = match phase {
-        UpdateModalPhase::Available { .. } => Color::Rgb(180, 0, 255),
+        UpdateModalPhase::Available { .. } => theme.primary,
         UpdateModalPhase::Downloading { .. } => Color::Rgb(0, 210, 255),
         UpdateModalPhase::RestartRequired { .. } => Color::Rgb(0, 255, 136),
         UpdateModalPhase::Failed { .. } => Color::Rgb(255, 80, 80),
