@@ -1485,16 +1485,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Event::Paste(text) => {
-                    if state.screen == Screen::QueueModal
-                        && state.playlist_transfer_mode.is_some()
-                        && state.playlist_transfer_choice == 1
-                    {
-                        state.playlist_transfer_input.push_str(&text);
-                        state.playlist_transfer_error = None;
-                        let path = services::queue::clean_user_path(&state.playlist_transfer_input);
-                        state.playlist_import_candidates = services::queue::scan_portable_playlists_in_dir(&path);
-                        state.playlist_import_cursor = 0;
-                        needs_redraw = true;
+                    if state.screen == Screen::QueueModal && state.playlist_transfer_mode.is_some() {
+                        let pasted = text
+                            .trim()
+                            .replace('\r', "")
+                            .replace('\n', " ");
+                        if !pasted.is_empty() {
+                            state.playlist_transfer_choice = 1;
+                            state.playlist_transfer_input = pasted;
+                            state.playlist_transfer_error = None;
+                            let path = services::queue::clean_user_path(&state.playlist_transfer_input);
+                            state.playlist_import_candidates =
+                                services::queue::scan_portable_playlists_in_dir(&path);
+                            state.playlist_import_cursor = 0;
+                            needs_redraw = true;
+                        }
                     }
                 }
                 Event::Resize(_, _) => {

@@ -781,8 +781,19 @@ fn render_saved_playlists_pane(
     frame.render_widget(Paragraph::new(p_lines), preview_inner);
 }
 
+fn transfer_modal_rect(area: Rect) -> Rect {
+    let width = (area.width.saturating_mul(68)).saturating_div(100).clamp(62, 96);
+    let height = if area.height >= 34 { 14 } else { area.height.saturating_sub(4).clamp(11, 14) };
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 pub fn render_playlist_transfer_modal(frame: &mut Frame, state: &AppState) {
-    let area = centered_rect(82, 70, frame.area());
+    let area = transfer_modal_rect(frame.area());
     frame.render_widget(Clear, area);
     let theme = state.theme();
     let title = match &state.playlist_transfer_mode {
@@ -819,7 +830,7 @@ pub fn render_playlist_transfer_modal(frame: &mut Frame, state: &AppState) {
         }
         Some(crate::services::queue::PlaylistTransferKind::Import) => {
             lines.push(Line::from(Span::styled(format!("      {} pack(s) found", state.playlist_import_candidates.len()), Style::default().fg(if state.playlist_import_candidates.is_empty() { FG_MUTED } else { EMERALD }))));
-            let visible = (inner.height as usize).saturating_sub(10).max(1).min(4);
+            let visible = (inner.height as usize).saturating_sub(8).max(1).min(2);
             for (idx, (_, pack)) in state.playlist_import_candidates.iter().enumerate().take(visible) {
                 let selected = default_selected && idx == state.playlist_import_cursor;
                 lines.push(Line::from(vec![
@@ -836,11 +847,17 @@ pub fn render_playlist_transfer_modal(frame: &mut Frame, state: &AppState) {
         Span::styled(if custom_selected { " ▶ " } else { "   " }, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::styled("[2] Custom Path (Paste file or folder)", Style::default().fg(if custom_selected { Color::White } else { FG_MUTED }).add_modifier(if custom_selected { Modifier::BOLD } else { Modifier::empty() })),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled("      ╭─ ", Style::default().fg(theme.divider)),
-        Span::styled(format!("{}{}", truncate_middle_path(&state.playlist_transfer_input, budget), if custom_selected { "_" } else { "" }), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" ─╮", Style::default().fg(theme.divider)),
-    ]));
+    if custom_selected {
+        let field = if state.playlist_transfer_input.is_empty() {
+            "Paste or type a .json file or folder path".to_string()
+        } else {
+            truncate_middle_path(&state.playlist_transfer_input, budget.saturating_sub(12))
+        };
+        lines.push(Line::from(vec![
+            Span::styled("      Path: ", Style::default().fg(FG_MUTED)),
+            Span::styled(format!("[ {}{} ]", field, "_"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]));
+    }
 
     match &state.playlist_transfer_mode {
         Some(crate::services::queue::PlaylistTransferKind::Export { name, .. }) if custom_selected => {
