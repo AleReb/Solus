@@ -142,6 +142,20 @@ pub fn format_y2k_loader_osd(elapsed_ms: u64) -> String {
     )
 }
 
+/// Format an ASS `osd-overlay` vector bar positioned directly inside the 1280x720 loading card's bar track.
+pub fn format_loader_ass_overlay(elapsed_ms: u64) -> String {
+    // Smoothly advance 0% -> 95% over 2.5s, then pulse gently while waiting for first video frame
+    let pct = if elapsed_ms < 2500 {
+        (elapsed_ms as f64 / 2500.0) * 0.95
+    } else {
+        0.95
+    };
+    let bar_w = ((568.0 * pct).round() as u32).clamp(16, 568);
+    format!(
+        "{{\\an7\\pos(600,398)\\p1\\bord0\\shad0\\1c&HFFFFFF&}}m 0 0 l {bar_w} 0 l {bar_w} 14 l 0 14{{\\p0}}"
+    )
+}
+
 /// Helper to parse property change data from mpv JSON-RPC.
 pub fn parse_property_change(line: &str) -> Option<(String, f64)> {
     let parsed: Value = serde_json::from_str(line).ok()?;
@@ -437,10 +451,12 @@ where
             }
             _ = loader_tick.tick(), if in_loading_screen => {
                 let elapsed_ms = loader_start.elapsed().as_millis() as u64;
-                let osd_text = format_y2k_loader_osd(elapsed_ms);
-                let osd_cmd = serde_json::json!({ "command": ["show-text", osd_text, 250] });
+                let ass_data = format_loader_ass_overlay(elapsed_ms);
+                let osd_cmd = serde_json::json!({
+                    "command": ["osd-overlay", 1, "ass-events", ass_data, 1280, 720]
+                });
                 let _ = writer_half.write_all(format!("{osd_cmd}\n").as_bytes()).await;
-                if elapsed_ms >= 900 && !switched_to_stream {
+                if elapsed_ms >= 1500 && !switched_to_stream {
                     switched_to_stream = true;
                     let _ = writer_half.write_all(b"{\"command\":[\"playlist-next\"]}\n").await;
                 }
@@ -462,7 +478,7 @@ where
                         if let Some((ref name, val)) = parse_property_change(&line) {
                             if name == "time-pos" && val > 0.05 {
                                 in_loading_screen = false;
-                                let _ = writer_half.write_all(b"{\"command\":[\"show-text\",\"\",1]}\n").await;
+                                let _ = writer_half.write_all(b"{\"command\":[\"osd-overlay\",1,\"none\",\"\"]}\n").await;
                                 let _ = writer_half.flush().await;
                             } else {
                                 continue;
