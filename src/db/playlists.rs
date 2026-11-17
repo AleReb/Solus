@@ -5,6 +5,25 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
+/// Truncate `text` to at most `max_chars` without splitting a word mid-word.
+fn truncate_word_boundary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let budget = max_chars - 1;
+    let slice: String = trimmed.chars().take(budget).collect();
+    if let Some(last_space) = slice.rfind(char::is_whitespace) {
+        if last_space >= budget / 2 {
+            return format!("{}…", slice[..last_space].trim_end());
+        }
+    }
+    format!("{}…", slice.trim_end())
+}
+
 /// Metadata summary for a saved playlist belonging to a user profile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedPlaylistSummary {
@@ -163,7 +182,7 @@ pub async fn list_playlists_for_profile(
             .map(|r| {
                 let t: String = r.get("title");
                 let ep: i64 = r.get("episode");
-                let short: String = t.chars().take(16).collect();
+                let short = truncate_word_boundary(&t, 18);
                 format!("{} E{}", short, ep.max(1))
             })
             .collect();

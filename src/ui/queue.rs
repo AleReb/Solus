@@ -56,8 +56,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
-/// Strictly clamp `text` to `max_chars` (appending `…` when truncated) so adjacent
-/// badges/columns always keep clean whitespace separation with zero concatenation.
+/// Strictly clamp `text` to `max_chars` (appending `…` at a clean word boundary when truncated)
+/// so adjacent badges/columns always keep clean whitespace separation with zero concatenation.
 pub fn clamp_text(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -69,9 +69,45 @@ pub fn clamp_text(text: &str, max_chars: usize) -> String {
     if max_chars == 1 {
         return "…".to_string();
     }
-    let mut out: String = text.chars().take(max_chars - 1).collect();
-    out.push('…');
-    out
+    let budget = max_chars - 1;
+    let slice: String = text.chars().take(budget).collect();
+    if let Some(last_space) = slice.rfind(char::is_whitespace) {
+        if last_space >= budget / 2 {
+            let clean = slice[..last_space].trim_end();
+            if !clean.is_empty() {
+                return format!("{}…", clean);
+            }
+        }
+    }
+    format!("{}…", slice.trim_end())
+}
+
+/// Map a subtitle language name/keyword to a crisp uppercase 3-letter badge (never mid-word clipped).
+fn short_lang_code(lang: &str) -> String {
+    let lower = lang.trim().to_lowercase();
+    if lower.starts_with("eng") || lower == "en" {
+        "ENG".to_string()
+    } else if lower.starts_with("ara") || lower == "ar" {
+        "ARA".to_string()
+    } else if lower.starts_with("spa") || lower == "es" {
+        "SPA".to_string()
+    } else if lower.starts_with("fre") || lower.starts_with("fra") || lower == "fr" {
+        "FRE".to_string()
+    } else if lower.starts_with("ger") || lower.starts_with("deu") || lower == "de" {
+        "GER".to_string()
+    } else if lower.starts_with("por") || lower == "pt" {
+        "POR".to_string()
+    } else if lower.starts_with("ind") || lower == "id" {
+        "IND".to_string()
+    } else if lower.starts_with("rus") || lower == "ru" {
+        "RUS".to_string()
+    } else if lower.starts_with("ita") || lower == "it" {
+        "ITA".to_string()
+    } else if lower.starts_with("tur") || lower == "tr" {
+        "TUR".to_string()
+    } else {
+        lang.trim().chars().take(3).collect::<String>().to_uppercase()
+    }
 }
 
 fn current_unix() -> u64 {
@@ -688,7 +724,7 @@ fn render_saved_playlists_pane(
             let selected = editing_items && i == state.playlist_item_cursor;
             let row_bg = if selected { BG_CARD_ACTIVE } else { BG_MODAL };
             let mode = if it.dub { "DUB" } else { "SUB" };
-            let sub_short: String = it.sub_lang.chars().take(3).collect();
+            let sub_short = short_lang_code(&it.sub_lang);
             let right_meta = format!("{} · {} · {}", mode, it.quality, sub_short);
             let ep_tag = format!(" · E{:02}", it.episode);
             let prefix = if selected {
@@ -1005,8 +1041,8 @@ mod tests {
     fn test_clamp_text_prevents_overflow_and_preserves_ellipsis() {
         assert_eq!(clamp_text("Frieren", 10), "Frieren");
         let clamped = clamp_text("Sousou no Frieren Beyond Journeys End", 14);
-        assert_eq!(clamped.chars().count(), 14);
-        assert!(clamped.ends_with('…'));
+        assert!(clamped.chars().count() <= 14);
+        assert_eq!(clamped, "Sousou no…");
     }
 
     #[test]

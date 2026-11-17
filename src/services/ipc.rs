@@ -335,47 +335,47 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     let sock_path_for_cleanup = config.sock_path.clone();
     set_active_socket_path(Some(config.sock_path.clone()));
 
-    // Fetch AniSkip intervals in parallel while waiting for mpv's IPC socket so
-    // player startup is never blocked by AniList / AniSkip network round trips.
-    let connect_fut = async {
-        for _ in 0..150 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Some(s) = connect_ipc(&config.sock_path).await {
-                return Some(s);
-            }
-        }
-        None
-    };
+    // Spawn AniSkip resolution completely in the background so IPC connection and
+    // loading-screen animation / playlist-next never stall waiting on network calls.
+    let (skip_tx, skip_rx) = tokio::sync::oneshot::channel::<Vec<SkipResult>>();
+    if config.skip_intervals.is_empty() && config.auto_skip_intro {
+        let mal_hint = config.mal_id;
+        let aid = config.anime_id;
+        let ep = config.episode;
+        let tx_app = config.tx.clone();
+        tokio::spawn(async move {
+            let mid = if let Some(m) = mal_hint {
+                Some(m)
+            } else {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(4))
+                    .build()
+                    .unwrap_or_default();
+                let resolved = crate::api::anilist::resolve_mal_id(&client, aid).await;
+                if let Some(m) = resolved {
+                    let _ = tx_app.send(AppMessage::AnimeMalIdReady(aid, m)).await;
+                }
+                resolved
+            };
+            let skips = if let Some(m) = mid {
+                crate::api::aniskip::fetch_skip_times(m, ep).await
+            } else {
+                Vec::new()
+            };
+            let _ = skip_tx.send(skips);
+        });
+    } else {
+        let _ = skip_tx.send(Vec::new());
+    }
 
-    let aniskip_fut = async {
-        if !config.skip_intervals.is_empty() || !config.auto_skip_intro {
-            return None;
+    let mut stream = None;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if let Some(s) = connect_ipc(&config.sock_path).await {
+            stream = Some(s);
+            break;
         }
-        let mid = if let Some(m) = config.mal_id {
-            Some(m)
-        } else {
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(4))
-                .build()
-                .unwrap_or_default();
-            let resolved = crate::api::anilist::resolve_mal_id(&client, config.anime_id).await;
-            if let Some(m) = resolved {
-                let _ = config.tx.send(AppMessage::AnimeMalIdReady(config.anime_id, m)).await;
-            }
-            resolved
-        };
-        if let Some(m) = mid {
-            Some(crate::api::aniskip::fetch_skip_times(m, config.episode).await)
-        } else {
-            None
-        }
-    };
-
-    let (stream, fetched_skips) = tokio::join!(connect_fut, aniskip_fut);
-    let mut config = config;
-    if let Some(skips) = fetched_skips {
-        config.skip_intervals = skips;
     }
 
     let stream = match stream {
@@ -391,15 +391,18 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
         }
     };
 
-    drive_ipc_stream(stream, config).await;
+    drive_ipc_stream(stream, config, skip_rx).await;
 
     // Clean up socket file
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock_path_for_cleanup);
 }
 
-async fn drive_ipc_stream<S>(stream: S, config: IpcMonitorConfig)
-where
+async fn drive_ipc_stream<S>(
+    stream: S,
+    config: IpcMonitorConfig,
+    mut skip_rx: tokio::sync::oneshot::Receiver<Vec<SkipResult>>,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let IpcMonitorConfig {
@@ -411,7 +414,7 @@ where
         tx,
         auth,
         trackers,
-        skip_intervals,
+        mut skip_intervals,
         auto_skip_intro,
         has_loading_screen,
         playback_exit_kind,
@@ -445,13 +448,23 @@ where
     let mut last_audio_tracks: Vec<crate::services::remote::RemoteAudioTrack> = Vec::new();
     let mut in_loading_screen = has_loading_screen;
     let mut switched_to_stream = false;
+    let mut retried_playlist_next = false;
     let mut stream_started = !has_loading_screen;
+    let mut skip_rx_pending = true;
     let loader_start = tokio::time::Instant::now();
     let mut loader_tick = tokio::time::interval(Duration::from_millis(120));
 
     loop {
         tokio::select! {
             biased;
+            skip_res = &mut skip_rx, if skip_rx_pending => {
+                skip_rx_pending = false;
+                if let Ok(skips) = skip_res {
+                    if skip_intervals.is_empty() && !skips.is_empty() {
+                        skip_intervals = skips;
+                    }
+                }
+            }
             cmd_opt = cmd_rx.recv() => {
                 match cmd_opt {
                     Some(cmd_payload) => {
@@ -478,6 +491,9 @@ where
                 let _ = writer_half.write_all(format!("{osd_cmd}\n").as_bytes()).await;
                 if elapsed_ms >= 1500 && !switched_to_stream {
                     switched_to_stream = true;
+                    let _ = writer_half.write_all(b"{\"command\":[\"playlist-next\"]}\n").await;
+                } else if elapsed_ms >= 3200 && !stream_started && !retried_playlist_next {
+                    retried_playlist_next = true;
                     let _ = writer_half.write_all(b"{\"command\":[\"playlist-next\"]}\n").await;
                 }
                 let _ = writer_half.flush().await;
@@ -764,8 +780,10 @@ mod tests {
             playback_exit_kind: None,
         };
 
+        let (skip_tx, skip_rx) = tokio::sync::oneshot::channel();
+        let _ = skip_tx.send(Vec::new());
         let task = tokio::spawn(async move {
-            drive_ipc_stream(client_io, config).await;
+            drive_ipc_stream(client_io, config, skip_rx).await;
         });
 
         let (server_read, _server_write) = tokio::io::split(server_io);

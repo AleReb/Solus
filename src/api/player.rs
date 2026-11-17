@@ -716,7 +716,7 @@ pub fn build_mpv_direct_args(
         .is_some_and(|p| !p.trim().is_empty());
 
     if has_loading {
-        args.push("--image-display-duration=inf".to_string());
+        args.push("--image-display-duration=4".to_string());
         args.push("--prefetch-playlist=yes".to_string());
         args.push("--loop-playlist=no".to_string());
         if let Some(ref loading_img) = opts.loading_image {
@@ -1333,7 +1333,7 @@ mod tests {
             Some(&yt_conf),
         );
         assert!(args.contains(&"--prefetch-playlist=yes".to_string()));
-        assert!(args.contains(&"--image-display-duration=inf".to_string()));
+        assert!(args.contains(&"--image-display-duration=4".to_string()));
         assert!(args.contains(&"--input-conf=/tmp/youtube-input.conf".to_string()));
         assert!(args.contains(&"--audio-file=https://cdn.example.com/hls/v1/master.m3u8".to_string()));
         let first_group = args.iter().position(|a| a == "--{").unwrap();
