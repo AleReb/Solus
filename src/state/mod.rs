@@ -623,6 +623,14 @@ pub struct AppState {
     pub queue_save_mode:         bool,
     pub queue_save_input:        String,
 
+    /// Unified playlist export/import transfer modal (`[w]` / `[i]`).
+    pub playlist_transfer_mode: Option<crate::services::queue::PlaylistTransferKind>,
+    pub playlist_transfer_choice: usize,
+    pub playlist_transfer_input: String,
+    pub playlist_transfer_error: Option<String>,
+    pub playlist_import_candidates: Vec<(std::path::PathBuf, crate::services::queue::PortablePlaylist)>,
+    pub playlist_import_cursor: usize,
+
     /// Detail Screen Batch Quick-Queue modal (`[E]`)
     pub is_batch_queue_modal_open: bool,
     pub batch_queue_mode:          usize,
@@ -811,6 +819,12 @@ impl AppState {
             playlist_item_cursor: 0,
             queue_save_mode: false,
             queue_save_input: String::new(),
+            playlist_transfer_mode: None,
+            playlist_transfer_choice: 0,
+            playlist_transfer_input: String::new(),
+            playlist_transfer_error: None,
+            playlist_import_candidates: Vec::new(),
+            playlist_import_cursor: 0,
             is_batch_queue_modal_open: false,
             batch_queue_mode: 0,
             batch_queue_range: String::new(),

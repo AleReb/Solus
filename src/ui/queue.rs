@@ -82,6 +82,17 @@ pub fn clamp_text(text: &str, max_chars: usize) -> String {
     format!("{}…", slice.trim_end())
 }
 
+pub fn truncate_middle_path(path: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if max_chars == 0 { return String::new(); }
+    if chars.len() <= max_chars { return path.to_string(); }
+    if max_chars < 5 { return chars.iter().take(max_chars).collect::<String>(); }
+    let keep = max_chars - 1;
+    let left = keep / 2;
+    let right = keep - left;
+    format!("{}…{}", chars.iter().take(left).collect::<String>(), chars.iter().skip(chars.len() - right).collect::<String>())
+}
+
 /// Map a subtitle language name/keyword to a crisp uppercase 3-letter badge (never mid-word clipped).
 fn short_lang_code(lang: &str) -> String {
     let lower = lang.trim().to_lowercase();
@@ -207,6 +218,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     }
 
     render_queue_footer(frame, v_chunks[2], state, &theme);
+    if state.playlist_transfer_mode.is_some() {
+        render_playlist_transfer_modal(frame, state);
+    }
 }
 
 fn render_session_queue_pane(
@@ -767,6 +781,95 @@ fn render_saved_playlists_pane(
     frame.render_widget(Paragraph::new(p_lines), preview_inner);
 }
 
+pub fn render_playlist_transfer_modal(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(82, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let theme = state.theme();
+    let title = match &state.playlist_transfer_mode {
+        Some(crate::services::queue::PlaylistTransferKind::Export { name, .. }) => format!(" ◈ EXPORT PLAYLIST: \"{}\" ", clamp_text(name, 36)),
+        Some(crate::services::queue::PlaylistTransferKind::Import) => " ◈ IMPORT PLAYLIST PACK (.json) ".to_string(),
+        None => " ◈ PLAYLIST TRANSFER ".to_string(),
+    };
+    let block = Block::default()
+        .title(Line::from(Span::styled(title, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))))
+        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_focus)).style(Style::default().bg(BG_MODAL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 24 || inner.height < 8 { return; }
+
+    let default_selected = state.playlist_transfer_choice == 0;
+    let custom_selected = state.playlist_transfer_choice == 1;
+    let budget = inner.width.saturating_sub(8) as usize;
+    let default_path = crate::services::queue::playlists_export_dir(&state.active_profile_id)
+        .map(|p| p.display().to_string()).unwrap_or_else(|_| "profiles/<id>/playlists/".to_string());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(if default_selected { " ▶ " } else { "   " }, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled("[1] Default Solus Folder", Style::default().fg(if default_selected { Color::White } else { FG_MUTED }).add_modifier(if default_selected { Modifier::BOLD } else { Modifier::empty() })),
+        ]),
+        Line::from(Span::styled(format!("      {}", truncate_middle_path(&default_path, budget)), Style::default().fg(if default_selected { CYAN } else { FG_MUTED }))),
+    ];
+
+    match &state.playlist_transfer_mode {
+        Some(crate::services::queue::PlaylistTransferKind::Export { name, .. }) => {
+            let slug = name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+            let slug = slug.trim_matches('-').to_string();
+            lines.push(Line::from(Span::styled(format!("      File: {}.json", if slug.is_empty() { "playlist".to_string() } else { slug }), Style::default().fg(FG_MUTED))));
+        }
+        Some(crate::services::queue::PlaylistTransferKind::Import) => {
+            lines.push(Line::from(Span::styled(format!("      {} pack(s) found", state.playlist_import_candidates.len()), Style::default().fg(if state.playlist_import_candidates.is_empty() { FG_MUTED } else { EMERALD }))));
+            let visible = (inner.height as usize).saturating_sub(10).max(1).min(4);
+            for (idx, (_, pack)) in state.playlist_import_candidates.iter().enumerate().take(visible) {
+                let selected = default_selected && idx == state.playlist_import_cursor;
+                lines.push(Line::from(vec![
+                    Span::styled(if selected { "      > " } else { "        " }, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled(clamp_text(&pack.name, budget.saturating_sub(14)), Style::default().fg(if selected { Color::White } else { FG_MUTED })),
+                    Span::styled(format!("  ({} items)", pack.items.len()), Style::default().fg(EMERALD)),
+                ]));
+            }
+        }
+        None => {}
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(if custom_selected { " ▶ " } else { "   " }, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled("[2] Custom Path (Paste file or folder)", Style::default().fg(if custom_selected { Color::White } else { FG_MUTED }).add_modifier(if custom_selected { Modifier::BOLD } else { Modifier::empty() })),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("      ╭─ ", Style::default().fg(theme.divider)),
+        Span::styled(format!("{}{}", truncate_middle_path(&state.playlist_transfer_input, budget), if custom_selected { "_" } else { "" }), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(" ─╮", Style::default().fg(theme.divider)),
+    ]));
+
+    match &state.playlist_transfer_mode {
+        Some(crate::services::queue::PlaylistTransferKind::Export { name, .. }) if custom_selected => {
+            match crate::services::queue::resolve_export_target(&state.playlist_transfer_input, name) {
+                Ok(target) => lines.push(Line::from(Span::styled(format!("      Resolved -> {}", truncate_middle_path(&target.display().to_string(), budget)), Style::default().fg(EMERALD)))),
+                Err(e) => lines.push(Line::from(Span::styled(format!("      Invalid: {}", e), Style::default().fg(Color::Rgb(255, 100, 100))))),
+            }
+        }
+        Some(crate::services::queue::PlaylistTransferKind::Import) if custom_selected => {
+            if let Some((_, pack)) = state.playlist_import_candidates.first() {
+                lines.push(Line::from(Span::styled(format!("      Preview -> Valid pack: \"{}\" ({} items)", pack.name, pack.items.len()), Style::default().fg(EMERALD))));
+            } else if !state.playlist_transfer_input.trim().is_empty() {
+                lines.push(Line::from(Span::styled("      Preview -> No valid .json playlist pack at this path", Style::default().fg(AMBER))));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(error) = &state.playlist_transfer_error {
+        lines.push(Line::from(Span::styled(format!("      {}", clamp_text(error, budget)), Style::default().fg(Color::Rgb(255, 100, 100)).add_modifier(Modifier::BOLD))));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner.inner(Margin { horizontal: 1, vertical: 1 }));
+    let is_export = matches!(&state.playlist_transfer_mode, Some(crate::services::queue::PlaylistTransferKind::Export { .. }));
+    let footer = if is_export { " [1/2] Mode  [Tab] Switch  [D] Desktop  [Enter] Export  [Esc] Cancel " } else { " [1/2] Source  [j/k] Pick  [A] Import All  [Enter] Import  [Esc] Back " };
+    let footer_area = Rect { x: inner.x, y: inner.y.saturating_add(inner.height.saturating_sub(1)), width: inner.width, height: 1 };
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(clamp_text(footer, footer_area.width as usize), Style::default().fg(theme.text_dim)))), footer_area);
+}
+
 fn render_save_playlist_prompt(
     frame: &mut Frame,
     area:  Rect,
@@ -1104,6 +1207,31 @@ mod tests {
             }
             assert!(batch_txt.contains("ADD TO QUEUE:"));
             assert!(batch_txt.contains("Queue Next (Ep 12)"));
+        }
+    }
+
+    #[test]
+    fn test_playlist_transfer_modals_render_cleanly() {
+        let mut state = AppState::new();
+        for kind in [
+            crate::services::queue::PlaylistTransferKind::Export {
+                playlist_id: 1,
+                name: "Friday Night Mix".to_string(),
+                loop_default: true,
+            },
+            crate::services::queue::PlaylistTransferKind::Import,
+        ] {
+            state.playlist_transfer_mode = Some(kind);
+            for (w, h) in [(120u16, 36u16), (90u16, 28u16)] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| render_playlist_transfer_modal(f, &state)).unwrap();
+                let buf = terminal.backend().buffer();
+                let mut rendered = String::new();
+                for y in 0..h {
+                    for x in 0..w { rendered.push_str(buf[(x, y)].symbol()); }
+                }
+                assert!(rendered.contains("Default Solus Folder") || rendered.contains("Custom Path"));
+            }
         }
     }
 }

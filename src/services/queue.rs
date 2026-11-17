@@ -533,6 +533,12 @@ pub struct PortablePlaylist {
     pub items:        Vec<PlaylistItemDraft>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistTransferKind {
+    Export { playlist_id: i64, name: String, loop_default: bool },
+    Import,
+}
+
 fn default_schema() -> u32 {
     1
 }
@@ -561,6 +567,97 @@ fn slugify_playlist_name(name: &str) -> String {
     } else {
         trimmed.chars().take(48).collect()
     }
+}
+
+pub fn clean_user_path(raw: &str) -> PathBuf {
+    let mut text = raw.trim().to_string();
+    if text.len() >= 2 {
+        let bytes = text.as_bytes();
+        if (bytes[0] == b'\'' && bytes[text.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[text.len() - 1] == b'"')
+        {
+            text = text[1..text.len() - 1].trim().to_string();
+        }
+    }
+    #[cfg(unix)] {
+        text = text.replace("\\ ", " ");
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+        if let Some(base) = directories::BaseDirs::new() {
+            return base.home_dir().join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
+
+fn slug_for_name(name: &str) -> String {
+    let mut slug: String = name.to_lowercase().chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    while slug.contains("--") { slug = slug.replace("--", "-"); }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() { "playlist".to_string() } else { slug.chars().take(48).collect() }
+}
+
+pub fn resolve_export_target(raw_input: &str, playlist_name: &str) -> Result<PathBuf> {
+    let mut path = clean_user_path(raw_input);
+    if path.as_os_str().is_empty() {
+        path = PathBuf::from(format!("{}.json", slug_for_name(playlist_name)));
+    } else {
+        let input = raw_input.trim();
+        let directory_hint = path.is_dir() || input.ends_with('/')
+            || (cfg!(windows) && input.ends_with('\\'));
+        if directory_hint {
+            path = path.join(format!("{}.json", slug_for_name(playlist_name)));
+        } else if path.extension().is_none()
+            || path.extension().and_then(|e| e.to_str()).map(|e| !e.eq_ignore_ascii_case("json")).unwrap_or(false)
+        {
+            path.set_extension("json");
+        }
+    }
+    Ok(path)
+}
+
+pub fn export_playlist_json_to_path(
+    target: &Path,
+    name: &str,
+    loop_default: bool,
+    items: &[PlaylistItemDraft],
+) -> Result<PathBuf> {
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() { std::fs::create_dir_all(parent)?; }
+    }
+    let envelope = PortablePlaylist { schema: 1, name: name.to_string(), loop_default, items: items.to_vec() };
+    let json = serde_json::to_string_pretty(&envelope)
+        .map_err(|e| AppError::Config(format!("Failed to serialize playlist: {e}")))?;
+    std::fs::write(target, json)?;
+    Ok(target.to_path_buf())
+}
+
+pub fn scan_portable_playlists_in_dir(dir: &Path) -> Vec<(PathBuf, PortablePlaylist)> {
+    let mut found = Vec::new();
+    if dir.is_file() {
+        if dir.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("json")) == Some(true) {
+            if let Ok(pack) = import_playlist_json(dir) {
+                if !pack.items.is_empty() { found.push((dir.to_path_buf(), pack)); }
+            }
+        }
+        return found;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return found; };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.path().to_string_lossy().to_lowercase());
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("json")) == Some(true) {
+            if let Ok(pack) = import_playlist_json(&path) {
+                if !pack.items.is_empty() { found.push((path, pack)); }
+            }
+        }
+    }
+    found
 }
 
 /// Export a saved playlist as a portable JSON file for sharing watch-party packs.
@@ -595,24 +692,8 @@ pub fn import_playlist_json(path: &Path) -> Result<PortablePlaylist> {
 
 /// Scan the profile's `playlists/` directory for `.json` watch-party packs.
 pub fn scan_portable_playlists(profile_id: &str) -> Vec<PortablePlaylist> {
-    let Ok(dir) = playlists_export_dir(profile_id) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut imported = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            if let Ok(pack) = import_playlist_json(&path) {
-                if !pack.items.is_empty() {
-                    imported.push(pack);
-                }
-            }
-        }
-    }
-    imported
+    let Ok(dir) = playlists_export_dir(profile_id) else { return Vec::new(); };
+    scan_portable_playlists_in_dir(&dir).into_iter().map(|(_, pack)| pack).collect()
 }
 
 /// Parse single numbers or dash ranges (`"5"`, `"3-8"`) bounded to `max_aired`.
@@ -908,6 +989,35 @@ mod tests {
         assert!(!decoded.manual_stop);
         assert!(!decoded.items[1].resolving);
         assert_eq!(decoded.items.len(), 3);
+    }
+
+    #[test]
+    fn test_clean_user_path_and_export_target_resolution() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        assert_eq!(clean_user_path("~/Desktop/mix.json"), PathBuf::from(&home).join("Desktop/mix.json"));
+        assert_eq!(clean_user_path("'~/Downloads/My Mix.json'"), PathBuf::from(&home).join("Downloads/My Mix.json"));
+        assert_eq!(clean_user_path("/tmp/My\\ Mix.json"), PathBuf::from("/tmp/My Mix.json"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_export_target(&tmp.path().display().to_string(), "Test Mix").unwrap(), tmp.path().join("test-mix.json"));
+        let extensionless = tmp.path().join("watch-party");
+        assert_eq!(resolve_export_target(&extensionless.display().to_string(), "Unused").unwrap(), tmp.path().join("watch-party.json"));
+        let explicit = tmp.path().join("watch-party.json");
+        assert_eq!(resolve_export_target(&explicit.display().to_string(), "Unused").unwrap(), explicit);
+    }
+
+    #[test]
+    fn test_custom_export_roundtrip_and_directory_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack_dir = tmp.path().join("packs");
+        let target = pack_dir.join("party.json");
+        let pack_item = mk_item(1, "Cowboy Bebop", 5).to_draft();
+        export_playlist_json_to_path(&target, "Party Mix", true, &[pack_item.clone()]).unwrap();
+        assert!(target.exists());
+        assert_eq!(import_playlist_json(&target).unwrap().name, "Party Mix");
+        let found = scan_portable_playlists_in_dir(&pack_dir);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.items[0], pack_item);
     }
 
     #[test]

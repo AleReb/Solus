@@ -12,7 +12,7 @@ pub use ui::components::cover::{
 
 use anyhow::Context;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1484,6 +1484,19 @@ async fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
                 }
+                Event::Paste(text) => {
+                    if state.screen == Screen::QueueModal
+                        && state.playlist_transfer_mode.is_some()
+                        && state.playlist_transfer_choice == 1
+                    {
+                        state.playlist_transfer_input.push_str(&text);
+                        state.playlist_transfer_error = None;
+                        let path = services::queue::clean_user_path(&state.playlist_transfer_input);
+                        state.playlist_import_candidates = services::queue::scan_portable_playlists_in_dir(&path);
+                        state.playlist_import_cursor = 0;
+                        needs_redraw = true;
+                    }
+                }
                 Event::Resize(_, _) => {
                     needs_redraw = true;
                 }
@@ -1514,6 +1527,7 @@ async fn main() -> anyhow::Result<()> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -6289,6 +6303,173 @@ async fn handle_batch_queue_modal(
     }
 }
 
+fn refresh_playlist_transfer_candidates(state: &mut AppState) {
+    if state.playlist_transfer_choice != 1 || state.playlist_transfer_input.trim().is_empty() {
+        state.playlist_import_candidates.clear();
+        state.playlist_import_cursor = 0;
+        return;
+    }
+    let path = services::queue::clean_user_path(&state.playlist_transfer_input);
+    state.playlist_import_candidates = services::queue::scan_portable_playlists_in_dir(&path);
+    state.playlist_import_cursor = 0;
+}
+
+async fn handle_playlist_transfer_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            state.playlist_transfer_mode = None;
+            state.playlist_transfer_choice = 0;
+            state.playlist_transfer_input.clear();
+            state.playlist_transfer_error = None;
+            state.playlist_import_candidates.clear();
+            state.playlist_import_cursor = 0;
+        }
+        KeyCode::Char('1') => {
+            state.playlist_transfer_choice = 0;
+            state.playlist_transfer_error = None;
+            if matches!(&state.playlist_transfer_mode, Some(services::queue::PlaylistTransferKind::Import)) {
+                state.playlist_import_candidates = if let Ok(dir) = services::queue::playlists_export_dir(&state.active_profile_id) {
+                    services::queue::scan_portable_playlists_in_dir(&dir)
+                } else { Vec::new() };
+            }
+        }
+        KeyCode::Char('2') => {
+            state.playlist_transfer_choice = 1;
+            state.playlist_transfer_error = None;
+            refresh_playlist_transfer_candidates(state);
+        }
+        KeyCode::Tab => {
+            state.playlist_transfer_choice = 1 - state.playlist_transfer_choice;
+            state.playlist_transfer_error = None;
+            if state.playlist_transfer_choice == 0
+                && matches!(&state.playlist_transfer_mode, Some(services::queue::PlaylistTransferKind::Import))
+            {
+                state.playlist_import_candidates = if let Ok(dir) = services::queue::playlists_export_dir(&state.active_profile_id) {
+                    services::queue::scan_portable_playlists_in_dir(&dir)
+                } else { Vec::new() };
+            } else {
+                refresh_playlist_transfer_candidates(state);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.playlist_import_cursor = state.playlist_import_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.playlist_import_cursor + 1 < state.playlist_import_candidates.len() {
+                state.playlist_import_cursor += 1;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') if state.playlist_transfer_choice == 1 => {
+            state.playlist_transfer_input = "~/Desktop/".to_string();
+            state.playlist_transfer_error = None;
+            refresh_playlist_transfer_candidates(state);
+        }
+        KeyCode::Char(c) if state.playlist_transfer_choice == 1 && !c.is_control() && state.playlist_transfer_input.chars().count() < 4096 => {
+            state.playlist_transfer_input.push(c);
+            state.playlist_transfer_error = None;
+            refresh_playlist_transfer_candidates(state);
+        }
+        KeyCode::Backspace if state.playlist_transfer_choice == 1 => {
+            state.playlist_transfer_input.pop();
+            state.playlist_transfer_error = None;
+            refresh_playlist_transfer_candidates(state);
+        }
+        KeyCode::Char('u') if state.playlist_transfer_choice == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.playlist_transfer_input.clear();
+            state.playlist_transfer_error = None;
+            refresh_playlist_transfer_candidates(state);
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if matches!(&state.playlist_transfer_mode, Some(services::queue::PlaylistTransferKind::Import)) {
+                let candidates = if state.playlist_transfer_choice == 0 {
+                    state.playlist_import_candidates.clone()
+                } else {
+                    let path = services::queue::clean_user_path(&state.playlist_transfer_input);
+                    services::queue::scan_portable_playlists_in_dir(&path)
+                };
+                let now = unix_now();
+                let existing: std::collections::HashSet<String> = state.saved_playlists.iter().map(|p| p.name.to_lowercase()).collect();
+                let mut imported = 0usize;
+                for (_, pack) in candidates {
+                    if existing.contains(&pack.name.to_lowercase()) { continue; }
+                    if db::playlists::save_playlist(pool, &state.active_profile_id, &pack.name, pack.loop_default, &pack.items, now).await.is_ok() {
+                        imported += 1;
+                    }
+                }
+                state.saved_playlists = db::playlists::list_playlists_for_profile(pool, &state.active_profile_id).await.unwrap_or_default();
+                refresh_playlist_preview(state, pool).await;
+                state.playlist_transfer_mode = None;
+                state.playlist_transfer_error = None;
+                state.show_toast(format!("Imported {} playlist pack(s)", imported), now);
+            }
+        }
+        KeyCode::Enter => {
+            match state.playlist_transfer_mode.clone() {
+                Some(services::queue::PlaylistTransferKind::Export { playlist_id, name, loop_default }) => {
+                    let items = db::playlists::get_playlist_items(pool, playlist_id).await.unwrap_or_default();
+                    let drafts: Vec<db::playlists::PlaylistItemDraft> = items.iter().map(|item| services::queue::QueueItem::from_saved(item).to_draft()).collect();
+                    let result = if state.playlist_transfer_choice == 0 {
+                        services::queue::export_playlist_json(&state.active_profile_id, &name, loop_default, &drafts)
+                    } else {
+                        match services::queue::resolve_export_target(&state.playlist_transfer_input, &name) {
+                            Ok(target) => services::queue::export_playlist_json_to_path(&target, &name, loop_default, &drafts),
+                            Err(e) => Err(e),
+                        }
+                    };
+                    match result {
+                        Ok(path) => {
+                            state.playlist_transfer_mode = None;
+                            state.playlist_transfer_error = None;
+                            state.show_toast(format!("Exported playlist -> {}", path.display()), unix_now());
+                        }
+                        Err(e) => state.playlist_transfer_error = Some(format!("Export error: {e}")),
+                    }
+                }
+                Some(services::queue::PlaylistTransferKind::Import) => {
+                    let candidates = if state.playlist_transfer_choice == 0 {
+                        state.playlist_import_candidates.clone()
+                    } else {
+                        let path = services::queue::clean_user_path(&state.playlist_transfer_input);
+                        if path.as_os_str().is_empty() {
+                            state.playlist_transfer_error = Some("Enter or paste a JSON file or folder path.".to_string());
+                            Vec::new()
+                        } else { services::queue::scan_portable_playlists_in_dir(&path) }
+                    };
+                    let selected = candidates.get(state.playlist_import_cursor).or_else(|| candidates.first()).cloned();
+                    let Some((_, pack)) = selected else {
+                        if state.playlist_transfer_error.is_none() {
+                            state.playlist_transfer_error = Some("No valid playlist packs found at this path.".to_string());
+                        }
+                        return;
+                    };
+                    let existing: std::collections::HashSet<String> = state.saved_playlists.iter().map(|p| p.name.to_lowercase()).collect();
+                    if existing.contains(&pack.name.to_lowercase()) {
+                        state.playlist_transfer_error = Some(format!("A playlist named \"{}\" already exists.", pack.name));
+                        return;
+                    }
+                    let now = unix_now();
+                    match db::playlists::save_playlist(pool, &state.active_profile_id, &pack.name, pack.loop_default, &pack.items, now).await {
+                        Ok(_) => {
+                            state.saved_playlists = db::playlists::list_playlists_for_profile(pool, &state.active_profile_id).await.unwrap_or_default();
+                            refresh_playlist_preview(state, pool).await;
+                            state.playlist_transfer_mode = None;
+                            state.playlist_transfer_error = None;
+                            state.show_toast(format!("Imported playlist \"{}\"", pack.name), now);
+                        }
+                        Err(e) => state.playlist_transfer_error = Some(format!("Import error: {e}")),
+                    }
+                }
+                None => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_queue_modal(
     key:   event::KeyEvent,
     state: &mut AppState,
@@ -6296,6 +6477,11 @@ async fn handle_queue_modal(
     cfg:   &config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
+    if state.playlist_transfer_mode.is_some() {
+        handle_playlist_transfer_modal(key, state, pool).await;
+        return;
+    }
+
     if state.queue_save_mode {
         match key.code {
             KeyCode::Esc => {
@@ -6662,75 +6848,28 @@ async fn handle_queue_modal(
         KeyCode::Char('w') | KeyCode::Char('W') => {
             if state.queue_focus_pane == 1 {
                 if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
-                    let items = db::playlists::get_playlist_items(pool, pl.id)
-                        .await
-                        .unwrap_or_default();
-                    let drafts: Vec<db::playlists::PlaylistItemDraft> = items
-                        .iter()
-                        .map(|s| services::queue::QueueItem::from_saved(s).to_draft())
-                        .collect();
-                    match services::queue::export_playlist_json(
-                        &state.active_profile_id,
-                        &pl.name,
-                        pl.loop_default,
-                        &drafts,
-                    ) {
-                        Ok(path) => {
-                            state.show_toast(
-                                format!("❖ Exported playlist -> {}", path.display()),
-                                unix_now(),
-                            );
-                        }
-                        Err(e) => {
-                            state.show_toast(format!("Export error: {e}"), unix_now());
-                        }
-                    }
+                    state.playlist_transfer_mode = Some(services::queue::PlaylistTransferKind::Export {
+                        playlist_id: pl.id,
+                        name: pl.name,
+                        loop_default: pl.loop_default,
+                    });
+                    state.playlist_transfer_choice = 0;
+                    state.playlist_transfer_input.clear();
+                    state.playlist_transfer_error = None;
+                    state.playlist_import_candidates.clear();
+                    state.playlist_import_cursor = 0;
                 }
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') => {
-            let packs = services::queue::scan_portable_playlists(&state.active_profile_id);
-            if packs.is_empty() {
-                let dir_hint = services::queue::playlists_export_dir(&state.active_profile_id)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "profiles/<id>/playlists/".to_string());
-                state.show_toast(format!("No JSON playlists found in {}", dir_hint), unix_now());
-            } else {
-                let existing_names: std::collections::HashSet<String> = state
-                    .saved_playlists
-                    .iter()
-                    .map(|p| p.name.to_lowercase())
-                    .collect();
-                let mut imported_count = 0usize;
-                let now = unix_now();
-                for pack in packs {
-                    if existing_names.contains(&pack.name.to_lowercase()) {
-                        continue;
-                    }
-                    if db::playlists::save_playlist(
-                        pool,
-                        &state.active_profile_id,
-                        &pack.name,
-                        pack.loop_default,
-                        &pack.items,
-                        now,
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        imported_count += 1;
-                    }
-                }
-                state.saved_playlists =
-                    db::playlists::list_playlists_for_profile(pool, &state.active_profile_id)
-                        .await
-                        .unwrap_or_default();
-                refresh_playlist_preview(state, pool).await;
-                state.show_toast(
-                    format!("❖ Imported {} playlist(s) from profile folder", imported_count),
-                    now,
-                );
-            }
+            state.playlist_transfer_mode = Some(services::queue::PlaylistTransferKind::Import);
+            state.playlist_transfer_choice = 0;
+            state.playlist_transfer_input.clear();
+            state.playlist_transfer_error = None;
+            state.playlist_import_cursor = 0;
+            state.playlist_import_candidates = if let Ok(dir) = services::queue::playlists_export_dir(&state.active_profile_id) {
+                services::queue::scan_portable_playlists_in_dir(&dir)
+            } else { Vec::new() };
         }
         KeyCode::Enter => {
             if state.queue_focus_pane == 0 {
