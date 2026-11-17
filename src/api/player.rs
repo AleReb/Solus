@@ -699,6 +699,7 @@ pub fn build_mpv_direct_args(
     let mut args = vec![
         "--ytdl=no".to_string(),
         "--force-window=immediate".to_string(),
+        "--keep-open=no".to_string(),
         "--referrer=https://zokoanime.video/".to_string(),
         "--input-terminal=no".to_string(),
     ];

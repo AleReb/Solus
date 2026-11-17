@@ -146,6 +146,17 @@ pub fn parse_playlist_pos_change(line: &str) -> Option<i64> {
     None
 }
 
+/// Parse boolean property changes (e.g., `eof-reached`) from mpv JSON-RPC.
+pub fn parse_bool_property_change(line: &str, target_name: &str) -> Option<bool> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? == "property-change"
+        && parsed.get("name")?.as_str()? == target_name
+    {
+        return parsed.get("data")?.as_bool();
+    }
+    None
+}
+
 /// Format a live buffering progress bar for mpv OSD while the stream connects.
 pub fn format_y2k_loader_osd(elapsed_ms: u64) -> String {
     let cycle = (elapsed_ms / 120) as usize % 12;
@@ -425,12 +436,13 @@ async fn drive_ipc_stream<S>(
     set_active_socket_path(Some(sock_path.clone()));
     set_active_ipc_sender(Some(cmd_tx.clone()));
 
-    // Subscribe to time-pos, duration, track-list, and playlist-pos property changes
+    // Subscribe to time-pos, duration, track-list, playlist-pos, and eof-reached property changes
     let observe_cmds = [
         r#"{"command": ["observe_property", 1, "time-pos"]}"#,
         r#"{"command": ["observe_property", 2, "duration"]}"#,
         r#"{"command": ["observe_property", 3, "track-list"]}"#,
         r#"{"command": ["observe_property", 4, "playlist-pos"]}"#,
+        r#"{"command": ["observe_property", 5, "eof-reached"]}"#,
     ];
     for cmd in observe_cmds {
         let _ = writer_half.write_all(format!("{}\n", cmd).as_bytes()).await;
@@ -513,22 +525,37 @@ async fn drive_ipc_stream<S>(
                     if let Some(ref kind) = playback_exit_kind {
                         if reason == "quit" {
                             kind.store(PLAYBACK_EXIT_USER_QUIT, Ordering::Relaxed);
-                        } else if reason == "eof" && stream_started && !in_loading_screen {
+                        } else if reason == "eof"
+                            && (stream_started || current_duration > 10.0 || current_pos > 1.0)
+                        {
                             kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
                         }
                     }
                 }
 
+                if parse_bool_property_change(&line, "eof-reached") == Some(true)
+                    && (stream_started || current_duration > 10.0 || current_pos > 1.0)
+                {
+                    if let Some(ref kind) = playback_exit_kind {
+                        kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
+                    }
+                    let _ = writer_half.write_all(b"{\"command\":[\"quit\"]}\n").await;
+                    let _ = writer_half.flush().await;
+                    break;
+                }
+
                 if in_loading_screen {
-                    if stream_started {
-                        if let Some((ref name, val)) = parse_property_change(&line) {
-                            if name == "time-pos" && val > 0.05 {
-                                in_loading_screen = false;
-                                let _ = writer_half.write_all(b"{\"command\":[\"osd-overlay\",1,\"none\",\"\"]}\n").await;
-                                let _ = writer_half.flush().await;
-                            } else {
-                                continue;
-                            }
+                    if let Some((ref name, val)) = parse_property_change(&line) {
+                        if name == "duration" && val > 10.0 {
+                            current_duration = val;
+                            stream_started = true;
+                            continue;
+                        }
+                        if stream_started && name == "time-pos" && val > 0.05 {
+                            current_pos = val;
+                            in_loading_screen = false;
+                            let _ = writer_half.write_all(b"{\"command\":[\"osd-overlay\",1,\"none\",\"\"]}\n").await;
+                            let _ = writer_half.flush().await;
                         } else {
                             continue;
                         }
@@ -789,15 +816,17 @@ mod tests {
         let (server_read, _server_write) = tokio::io::split(server_io);
         let mut lines = BufReader::new(server_read).lines();
 
-        // First four commands must be observe_property subscriptions
+        // First five commands must be observe_property subscriptions
         let l1 = lines.next_line().await.unwrap().unwrap();
         let l2 = lines.next_line().await.unwrap().unwrap();
         let l3 = lines.next_line().await.unwrap().unwrap();
         let l4 = lines.next_line().await.unwrap().unwrap();
+        let l5 = lines.next_line().await.unwrap().unwrap();
         assert!(l1.contains("observe_property"));
         assert!(l2.contains("observe_property"));
         assert!(l3.contains("observe_property"));
         assert!(l4.contains("observe_property"));
+        assert!(l5.contains("eof-reached"));
         assert_eq!(
             get_active_socket_path().as_deref(),
             Some(r"\\.\pipe\solus-mpv-1-1")
@@ -805,8 +834,8 @@ mod tests {
 
         // Send a command through the active monitor channel
         assert!(try_send_via_active_monitor(r#"{"command":["cycle","pause"]}"#));
-        let l5 = lines.next_line().await.unwrap().unwrap();
-        assert_eq!(l5, r#"{"command":["cycle","pause"]}"#);
+        let l6 = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(l6, r#"{"command":["cycle","pause"]}"#);
 
         drop(lines);
         drop(_server_write);

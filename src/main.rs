@@ -564,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     // Auto-advance next queued item on natural EOF / clean completion
-                    let natural_finish = natural_eof || (exited_ok && !user_quit && elapsed_secs >= 15);
+                    let natural_finish = natural_eof || (exited_ok && !user_quit && elapsed_secs >= 3);
                     if natural_finish && !state.queue.manual_stop && state.queue.auto_advance {
                         if let Some(next_item) = state.queue.pop_next_for_advance() {
                             if state.queue_cursor >= state.queue.len() {
