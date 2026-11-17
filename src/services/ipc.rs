@@ -128,17 +128,16 @@ pub fn parse_playlist_pos_change(line: &str) -> Option<i64> {
     None
 }
 
-/// Format a live Y2K-styled buffering progress bar for mpv OSD while the stream connects.
+/// Format a live buffering progress bar for mpv OSD while the stream connects.
 pub fn format_y2k_loader_osd(elapsed_ms: u64) -> String {
-    let pct = ((elapsed_ms as f64 / 1350.0).clamp(0.0, 1.0) * 100.0).round() as usize;
-    let filled = (pct * 10 / 100).min(10);
+    let cycle = (elapsed_ms / 120) as usize % 12;
+    let filled = (cycle + 1).min(10);
     let empty = 10usize.saturating_sub(filled);
     let secs = elapsed_ms as f64 / 1000.0;
     format!(
-        "◈ SOLUS // Y2K STREAM LOADER  [{}{}]  {}%  ({:.1}s)",
+        "◈ SOLUS // STREAM LOADER  [{}{}]  {:.1}s",
         "■".repeat(filled),
         "□".repeat(empty),
-        pct,
         secs
     )
 }
@@ -412,8 +411,9 @@ where
     let mut last_audio_tracks: Vec<crate::services::remote::RemoteAudioTrack> = Vec::new();
     let mut in_loading_screen = has_loading_screen;
     let mut switched_to_stream = false;
+    let mut stream_started = !has_loading_screen;
     let loader_start = tokio::time::Instant::now();
-    let mut loader_tick = tokio::time::interval(Duration::from_millis(150));
+    let mut loader_tick = tokio::time::interval(Duration::from_millis(120));
 
     loop {
         tokio::select! {
@@ -438,9 +438,9 @@ where
             _ = loader_tick.tick(), if in_loading_screen => {
                 let elapsed_ms = loader_start.elapsed().as_millis() as u64;
                 let osd_text = format_y2k_loader_osd(elapsed_ms);
-                let osd_cmd = serde_json::json!({ "command": ["show-text", osd_text, 300] });
+                let osd_cmd = serde_json::json!({ "command": ["show-text", osd_text, 250] });
                 let _ = writer_half.write_all(format!("{osd_cmd}\n").as_bytes()).await;
-                if elapsed_ms >= 1350 && !switched_to_stream {
+                if elapsed_ms >= 900 && !switched_to_stream {
                     switched_to_stream = true;
                     let _ = writer_half.write_all(b"{\"command\":[\"playlist-next\"]}\n").await;
                 }
@@ -452,15 +452,27 @@ where
                 };
 
                 if let Some(pos) = parse_playlist_pos_change(&line) {
-                    if pos >= 1 && in_loading_screen {
-                        in_loading_screen = false;
-                        let _ = writer_half.write_all(b"{\"command\":[\"show-text\",\"\",1]}\n").await;
-                        let _ = writer_half.flush().await;
+                    if pos >= 1 {
+                        stream_started = true;
                     }
                 }
 
                 if in_loading_screen {
-                    continue;
+                    if stream_started {
+                        if let Some((ref name, val)) = parse_property_change(&line) {
+                            if name == "time-pos" && val > 0.05 {
+                                in_loading_screen = false;
+                                let _ = writer_half.write_all(b"{\"command\":[\"show-text\",\"\",1]}\n").await;
+                                let _ = writer_half.flush().await;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
 
                 if let Some(tracks) = parse_audio_tracks_from_property_change(&line) {
@@ -768,8 +780,9 @@ mod tests {
         let ev1 = r#"{"event":"property-change","id":4,"name":"playlist-pos","data":1}"#;
         assert_eq!(parse_playlist_pos_change(ev0), Some(0));
         assert_eq!(parse_playlist_pos_change(ev1), Some(1));
-        let osd = format_y2k_loader_osd(675);
-        assert!(osd.contains("Y2K STREAM LOADER"));
-        assert!(osd.contains("50%"));
+        let osd = format_y2k_loader_osd(600);
+        assert!(osd.contains("STREAM LOADER"));
+        assert!(!osd.contains("Y2K"));
+        assert!(osd.contains("0.6s"));
     }
 }

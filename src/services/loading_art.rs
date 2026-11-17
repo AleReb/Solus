@@ -112,11 +112,11 @@ pub fn generate_y2k_loading_screen(
     draw_y2k_star(&mut canvas, art_x + art_size - 22, art_y + 22, 12, accent);
     draw_y2k_star(&mut canvas, art_x + 22, art_y + art_size - 22, 9, white);
 
-    // 5. Right-side Y2K HUD typography
+    // 5. Right-side HUD typography
     let hud_x = 594u32;
-    fill_rect(&mut canvas, hud_x, 148, 310, 36, accent);
-    draw_text(&mut canvas, "SOLUS // Y2K", hud_x + 14, 156, 3, black);
-    draw_text(&mut canvas, tag, hud_x + 328, 158, 2, accent);
+    fill_rect(&mut canvas, hud_x, 148, 300, 36, accent);
+    draw_text(&mut canvas, "SOLUS // PLAYER", hud_x + 14, 156, 3, black);
+    draw_text(&mut canvas, tag, hud_x + 318, 158, 2, accent);
 
     draw_text(&mut canvas, "NOW LOADING...", hud_x, 220, 5, white);
 
@@ -133,15 +133,9 @@ pub fn generate_y2k_loading_screen(
         draw_text(&mut canvas, &clean_title, hud_x, 326, 3, white);
     }
 
-    // Y2K decorative equalizer/bar track
+    // Equalizer/bar track (animated live by mpv OSD while buffering)
     draw_rect_outline(&mut canvas, hud_x, 392, 580, 26, 2, dim_border);
-    for seg in 0..8 {
-        let sx = hud_x + 8 + seg * 32;
-        if sx + 22 < hud_x + 572 {
-            fill_rect(&mut canvas, sx, 398, 22, 14, accent);
-        }
-    }
-    draw_text(&mut canvas, "BUFFERING STREAM", hud_x, 434, 2, muted);
+    draw_text(&mut canvas, "BUFFERING STREAM...", hud_x, 434, 2, muted);
 
     // YouTube Keybindings Legend
     fill_rect(&mut canvas, hud_x, 486, 580, 2, dim_border);
