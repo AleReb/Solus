@@ -6,7 +6,7 @@ use image::{imageops, DynamicImage, GenericImageView, Rgba, RgbaImage};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const Y2K_ASSETS: [(&[u8], [u8; 3], &str); 4] = [
+const Y2K_ASSETS: [(&[u8], [u8; 3], &str); 11] = [
     (
         include_bytes!("../../assets/loading/y2k_0.jpg"),
         [110, 231, 135], // CRT Phosphor Green
@@ -14,7 +14,7 @@ const Y2K_ASSETS: [(&[u8], [u8; 3], &str); 4] = [
     ),
     (
         include_bytes!("../../assets/loading/y2k_1.jpg"),
-        [96, 165, 250], // Y2K Cyber Cobalt
+        [96, 165, 250], // Cyber Cobalt
         "CYBER AUDIO",
     ),
     (
@@ -26,6 +26,41 @@ const Y2K_ASSETS: [(&[u8], [u8; 3], &str); 4] = [
         include_bytes!("../../assets/loading/y2k_3.jpg"),
         [165, 180, 252], // Midnight Deck Indigo
         "MIDNIGHT DECK",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_4.jpg"),
+        [134, 239, 172], // Mint CRT Star
+        "MINT STAR",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_5.jpg"),
+        [129, 140, 248], // Neon Violet Headphones
+        "NEON CAT",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_6.jpg"),
+        [203, 213, 225], // Halftone Mono Star
+        "HALFTONE STAR",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_7.jpg"),
+        [192, 132, 252], // Cyber Punk Violet
+        "CYBER VIOLET",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_8.jpg"),
+        [94, 234, 212], // Cyan Halo Star
+        "CYAN HALO",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_9.jpg"),
+        [147, 197, 253], // Ice Matrix Grid
+        "ICE MATRIX",
+    ),
+    (
+        include_bytes!("../../assets/loading/y2k_10.jpg"),
+        [45, 212, 191], // Teal Stairwell
+        "TEAL SIGNAL",
     ),
 ];
 
@@ -300,20 +335,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_next_loading_variant_cycles_all_four_y2k_themes() {
+    fn test_next_loading_variant_cycles_all_eleven_themes() {
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..Y2K_ASSETS.len() {
             seen.push(next_loading_variant_index());
         }
         seen.sort();
-        assert_eq!(seen, vec![0, 1, 2, 3]);
+        assert_eq!(seen, (0..Y2K_ASSETS.len()).collect::<Vec<_>>());
     }
 
     #[test]
     fn test_generate_y2k_loading_screen_creates_1280x720_cards() {
-        for idx in 0..4 {
+        for idx in 0..Y2K_ASSETS.len() {
             let path = generate_y2k_loading_screen("Serial Experiments Lain", 1, idx)
-                .expect("should generate Y2K loading card");
+                .expect("should generate loading card");
             assert!(path.is_file());
             let img = image::open(&path).expect("should decode generated JPEG");
             assert_eq!(img.dimensions(), (1280, 720));
