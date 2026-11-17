@@ -3,7 +3,7 @@
 use crate::{
     api::{
         player::PlayOptions,
-        subtitles::fetch_stream_info_with_mal,
+        subtitles::{fetch_stream_info_with_mal, AudioTrackOption, SubtitleOption},
     },
     config::{Anime4KMode, Config},
     db::playlists::{PlaylistItemDraft, SavedPlaylistItem},
@@ -22,8 +22,8 @@ use std::{
     time::Duration,
 };
 
-/// Conservative 50-minute freshness lifetime for pre-resolved CDN stream links.
-pub const PREFETCH_TTL_SECS: u64 = 3000;
+/// Short 3-minute freshness window for near-EOF pre-resolved CDN stream links.
+pub const PREFETCH_TTL_SECS: u64 = 180;
 
 /// Fixed monochrome status label for a queued item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +57,18 @@ impl PrefetchStatus {
 /// Pre-resolved playback payload ready for instant `mpv`/`vlc` launch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedPrefetch {
-    pub options:     PlayOptions,
-    pub resolved_at: u64,
+    pub options:       PlayOptions,
+    pub resolved_at:   u64,
     #[serde(default)]
-    pub sub_synced:  bool,
+    pub sub_synced:    bool,
+    #[serde(default)]
+    pub master_url:    Option<String>,
+    #[serde(default)]
+    pub subtitles:     Vec<SubtitleOption>,
+    #[serde(default)]
+    pub audio_tracks:  Vec<AudioTrackOption>,
+    #[serde(default)]
+    pub dub_available: bool,
 }
 
 impl ResolvedPrefetch {
@@ -80,23 +88,25 @@ impl ResolvedPrefetch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     #[serde(default)]
-    pub uid:         u64,
-    pub anime_id:    i64,
+    pub uid:          u64,
     #[serde(default)]
-    pub mal_id:      Option<i64>,
+    pub spec_version: u64,
+    pub anime_id:     i64,
     #[serde(default)]
-    pub season_year: Option<i64>,
-    pub title:       String,
-    pub query:       String,
-    pub episode:     u32,
-    pub quality:     String,
-    pub dub:         bool,
-    pub sub_lang:    String,
-    pub player:      String,
+    pub mal_id:       Option<i64>,
+    #[serde(default)]
+    pub season_year:  Option<i64>,
+    pub title:        String,
+    pub query:        String,
+    pub episode:      u32,
+    pub quality:      String,
+    pub dub:          bool,
+    pub sub_lang:     String,
+    pub player:       String,
     #[serde(skip)]
-    pub resolving:   bool,
+    pub resolving:    bool,
     #[serde(default)]
-    pub prefetch:    Option<ResolvedPrefetch>,
+    pub prefetch:     Option<ResolvedPrefetch>,
 }
 
 impl QueueItem {
@@ -114,6 +124,7 @@ impl QueueItem {
     ) -> Self {
         Self {
             uid: 0,
+            spec_version: 1,
             anime_id,
             mal_id,
             season_year,
@@ -132,6 +143,7 @@ impl QueueItem {
     pub fn from_saved(saved: &SavedPlaylistItem) -> Self {
         Self {
             uid: 0,
+            spec_version: 1,
             anime_id: saved.anime_id,
             mal_id: saved.mal_id,
             season_year: saved.season_year,
@@ -145,6 +157,13 @@ impl QueueItem {
             resolving: false,
             prefetch: None,
         }
+    }
+
+    /// Invalidate any cached URL snapshot after modifying item playback configuration.
+    pub fn bump_spec(&mut self) {
+        self.spec_version = self.spec_version.saturating_add(1);
+        self.prefetch = None;
+        self.resolving = false;
     }
 
     pub fn to_draft(&self) -> PlaylistItemDraft {
@@ -247,6 +266,7 @@ impl WatchQueue {
         for item in &mut self.items {
             item.uid = self.next_uid;
             self.next_uid += 1;
+            item.spec_version = item.spec_version.max(1);
             item.resolving = false;
         }
         self.manual_stop = false;
@@ -265,8 +285,7 @@ impl WatchQueue {
                 existing.dub = item.dub;
                 existing.sub_lang = item.sub_lang;
                 existing.player = item.player;
-                existing.prefetch = None;
-                existing.resolving = false;
+                existing.bump_spec();
             }
             return EnqueueOutcome {
                 position: pos + 1,
@@ -274,10 +293,22 @@ impl WatchQueue {
             };
         }
         item.uid = self.alloc_uid();
+        item.spec_version = item.spec_version.max(1);
         self.items.push_back(item);
         EnqueueOutcome {
             position: self.items.len(),
             replaced: false,
+        }
+    }
+
+    /// Update an item in-place by `uid`, bumping its `spec_version` and clearing stale cached URLs.
+    pub fn update_item_by_uid(&mut self, uid: u64, mut f: impl FnMut(&mut QueueItem)) -> bool {
+        if let Some(item) = self.items.iter_mut().find(|i| i.uid == uid) {
+            f(item);
+            item.bump_spec();
+            true
+        } else {
+            false
         }
     }
 
@@ -393,10 +424,18 @@ impl WatchQueue {
         }
     }
 
-    /// Store resolved prefetch payload onto matching `uid` item.
-    pub fn apply_prefetch_result(&mut self, uid: u64, prefetch: Option<ResolvedPrefetch>) -> bool {
+    /// Store resolved prefetch payload onto matching `uid` item if its config version is unchanged.
+    pub fn apply_prefetch_result(
+        &mut self,
+        uid: u64,
+        expected_spec_version: u64,
+        prefetch: Option<ResolvedPrefetch>,
+    ) -> bool {
         if let Some(item) = self.items.iter_mut().find(|i| i.uid == uid) {
             item.resolving = false;
+            if item.spec_version != expected_spec_version {
+                return false;
+            }
             if let Some(pre) = prefetch {
                 item.prefetch = Some(pre);
                 return true;
@@ -581,8 +620,49 @@ pub fn parse_batch_queue_input(input: &str, max_aired: u32) -> Vec<u32> {
     parse_episode_range(input, max_aired.max(1), &[])
 }
 
+async fn verify_stream_url_alive(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return true;
+    }
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let head = client
+        .head(url)
+        .header("Referer", "https://zokoanime.video/")
+        .send()
+        .await;
+    if let Ok(resp) = head {
+        let code = resp.status().as_u16();
+        if (200..400).contains(&code) {
+            return true;
+        }
+        if code == 403 || code == 404 || code == 410 {
+            return false;
+        }
+    }
+    match client
+        .get(url)
+        .header("Referer", "https://zokoanime.video/")
+        .header("Range", "bytes=0-128")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            (200..400).contains(&code)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Resolve stream URL, subtitle track (including optional auto-sync), and Era-Adaptive GLSL shaders
-/// for a queued episode. Used by both the background `N+1` prefetch worker and direct queue launches.
+/// for a queued episode. Used by both near-EOF `N+1` prefetch and Just-In-Time queue launches.
 pub async fn resolve_item_prefetch(
     item:         &QueueItem,
     anime4k_mode: Anime4KMode,
@@ -605,7 +685,14 @@ pub async fn resolve_item_prefetch(
         .or_else(|| stream_info.qualities.first())
         .map(|q| q.url.clone())
         .filter(|u| !u.is_empty())
-        .or_else(|| stream_info.master_url.clone());
+        .or_else(|| stream_info.master_url.clone())
+        .filter(|u| !u.is_empty());
+
+    // Do not cache empty fallback results as Ready; require an actual verified HTTP stream URL.
+    let valid_url = match stream_url {
+        Some(ref url) if verify_stream_url_alive(url).await => Some(url.clone()),
+        _ => return None,
+    };
 
     let pref_lower = item.sub_lang.to_lowercase();
     let chosen_sub = stream_info
@@ -653,7 +740,7 @@ pub async fn resolve_item_prefetch(
                     &client,
                     raw_sub_url,
                     ref_sub_url,
-                    stream_url.as_deref(),
+                    valid_url.as_deref(),
                     item.anime_id,
                     item.episode,
                     code,
@@ -681,7 +768,7 @@ pub async fn resolve_item_prefetch(
         player: item.player.clone(),
         sub_lang,
         sub_url,
-        stream_url,
+        stream_url: valid_url,
         ipc_socket: None,
         start_pos: None,
         glsl_shaders,
@@ -693,6 +780,10 @@ pub async fn resolve_item_prefetch(
         options,
         resolved_at,
         sub_synced,
+        master_url: stream_info.master_url,
+        subtitles: stream_info.subtitles,
+        audio_tracks: stream_info.audio_tracks,
+        dub_available: stream_info.dub_available,
     })
 }
 
@@ -734,6 +825,10 @@ mod tests {
             },
             resolved_at,
             sub_synced: false,
+            master_url: None,
+            subtitles: Vec::new(),
+            audio_tracks: Vec::new(),
+            dub_available: false,
         }
     }
 
@@ -782,13 +877,15 @@ mod tests {
         assert!(!pre.is_fresh(1_000 + PREFETCH_TTL_SECS));
 
         let mut item = mk_item(1, "Frieren", 1);
-        assert_eq!(item.status(1_500), PrefetchStatus::Queued);
+        let fresh_ts = 1_000 + PREFETCH_TTL_SECS.saturating_sub(10);
+        let stale_ts = 1_000 + PREFETCH_TTL_SECS;
+        assert_eq!(item.status(fresh_ts), PrefetchStatus::Queued);
         item.resolving = true;
-        assert_eq!(item.status(1_500), PrefetchStatus::Resolving);
+        assert_eq!(item.status(fresh_ts), PrefetchStatus::Resolving);
         item.resolving = false;
         item.prefetch = Some(pre);
-        assert_eq!(item.status(1_500), PrefetchStatus::Ready);
-        assert_eq!(item.status(5_000), PrefetchStatus::Stale);
+        assert_eq!(item.status(fresh_ts), PrefetchStatus::Ready);
+        assert_eq!(item.status(stale_ts), PrefetchStatus::Stale);
     }
 
     #[test]
@@ -830,5 +927,31 @@ mod tests {
         let loaded = import_playlist_json(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(loaded, pack);
+    }
+
+    #[test]
+    fn test_spec_version_rejects_stale_prefetch_after_item_edit() {
+        let mut q = WatchQueue::default();
+        q.enqueue_back(mk_item(1, "Frieren", 4));
+        let uid = q.items[0].uid;
+        let old_spec = q.items[0].spec_version;
+
+        // Simulate user editing dub/sub settings while older prefetch was in flight
+        assert!(q.update_item_by_uid(uid, |item| {
+            item.dub = true;
+            item.sub_lang = "Arabic".to_string();
+        }));
+        assert!(q.items[0].spec_version > old_spec);
+
+        // Stale prefetch carrying old_spec must be rejected cleanly
+        let applied_stale = q.apply_prefetch_result(uid, old_spec, Some(mk_prefetch(1_000)));
+        assert!(!applied_stale);
+        assert!(q.items[0].prefetch.is_none());
+
+        // Matching current spec_version succeeds
+        let cur_spec = q.items[0].spec_version;
+        let applied_fresh = q.apply_prefetch_result(uid, cur_spec, Some(mk_prefetch(1_000)));
+        assert!(applied_fresh);
+        assert!(q.items[0].prefetch.is_some());
     }
 }

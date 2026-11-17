@@ -643,17 +643,28 @@ fn render_saved_playlists_pane(
         frame.render_widget(Paragraph::new(lines), chunks[0]);
     }
 
-    // Bottom preview pane: items of selected playlist
+    // Bottom preview pane: items of selected playlist (interactive editor when playlist_focus_items)
+    let editing_items = focused && state.playlist_focus_items;
     let preview_block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(theme.divider));
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if editing_items { theme.secondary } else { theme.divider }));
     let preview_inner = preview_block.inner(chunks[1]);
     frame.render_widget(preview_block, chunks[1]);
 
     let p_w = preview_inner.width as usize;
+    let header_title = if editing_items {
+        " ◈ PLAYLIST ITEMS [EDITING] "
+    } else if !state.playlist_preview_items.is_empty() {
+        " ── SELECTED PLAYLIST ITEMS ([e] Edit/Reorder) "
+    } else {
+        " ── SELECTED PLAYLIST ITEMS "
+    };
     let mut p_lines = vec![Line::from(Span::styled(
-        " ── SELECTED PLAYLIST ITEMS ──────────",
-        Style::default().fg(theme.divider),
+        clamp_text(header_title, p_w),
+        Style::default()
+            .fg(if editing_items { theme.secondary } else { theme.divider })
+            .add_modifier(if editing_items { Modifier::BOLD } else { Modifier::empty() }),
     ))];
     if state.playlist_preview_items.is_empty() {
         p_lines.push(Line::from(Span::styled(
@@ -661,16 +672,30 @@ fn render_saved_playlists_pane(
             Style::default().fg(FG_MUTED),
         )));
     } else {
-        let avail = preview_inner.height.saturating_sub(1) as usize;
-        for (i, it) in state.playlist_preview_items.iter().take(avail).enumerate() {
-            let year_str = it
-                .season_year
-                .map(|y| y.to_string())
-                .unwrap_or_else(|| "----".to_string());
+        let avail = preview_inner.height.saturating_sub(1).max(1) as usize;
+        let start = if editing_items {
+            state.playlist_item_cursor.saturating_sub(avail.saturating_sub(1))
+        } else {
+            0
+        };
+        for (i, it) in state
+            .playlist_preview_items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(avail)
+        {
+            let selected = editing_items && i == state.playlist_item_cursor;
+            let row_bg = if selected { BG_CARD_ACTIVE } else { BG_MODAL };
             let mode = if it.dub { "DUB" } else { "SUB" };
-            let right_meta = format!("{} · {}", mode, year_str);
+            let sub_short: String = it.sub_lang.chars().take(3).collect();
+            let right_meta = format!("{} · {} · {}", mode, it.quality, sub_short);
             let ep_tag = format!(" · E{:02}", it.episode);
-            let prefix = format!("  {}. ", i + 1);
+            let prefix = if selected {
+                format!(" ▶ {}. ", i + 1)
+            } else {
+                format!("   {}. ", i + 1)
+            };
             let budget = p_w
                 .saturating_sub(prefix.chars().count() + ep_tag.chars().count() + right_meta.chars().count() + 3)
                 .max(6);
@@ -679,9 +704,27 @@ fn render_saved_playlists_pane(
                 .saturating_sub(prefix.chars().count() + name.chars().count() + ep_tag.chars().count() + right_meta.chars().count() + 1)
                 .max(1);
             p_lines.push(Line::from(vec![
-                Span::styled(format!("{}{}{}", prefix, name, ep_tag), Style::default().fg(Color::White)),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(format!("{} ", right_meta), Style::default().fg(FG_MUTED)),
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(if selected { theme.secondary } else { FG_MUTED })
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}{}", name, ep_tag),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(row_bg)
+                        .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(" ".repeat(gap), Style::default().bg(row_bg)),
+                Span::styled(
+                    format!("{} ", right_meta),
+                    Style::default()
+                        .fg(if selected { theme.accent } else { FG_MUTED })
+                        .bg(row_bg),
+                ),
             ]));
         }
     }
@@ -723,47 +766,92 @@ fn render_queue_footer(
     state: &AppState,
     theme: &ThemePalette,
 ) {
-    let line1 = if state.queue_focus_pane == 0 {
-        Line::from(vec![
-            Span::styled(" [Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
-            Span::styled(" Play Now  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[J/K]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-            Span::styled(" Move  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[d]", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
-            Span::styled(" Drop  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[s]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(" Save Playlist  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[L]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(" Loop  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[R]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled(" Shuffle  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[Space]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
-            Span::styled(" Auto", Style::default().fg(FG_MUTED)),
-        ])
+    let (line1, line2) = if state.queue_focus_pane == 0 {
+        (
+            Line::from(vec![
+                Span::styled(" [Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Play  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[J/K]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Move  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[a]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" Audio  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[l]", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Sub  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[v]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" Qual  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[c]", Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Config  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[d]", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
+                Span::styled(" Drop", Style::default().fg(FG_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [s]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" Save Playlist  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[L]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" Loop  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[R]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" Shuffle  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Space]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Auto  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[C]", Style::default().fg(Color::Rgb(255, 140, 80)).add_modifier(Modifier::BOLD)),
+                Span::styled(" Clear  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Playlists  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Esc/Q]", Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)),
+                Span::styled(" Close", Style::default().fg(FG_MUTED)),
+            ]),
+        )
+    } else if state.playlist_focus_items {
+        (
+            Line::from(vec![
+                Span::styled(" [J/K]", Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Move Item  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[d]", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
+                Span::styled(" Remove  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[a]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" Audio  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[v]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" Qual  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[l]", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Sub  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Play Playlist", Style::default().fg(FG_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [Esc/e]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Done Editing Items  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Queue Pane  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Q]", Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)),
+                Span::styled(" Close", Style::default().fg(FG_MUTED)),
+            ]),
+        )
     } else {
-        Line::from(vec![
-            Span::styled(" [Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
-            Span::styled(" Load & Play  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[a]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(" Append to Queue  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[w]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled(" Export  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[i]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
-            Span::styled(" Import  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[x]", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
-            Span::styled(" Delete  ", Style::default().fg(FG_MUTED)),
-            Span::styled("[Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-            Span::styled(" Switch Pane", Style::default().fg(FG_MUTED)),
-        ])
+        (
+            Line::from(vec![
+                Span::styled(" [Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Load & Play  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[e]", Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Edit Items  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[a]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" Append  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[w]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" Export  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[i]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Import  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[x]", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
+                Span::styled(" Delete", Style::default().fg(FG_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(" Queue Pane  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[C]", Style::default().fg(Color::Rgb(255, 140, 80)).add_modifier(Modifier::BOLD)),
+                Span::styled(" Clear Queue  ", Style::default().fg(FG_MUTED)),
+                Span::styled("[Esc/Q]", Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)),
+                Span::styled(" Close", Style::default().fg(FG_MUTED)),
+            ]),
+        )
     };
-    let line2 = Line::from(vec![
-        Span::styled(" [Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Switch Pane  ", Style::default().fg(FG_MUTED)),
-        Span::styled("[c]", Style::default().fg(Color::Rgb(255, 140, 80)).add_modifier(Modifier::BOLD)),
-        Span::styled(" Clear Queue  ", Style::default().fg(FG_MUTED)),
-        Span::styled("[Esc/Q]", Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)),
-        Span::styled(" Close", Style::default().fg(FG_MUTED)),
-    ]);
     frame.render_widget(Paragraph::new(vec![line1, line2]), area);
 }
 
@@ -830,7 +918,7 @@ pub fn render_batch_queue_modal(frame: &mut Frame, state: &AppState, cfg: &Confi
     let options = [
         (0usize, format!("[1] Queue Next (Ep {})", ep), "Insert at front (plays right after current)".to_string()),
         (1usize, format!("[2] Append to Queue (Ep {})", ep), format!("Add at tail (#{} in active session)", tail_pos)),
-        (2usize, format!("[3] Next 3 Episodes ({}..{})", ep, e3), format!("Batch append ({} · {})", audio_tag, cfg.quality.as_str())),
+        (2usize, format!("[3] Next 3 Episodes ({}..{})", ep, e3), format!("Batch append ({} · {})", audio_tag, state.batch_queue_quality)),
         (3usize, format!("[4] Rest of Season ({}..{})", ep, max_aired), format!("Append {} remaining episode(s)", remaining_count)),
     ];
 
@@ -871,13 +959,20 @@ pub fn render_batch_queue_modal(frame: &mut Frame, state: &AppState, cfg: &Confi
     ]);
     frame.render_widget(Paragraph::new(range_line).style(Style::default().bg(BG_CARD)), r_inner);
 
+    let _ = cfg;
+    let dub_note = match state.dub_available {
+        Some(true) => "Dub ready",
+        Some(false) => "Sub only",
+        None => "Auto-detect",
+    };
     let settings_line = Line::from(vec![
         Span::styled(" Settings: ", Style::default().fg(FG_MUTED)),
         Span::styled(format!("[{}]", audio_tag), Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(format!("[{}]", cfg.quality.as_str()), Style::default().fg(CYAN)),
+        Span::styled(format!("[{}]", state.batch_queue_quality), Style::default().fg(CYAN)),
         Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(format!("[{}]", cfg.default_sub_lang), Style::default().fg(theme.accent)),
+        Span::styled(format!("[{}]", state.batch_queue_sub_lang), Style::default().fg(theme.accent)),
+        Span::styled(format!("   ({})", dub_note), Style::default().fg(FG_MUTED)),
     ]);
     frame.render_widget(Paragraph::new(settings_line), chunks[5]);
 
@@ -885,11 +980,15 @@ pub fn render_batch_queue_modal(frame: &mut Frame, state: &AppState, cfg: &Confi
         Span::styled(" [Enter]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
         Span::styled(" Queue  ", Style::default().fg(FG_MUTED)),
         Span::styled("[1-4]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Instant Run  ", Style::default().fg(FG_MUTED)),
+        Span::styled(" Run  ", Style::default().fg(FG_MUTED)),
         Span::styled("[r]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Span::styled(" Range  ", Style::default().fg(FG_MUTED)),
         Span::styled("[Tab]", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
         Span::styled(" Sub/Dub  ", Style::default().fg(FG_MUTED)),
+        Span::styled("[v]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" Qual  ", Style::default().fg(FG_MUTED)),
+        Span::styled("[l]", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" Sub  ", Style::default().fg(FG_MUTED)),
         Span::styled("[Esc]", Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)),
         Span::styled(" Cancel", Style::default().fg(FG_MUTED)),
     ]);

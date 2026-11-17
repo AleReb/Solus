@@ -32,12 +32,18 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         "Sub"
     };
 
+    let (header_icon, title_suffix) = match state.playback_options_purpose {
+        crate::state::PlaybackOptionsPurpose::LaunchNow => ("  ", String::new()),
+        crate::state::PlaybackOptionsPurpose::EnqueueSingle => (" ◈ ADD TO QUEUE: ", String::new()),
+        crate::state::PlaybackOptionsPurpose::EditQueueItem { .. } => (" ◈ EDIT QUEUE ENTRY: ", String::new()),
+    };
+
     let title_line = state
         .selected_anime
         .as_ref()
         .map(|a| {
             let ep = state.selected_episode.unwrap_or(1);
-            format!("{} • Episode {}", a.short_title(), ep)
+            format!("{} • Episode {}{}", a.short_title(), ep, title_suffix)
         })
         .unwrap_or_else(|| "Choose options before launch".to_string());
 
@@ -61,7 +67,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                "  ",
+                header_icon,
                 Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -413,24 +419,38 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     }
 
     // ── Footer: Keymap Bar ───────────────────────────────────────────────
-    let footer = Paragraph::new(Line::from(vec![
+    let enter_label = match state.playback_options_purpose {
+        crate::state::PlaybackOptionsPurpose::LaunchNow => " Launch  ",
+        crate::state::PlaybackOptionsPurpose::EnqueueSingle => " Save to Queue  ",
+        crate::state::PlaybackOptionsPurpose::EditQueueItem { .. } => " Apply Changes  ",
+    };
+    let mut footer_spans = vec![
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::raw(" Launch  "),
+        Span::raw(enter_label),
+    ];
+    if state.playback_options_purpose == crate::state::PlaybackOptionsPurpose::LaunchNow {
+        footer_spans.extend([
+            Span::styled(" e ", Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(" Enqueue  "),
+        ]);
+    }
+    footer_spans.extend([
         Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::raw(" Column  "),
+        Span::raw(" Col  "),
         Span::styled(" 1-4 ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Jump  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::raw(" Select  "),
+        Span::raw(" Pick  "),
         Span::styled(" p ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Player  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
         Span::styled(" u ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::raw(" Anime4K  "),
+        Span::raw(" A4K  "),
         Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(theme.border_idle)),
         Span::raw(" Back"),
-    ]))
+    ]);
+    let footer = Paragraph::new(Line::from(footer_spans))
     .block(
         Block::default()
             .borders(Borders::ALL)

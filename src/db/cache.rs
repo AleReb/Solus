@@ -194,6 +194,15 @@ where
     Ok(())
 }
 
+/// Mark an anime as having a verified dub stream in the local SQLite cache.
+pub async fn mark_anime_has_dub(pool: &SqlitePool, anime_id: i64) -> Result<()> {
+    sqlx::query("UPDATE anime SET has_dub = 1 WHERE id = ?")
+        .bind(anime_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Look up cached `(mal_id -> canonical anilist_id)` mappings from both `id_crosswalk` and `anime`.
 pub async fn lookup_anilist_by_mal_ids(
     pool: &SqlitePool,

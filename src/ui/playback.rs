@@ -85,6 +85,8 @@ fn render_controls(frame: &mut Frame, area: ratatui::layout::Rect, theme: &Theme
         Span::styled(" Stop    ", Style::default().fg(theme.text_dim)),
         Span::styled(" n ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
         Span::styled(" Next Ep    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Sub/Dub    ", Style::default().fg(theme.text_dim)),
         Span::styled(" Esc ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
         Span::styled(" Return", Style::default().fg(theme.text_dim)),
     ]))

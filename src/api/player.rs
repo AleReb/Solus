@@ -434,6 +434,14 @@ if [ -n "$SOLUS_IPC_SOCKET" ]; then
     fi
 fi
 
+if [ -n "$SOLUS_AUDIO_SCRIPT" ] && [ "$is_vlc" -eq 0 ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-script=$SOLUS_AUDIO_SCRIPT")
+    else
+        args+=("--script=$SOLUS_AUDIO_SCRIPT")
+    fi
+fi
+
 if [ -n "$SOLUS_START_POS" ]; then
     if [ "$is_iina" -eq 1 ]; then
         args+=("--mpv-start=$SOLUS_START_POS")
@@ -626,6 +634,62 @@ pub fn ensure_youtube_input_conf() -> Option<PathBuf> {
     Some(path)
 }
 
+const SOLUS_AUDIO_LUA: &str = r##"-- Solus Smart Audio Cycle Bridge
+-- Cycles embedded mpv audio tracks natively with an exact seek buffer flush when multiple
+-- tracks exist, or signals Solus over stdout to hot-swap between split Sub/Dub embeds.
+local function solus_cycle_audio()
+    local tracks = mp.get_property_native("track-list") or {}
+    local audio_tracks = {}
+    local cur_aid = mp.get_property_number("aid")
+    for _, t in ipairs(tracks) do
+        if t.type == "audio" and t.id then
+            table.insert(audio_tracks, t)
+        end
+    end
+
+    if #audio_tracks > 1 then
+        local cur_idx = 1
+        for i, t in ipairs(audio_tracks) do
+            if t.id == cur_aid then
+                cur_idx = i
+                break
+            end
+        end
+        local next_idx = (cur_idx % #audio_tracks) + 1
+        local nxt = audio_tracks[next_idx]
+        mp.set_property_number("aid", nxt.id)
+        mp.commandv("seek", "0", "relative+exact")
+        local label = nxt.title or nxt.lang or ("Track " .. tostring(nxt.id))
+        mp.osd_message("✦ Audio: " .. tostring(label), 2.5)
+    else
+        mp.osd_message("✦ Switching Sub/Dub stream...", 2.5)
+        io.write("__SOLUS_AUDIO_CYCLE__\n")
+        io.flush()
+    end
+end
+
+mp.add_forced_key_binding("#", "solus-cycle-audio-hash", solus_cycle_audio)
+mp.add_forced_key_binding("SHARP", "solus-cycle-audio-sharp", solus_cycle_audio)
+mp.add_forced_key_binding("Ctrl+a", "solus-cycle-audio-ctrl", solus_cycle_audio)
+"##;
+
+/// Ensure Solus's `mpv` audio-switch helper script exists on disk and return its path.
+pub fn ensure_solus_audio_lua() -> Option<PathBuf> {
+    let dir = crate::config::Config::cache_dir()
+        .unwrap_or_else(|_| env::temp_dir().join("solus-cache"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join("solus-audio.lua");
+    let needs_write = std::fs::read_to_string(&path)
+        .map(|cur| cur != SOLUS_AUDIO_LUA)
+        .unwrap_or(true);
+    if needs_write && std::fs::write(&path, SOLUS_AUDIO_LUA).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
 /// Build direct `mpv` arguments, wrapping the stream in `--{ ... --}` when a Y2K loading screen precedes it.
 pub fn build_mpv_direct_args(
     opts: &PlayOptions,
@@ -731,6 +795,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         .unwrap_or_else(|| "solus-mpv".to_string());
 
     let yt_conf = ensure_youtube_input_conf();
+    let audio_script = ensure_solus_audio_lua();
 
     // 1. Direct stream playback:
     // If we resolved the exact verified stream URL (.m3u8), launch the player directly.
@@ -774,6 +839,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--mpv-force-window=immediate");
                 if let Some(ref conf_path) = yt_conf {
                     cmd.arg(format!("--mpv-input-conf={}", conf_path.display()));
+                }
+                if let Some(ref script_path) = audio_script {
+                    cmd.arg(format!("--mpv-script={}", script_path.display()));
                 }
                 cmd.arg("--mpv-referrer=https://zokoanime.video/");
                 cmd.arg("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
@@ -829,6 +897,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 }
                 for arg in build_mpv_direct_args(opts, direct_url, yt_conf.as_deref()) {
                     cmd.arg(arg);
+                }
+                if let Some(ref script_path) = audio_script {
+                    cmd.arg(format!("--script={}", script_path.display()));
                 }
             }
 
@@ -952,6 +1023,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         cmd.env("SOLUS_AUDIO_DUB", "1");
     } else {
         cmd.env("SOLUS_AUDIO_DUB", "0");
+    }
+    if let Some(ref script_path) = audio_script {
+        cmd.env("SOLUS_AUDIO_SCRIPT", script_path);
     }
 
     if let Some(ref lang) = opts.sub_lang {
@@ -1240,6 +1314,12 @@ mod tests {
         assert!(text.contains("f cycle fullscreen"));
         assert!(text.contains("c cycle sub-visibility"));
         assert!(text.contains("5 seek 50 absolute-percent"));
+
+        let lua_path = ensure_solus_audio_lua().expect("solus-audio.lua path");
+        assert!(lua_path.is_file());
+        let lua_text = std::fs::read_to_string(&lua_path).unwrap();
+        assert!(lua_text.contains("__SOLUS_AUDIO_CYCLE__"));
+        assert!(lua_text.contains("relative+exact"));
     }
 
     #[test]

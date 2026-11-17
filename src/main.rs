@@ -182,9 +182,12 @@ enum AppMessage {
     RemoteAnime4K(config::Anime4KMode),
     /// Background `N+1` queue prefetch completed
     QueuePrefetchReady {
-        uid:      u64,
-        prefetch: Option<services::queue::ResolvedPrefetch>,
+        uid:          u64,
+        spec_version: u64,
+        prefetch:     Option<services::queue::ResolvedPrefetch>,
     },
+    /// Active playback entered final ~90s window — warm next queued item Just-In-Time
+    NearEofPrefetch(i64, u32),
     /// Mobile companion tapped Skip Next in Queue drawer
     RemoteQueueSkip,
     /// Mobile companion tapped a specific queued item index to play now
@@ -507,7 +510,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 AppMessage::PlaybackLog(line) => {
-                    state.push_log(line);
+                    if line.trim() == "__SOLUS_AUDIO_CYCLE__" {
+                        cycle_active_playback_audio(&mut state, &pool, &cfg, &tx).await;
+                    } else {
+                        state.push_log(line);
+                    }
                 }
                 AppMessage::PlaybackDone {
                     gen,
@@ -537,13 +544,13 @@ async fn main() -> anyhow::Result<()> {
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
 
                     // Self-healing retry once if a prefetched CDN URL failed quickly on launch
-                    if !exited_ok && !user_quit && elapsed_secs < 10 {
+                    if !exited_ok && !user_quit && elapsed_secs < 20 {
                         if let Some(mut active) = active_snapshot
                             .as_ref()
                             .filter(|a| a.used_prefetched && !a.retried_once)
                             .cloned()
                         {
-                            active.item.prefetch = None;
+                            active.item.bump_spec();
                             state.show_toast(
                                 format!(
                                     "❖ Cached link expired — re-resolving {} Ep {}...",
@@ -767,6 +774,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 AppMessage::StreamInfoDetected(anime_id, ep, is_dub, info) => {
+                    if info.dub_available {
+                        let pool_dub = pool.clone();
+                        tokio::spawn(async move {
+                            let _ = db::cache::mark_anime_has_dub(&pool_dub, anime_id).await;
+                        });
+                        if let Some(ref mut a) = state.selected_anime {
+                            if a.id == anime_id {
+                                a.has_dub = 1;
+                            }
+                        }
+                    }
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
                         && state.selected_episode == Some(ep)
                         && state.pending_dub == is_dub
@@ -778,14 +796,26 @@ async fn main() -> anyhow::Result<()> {
                         state.dub_available = Some(info.dub_available);
                         state.pending_master_url = info.master_url;
 
-                        let pref_str = cfg.quality.as_str();
+                        let edit_item = match state.playback_options_purpose {
+                            state::PlaybackOptionsPurpose::EditQueueItem { uid } => {
+                                state.queue.items.iter().find(|i| i.uid == uid).cloned()
+                            }
+                            _ => None,
+                        };
+                        let pref_str = edit_item
+                            .as_ref()
+                            .map(|i| i.quality.as_str())
+                            .unwrap_or_else(|| cfg.quality.as_str());
                         state.playback_quality_cursor = state
                             .playback_qualities
                             .iter()
-                            .position(|q| q.label == pref_str)
+                            .position(|q| q.label.eq_ignore_ascii_case(pref_str))
                             .unwrap_or(0);
 
-                        let pref_sub = &cfg.default_sub_lang;
+                        let pref_sub = edit_item
+                            .as_ref()
+                            .map(|i| i.sub_lang.clone())
+                            .unwrap_or_else(|| cfg.default_sub_lang.clone());
                         state.playback_sub_cursor = state
                             .playback_sub_languages
                             .iter()
@@ -1266,11 +1296,16 @@ async fn main() -> anyhow::Result<()> {
                     let _ = cfg.save();
                     state.show_toast(format!("❖ Anime4K: {}", mode.as_str()), unix_now());
                 }
-                AppMessage::QueuePrefetchReady { uid, prefetch } => {
-                    if state.queue.apply_prefetch_result(uid, prefetch) {
+                AppMessage::QueuePrefetchReady { uid, spec_version, prefetch } => {
+                    if state.queue.apply_prefetch_result(uid, spec_version, prefetch) {
                         services::queue::save_active_queue(&state.active_profile_id, &state.queue);
                     }
                     sync_remote_queue_snapshot(&state);
+                }
+                AppMessage::NearEofPrefetch(_anime_id, _ep) => {
+                    if state.now_playing.is_some() {
+                        warm_next_queue_item_now(&mut state, &cfg, &tx);
+                    }
                 }
                 AppMessage::RemoteQueueSkip => {
                     if let Some(next_item) = state.queue.pop_next_for_advance() {
@@ -2298,7 +2333,7 @@ async fn handle_home(
                     .copied()
                     .unwrap_or(1)
                     .max(1);
-                let default_dub = anime.has_dub() && cfg.audio_mode == config::AudioMode::Dub;
+                let default_dub = cfg.audio_mode == config::AudioMode::Dub;
                 let item = build_queue_item_for_anime(&anime, next_ep, default_dub, cfg, state);
                 let label = format!("{} · Ep {}", item.title, item.episode);
                 let outcome = state.queue.enqueue_back(item);
@@ -2608,6 +2643,25 @@ async fn begin_playback_flow(
     force_resume: bool,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
+    open_episode_options_flow(
+        state,
+        pool,
+        cfg,
+        force_resume,
+        state::PlaybackOptionsPurpose::LaunchNow,
+        tx,
+    )
+    .await;
+}
+
+async fn open_episode_options_flow(
+    state:   &mut AppState,
+    pool:    &sqlx::SqlitePool,
+    cfg:     &config::Config,
+    force_resume: bool,
+    purpose: state::PlaybackOptionsPurpose,
+    tx:      &tokio::sync::mpsc::Sender<AppMessage>,
+) {
     let Some(anime) = state.selected_anime.clone() else {
         return;
     };
@@ -2618,7 +2672,7 @@ async fn begin_playback_flow(
 
     let ep = state.selected_episode.unwrap_or(1);
     let max_aired = anime.aired_episodes();
-    if ep > max_aired {
+    if ep > max_aired && max_aired > 0 {
         state.show_toast(
             format!("Episode {} is locked — not yet released/aired", ep),
             unix_now(),
@@ -2630,7 +2684,7 @@ async fn begin_playback_flow(
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| cfg.audio_mode.clone());
-    let use_dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
+    let use_dub = default_audio == config::AudioMode::Dub;
     let ep = state.selected_episode.unwrap_or(1);
 
     let default_player = state.selected_player();
@@ -2641,9 +2695,11 @@ async fn begin_playback_flow(
             use_dub,
             default_player,
         );
+        state.playback_options_purpose = purpose;
         trigger_stream_detection(&anime, ep, use_dub, tx);
     } else if anime.playback_queries().len() > 1 {
         state.open_playback_query_picker(&anime);
+        state.playback_options_purpose = purpose;
     } else {
         state.open_playback_options(
             anime.playback_query(),
@@ -2651,6 +2707,7 @@ async fn begin_playback_flow(
             use_dub,
             default_player,
         );
+        state.playback_options_purpose = purpose;
         trigger_stream_detection(&anime, ep, use_dub, tx);
     }
 }
@@ -3154,30 +3211,22 @@ async fn handle_detail(
             open_queue_hub(state, pool).await;
         }
 
-        KeyCode::Char('e') => {
-            if let Some(anime) = state.selected_anime.clone() {
-                let ep = state.selected_episode.unwrap_or(1);
-                let max_aired = anime.aired_episodes();
-                if ep > max_aired && max_aired > 0 {
-                    state.show_toast(
-                        format!("Episode {} is locked — not yet aired", ep),
-                        unix_now(),
-                    );
-                } else {
-                    let default_audio = db::user::get_audio_mode(pool, anime.id)
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| cfg.audio_mode.clone());
-                    let dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
-                    let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
-                    let label = format!("{} · Ep {}", item.title, item.episode);
-                    let outcome = state.queue.enqueue_back(item);
-                    state.queue_cursor = state.queue.len().saturating_sub(1);
-                    persist_and_warm_queue(state, cfg, tx);
-                    let verb = if outcome.replaced { "Refreshed in queue" } else { "Queued" };
-                    state.show_toast(format!("◆ {}: {} (#{})", verb, label, outcome.position), unix_now());
-                }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if state.now_playing.is_some() {
+                cycle_active_playback_audio(state, pool, cfg, tx).await;
             }
+        }
+
+        KeyCode::Char('e') => {
+            open_episode_options_flow(
+                state,
+                pool,
+                cfg,
+                false,
+                state::PlaybackOptionsPurpose::EnqueueSingle,
+                tx,
+            )
+            .await;
         }
 
         KeyCode::Char('E') => {
@@ -3186,8 +3235,12 @@ async fn handle_detail(
                     .await
                     .unwrap_or(None)
                     .unwrap_or_else(|| cfg.audio_mode.clone());
-                let dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
-                state.open_batch_queue_modal(dub);
+                let dub = default_audio == config::AudioMode::Dub;
+                state.open_batch_queue_modal_with_prefs(
+                    dub,
+                    cfg.quality.as_str(),
+                    &cfg.default_sub_lang,
+                );
             }
         }
 
@@ -3458,14 +3511,16 @@ async fn handle_playback_query(
                     .await
                     .unwrap_or(None)
                     .unwrap_or_else(|| cfg.audio_mode.clone());
-                let is_dub = anime.has_dub() && preferred_audio == config::AudioMode::Dub;
+                let is_dub = preferred_audio == config::AudioMode::Dub;
                 let default_player = state.selected_player();
+                let purpose = state.playback_options_purpose;
                 state.open_playback_options(
                     query,
                     quality_index(&cfg.quality),
                     is_dub,
                     default_player,
                 );
+                state.playback_options_purpose = purpose;
                 let ep = state.selected_episode.unwrap_or(1);
                 trigger_stream_detection(&anime, ep, is_dub, tx);
             }
@@ -3583,7 +3638,8 @@ async fn handle_playback_options(
             state.toggle_anime4k();
             state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
         }
-        KeyCode::Enter => {
+        KeyCode::Char('e') | KeyCode::Enter => {
+            let force_enqueue = matches!(key.code, KeyCode::Char('e'));
             if let Some(anime) = state.selected_anime.clone() {
                 let ep    = state.selected_episode.unwrap_or(1);
                 let title = anime.display_title().to_string();
@@ -3651,26 +3707,84 @@ async fn handle_playback_options(
                     return;
                 }
 
-                let glsl_shaders = services::shaders::build_shader_arg_for_year(
-                    state.anime4k_mode,
-                    anime.season_year,
-                );
-                let opts = api::player::PlayOptions {
-                    title:   query,
-                    episode: ep,
-                    quality: quality_label,
-                    dub:     audio == config::AudioMode::Dub,
-                    player:  chosen_player.as_str().to_string(),
-                    sub_lang,
-                    sub_url,
-                    stream_url,
-                    ipc_socket: None,
-                    start_pos:  None,
-                    glsl_shaders,
-                    sub_style:  Some(cfg.subtitle_style.clone()),
-                    loading_image: None,
+                let effective_purpose = if force_enqueue {
+                    state::PlaybackOptionsPurpose::EnqueueSingle
+                } else {
+                    state.playback_options_purpose
                 };
-                start_playback(state, opts, title, ep, tx, pool, cfg).await;
+
+                let chosen_sub_str = sub_lang
+                    .clone()
+                    .or_else(|| chosen_sub.map(|s| s.name.clone()))
+                    .unwrap_or_else(|| cfg.default_sub_lang.clone());
+                let is_dub = audio == config::AudioMode::Dub;
+
+                match effective_purpose {
+                    state::PlaybackOptionsPurpose::EnqueueSingle => {
+                        let mut item = build_queue_item_for_anime(&anime, ep, is_dub, cfg, state);
+                        item.query = query;
+                        item.quality = quality_label;
+                        item.sub_lang = chosen_sub_str.clone();
+                        item.player = chosen_player.as_str().to_string();
+                        let mode_tag = if is_dub { "DUB" } else { "SUB" };
+                        let outcome = state.queue.enqueue_back(item);
+                        state.queue_cursor = state.queue.len().saturating_sub(1);
+                        state.playback_options_purpose = state::PlaybackOptionsPurpose::LaunchNow;
+                        persist_and_warm_queue(state, cfg, tx);
+                        state.go_back();
+                        state.show_toast(
+                            format!(
+                                "◆ Queued {} · Ep {} [{} · {}] (#{})",
+                                title, ep, mode_tag, chosen_sub_str, outcome.position
+                            ),
+                            unix_now(),
+                        );
+                    }
+                    state::PlaybackOptionsPurpose::EditQueueItem { uid } => {
+                        let mode_tag = if is_dub { "DUB" } else { "SUB" };
+                        let updated = state.queue.update_item_by_uid(uid, |item| {
+                            item.query = query.clone();
+                            item.dub = is_dub;
+                            item.quality = quality_label.clone();
+                            item.sub_lang = chosen_sub_str.clone();
+                            item.player = chosen_player.as_str().to_string();
+                        });
+                        state.playback_options_purpose = state::PlaybackOptionsPurpose::LaunchNow;
+                        persist_and_warm_queue(state, cfg, tx);
+                        state.screen = Screen::QueueModal;
+                        if updated {
+                            state.show_toast(
+                                format!(
+                                    "◆ Updated Queue: Ep {} [{} · {} · {}]",
+                                    ep, mode_tag, quality_label, chosen_sub_str
+                                ),
+                                unix_now(),
+                            );
+                        }
+                    }
+                    state::PlaybackOptionsPurpose::LaunchNow => {
+                        let glsl_shaders = services::shaders::build_shader_arg_for_year(
+                            state.anime4k_mode,
+                            anime.season_year,
+                        );
+                        let opts = api::player::PlayOptions {
+                            title:   query,
+                            episode: ep,
+                            quality: quality_label,
+                            dub:     is_dub,
+                            player:  chosen_player.as_str().to_string(),
+                            sub_lang,
+                            sub_url,
+                            stream_url,
+                            ipc_socket: None,
+                            start_pos:  None,
+                            glsl_shaders,
+                            sub_style:  Some(cfg.subtitle_style.clone()),
+                            loading_image: None,
+                        };
+                        start_playback(state, opts, title, ep, tx, pool, cfg).await;
+                    }
+                }
             }
         }
         _ => {}
@@ -5702,15 +5816,56 @@ fn sync_remote_queue_snapshot(state: &AppState) {
     });
 }
 
+fn cycle_quality_str(cur: &str) -> String {
+    const QUALS: [&str; 4] = ["1080p", "720p", "480p", "360p"];
+    let idx = QUALS
+        .iter()
+        .position(|q| q.eq_ignore_ascii_case(cur))
+        .map(|i| (i + 1) % QUALS.len())
+        .unwrap_or(0);
+    QUALS[idx].to_string()
+}
+
+fn cycle_sub_lang_str(cur: &str) -> String {
+    const SUBS: [&str; 7] = [
+        "English",
+        "Arabic",
+        "Spanish",
+        "French",
+        "German",
+        "Portuguese",
+        "Indonesian",
+    ];
+    let idx = SUBS
+        .iter()
+        .position(|s| cur.to_lowercase().contains(&s.to_lowercase()))
+        .map(|i| (i + 1) % SUBS.len())
+        .unwrap_or(0);
+    SUBS[idx].to_string()
+}
+
+/// Persist the session queue file and purge stale cached URLs without eagerly pre-fetching CDN URLs prematurely.
 fn persist_and_warm_queue(
+    state: &mut AppState,
+    _cfg:  &config::Config,
+    _tx:   &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let now = unix_now() as u64;
+    state.queue.invalidate_stale(now);
+    services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+    sync_remote_queue_snapshot(state);
+}
+
+/// Trigger Just-In-Time background warm-up for the front queued item when playback enters the final 90s.
+fn warm_next_queue_item_now(
     state: &mut AppState,
     cfg:   &config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let now = unix_now() as u64;
     state.queue.invalidate_stale(now);
-    services::queue::save_active_queue(&state.active_profile_id, &state.queue);
     if let Some(target) = state.queue.next_prefetch_target(now) {
+        let spec_ver = target.spec_version;
         state.queue.set_resolving(target.uid, true);
         let a4k = state.anime4k_mode;
         let sub_style = cfg.subtitle_style.clone();
@@ -5722,12 +5877,50 @@ fn persist_and_warm_queue(
             let _ = tx2
                 .send(AppMessage::QueuePrefetchReady {
                     uid: target.uid,
+                    spec_version: spec_ver,
                     prefetch: resolved,
                 })
                 .await;
         });
     }
-    sync_remote_queue_snapshot(state);
+}
+
+async fn persist_edited_playlist_items(state: &mut AppState, pool: &sqlx::SqlitePool) {
+    let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() else {
+        return;
+    };
+    let drafts: Vec<db::playlists::PlaylistItemDraft> = state
+        .playlist_preview_items
+        .iter()
+        .map(|it| db::playlists::PlaylistItemDraft {
+            anime_id: it.anime_id,
+            mal_id: it.mal_id,
+            title: it.title.clone(),
+            query: it.query.clone(),
+            episode: it.episode,
+            season_year: it.season_year,
+            quality: it.quality.clone(),
+            dub: it.dub,
+            sub_lang: it.sub_lang.clone(),
+            player: it.player.clone(),
+        })
+        .collect();
+    let now = unix_now();
+    if db::playlists::update_playlist_items(pool, &state.active_profile_id, pl.id, &drafts, now)
+        .await
+        .unwrap_or(false)
+    {
+        state.saved_playlists = db::playlists::list_playlists_for_profile(
+            pool,
+            &state.active_profile_id,
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(new_idx) = state.saved_playlists.iter().position(|p| p.id == pl.id) {
+            state.playlist_cursor = new_idx;
+        }
+        refresh_playlist_preview(state, pool).await;
+    }
 }
 
 async fn refresh_playlist_preview(state: &mut AppState, pool: &sqlx::SqlitePool) {
@@ -5804,15 +5997,20 @@ async fn play_queue_item(
     }
 
     state.selected_episode = Some(item.episode);
-    let now = unix_now() as u64;
-    let cached_opt = item
-        .prefetch
-        .as_ref()
-        .filter(|p| p.is_fresh(now))
-        .map(|p| p.options.clone());
+    state.playback_qualities.clear();
+    state.playback_sub_languages.clear();
+    state.playback_audio_tracks.clear();
+    state.pending_master_url = None;
+    state.dub_available = None;
 
-    let (mut opts, actually_prefetched) = if let Some(cached) = cached_opt {
-        (cached, true)
+    let now = unix_now() as u64;
+    let cached_pre = item
+        .prefetch
+        .clone()
+        .filter(|p| p.is_fresh(now) && p.options.stream_url.as_ref().is_some_and(|u| !u.is_empty()));
+
+    let (resolved_pre, actually_prefetched) = if let Some(cached) = cached_pre {
+        (Some(cached), true)
     } else {
         let resolved = services::queue::resolve_item_prefetch(
             &item,
@@ -5821,7 +6019,29 @@ async fn play_queue_item(
             now,
         )
         .await;
-        let opts = resolved.map(|r| r.options).unwrap_or_else(|| api::player::PlayOptions {
+        (resolved, false)
+    };
+
+    if let Some(ref pre) = resolved_pre {
+        state.playback_sub_languages = pre.subtitles.clone();
+        state.playback_audio_tracks = pre.audio_tracks.clone();
+        state.pending_master_url = pre.master_url.clone();
+        state.dub_available = Some(pre.dub_available || item.dub);
+        if let Some(ref chosen_lang) = pre.options.sub_lang {
+            state.playback_sub_cursor = state
+                .playback_sub_languages
+                .iter()
+                .position(|s| {
+                    s.lang_keyword().eq_ignore_ascii_case(chosen_lang)
+                        || s.name.eq_ignore_ascii_case(chosen_lang)
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    let mut opts = resolved_pre
+        .map(|r| r.options)
+        .unwrap_or_else(|| api::player::PlayOptions {
             title: item.query.clone(),
             episode: item.episode,
             quality: item.quality.clone(),
@@ -5836,8 +6056,6 @@ async fn play_queue_item(
             sub_style: Some(cfg.subtitle_style.clone()),
             loading_image: None,
         });
-        (opts, false)
-    };
 
     opts.ipc_socket = None;
     opts.loading_image = None;
@@ -5857,6 +6075,14 @@ async fn play_queue_item(
     let display_title = item.title.clone();
     let ep = item.episode;
     start_playback(state, opts, display_title, ep, tx, pool, cfg).await;
+}
+
+fn toggle_batch_dub(state: &mut AppState) {
+    if !state.batch_queue_dub && state.dub_available == Some(false) {
+        state.show_toast("English Dub is not available for this anime (Sub only)", unix_now());
+        return;
+    }
+    state.batch_queue_dub = !state.batch_queue_dub;
 }
 
 async fn handle_batch_queue_modal(
@@ -5879,9 +6105,15 @@ async fn handle_batch_queue_modal(
                 return;
             }
             KeyCode::Tab => {
-                if anime.has_dub() {
-                    state.batch_queue_dub = !state.batch_queue_dub;
-                }
+                toggle_batch_dub(state);
+                return;
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                state.batch_queue_quality = cycle_quality_str(&state.batch_queue_quality);
+                return;
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                state.batch_queue_sub_lang = cycle_sub_lang_str(&state.batch_queue_sub_lang);
                 return;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -5909,9 +6141,15 @@ async fn handle_batch_queue_modal(
             return;
         }
         KeyCode::Tab => {
-            if anime.has_dub() {
-                state.batch_queue_dub = !state.batch_queue_dub;
-            }
+            toggle_batch_dub(state);
+            return;
+        }
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            state.batch_queue_quality = cycle_quality_str(&state.batch_queue_quality);
+            return;
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            state.batch_queue_sub_lang = cycle_sub_lang_str(&state.batch_queue_sub_lang);
             return;
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -5939,10 +6177,35 @@ async fn handle_batch_queue_modal(
     };
     state.is_batch_queue_modal_open = false;
 
-    let dub = anime.has_dub() && state.batch_queue_dub;
+    let dub = state.batch_queue_dub;
+    let chosen_quality = state.batch_queue_quality.clone();
+    let chosen_sub = state.batch_queue_sub_lang.clone();
+    let mal_id = state
+        .anime_mal_ids
+        .get(&anime.id)
+        .copied()
+        .or(anime.mal_id);
+    let player_str = state.selected_player().as_str().to_string();
+    let display_title = anime.display_title().to_string();
+    let playback_query = anime.playback_query();
+    let make_item = |ep_num: u32| -> services::queue::QueueItem {
+        services::queue::QueueItem::new(
+            anime.id,
+            mal_id,
+            anime.season_year,
+            display_title.clone(),
+            playback_query.clone(),
+            ep_num,
+            chosen_quality.clone(),
+            dub,
+            chosen_sub.clone(),
+            player_str.clone(),
+        )
+    };
+
     match mode {
         0 => {
-            let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
+            let item = make_item(ep);
             state.queue.enqueue_next(item);
             state.queue_cursor = 0;
             persist_and_warm_queue(state, cfg, tx);
@@ -5952,7 +6215,7 @@ async fn handle_batch_queue_modal(
             );
         }
         1 => {
-            let item = build_queue_item_for_anime(&anime, ep, dub, cfg, state);
+            let item = make_item(ep);
             let outcome = state.queue.enqueue_back(item);
             state.queue_cursor = state.queue.len().saturating_sub(1);
             persist_and_warm_queue(state, cfg, tx);
@@ -5971,8 +6234,7 @@ async fn handle_batch_queue_modal(
             let eps: Vec<u32> = (ep..=end).collect();
             let count = eps.len();
             for e in eps {
-                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
-                state.queue.enqueue_back(item);
+                state.queue.enqueue_back(make_item(e));
             }
             persist_and_warm_queue(state, cfg, tx);
             state.show_toast(
@@ -5985,8 +6247,7 @@ async fn handle_batch_queue_modal(
             let eps: Vec<u32> = (start..=max_aired).collect();
             let count = eps.len();
             for e in eps {
-                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
-                state.queue.enqueue_back(item);
+                state.queue.enqueue_back(make_item(e));
             }
             persist_and_warm_queue(state, cfg, tx);
             state.show_toast(
@@ -6011,8 +6272,7 @@ async fn handle_batch_queue_modal(
             }
             let count = eps.len();
             for e in eps {
-                let item = build_queue_item_for_anime(&anime, e, dub, cfg, state);
-                state.queue.enqueue_back(item);
+                state.queue.enqueue_back(make_item(e));
             }
             persist_and_warm_queue(state, cfg, tx);
             state.show_toast(
@@ -6103,13 +6363,33 @@ async fn handle_queue_modal(
     }
 
     match key.code {
+        KeyCode::Esc if state.queue_focus_pane == 1 && state.playlist_focus_items => {
+            state.playlist_focus_items = false;
+        }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            state.playlist_focus_items = false;
             state.go_back();
         }
-        KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+            if !(state.queue_focus_pane == 0 && key.code == KeyCode::Char('l'))
+                && !(state.queue_focus_pane == 1 && state.playlist_focus_items && key.code == KeyCode::Char('l')) =>
+        {
             state.queue_focus_pane = 1 - (state.queue_focus_pane % 2);
+            state.playlist_focus_items = false;
             if state.queue_focus_pane == 1 {
                 refresh_playlist_preview(state, pool).await;
+            }
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') if state.queue_focus_pane == 1 => {
+            if state.playlist_focus_items {
+                state.playlist_focus_items = false;
+            } else if !state.playlist_preview_items.is_empty() {
+                state.playlist_focus_items = true;
+                if state.playlist_item_cursor >= state.playlist_preview_items.len() {
+                    state.playlist_item_cursor = 0;
+                }
+            } else {
+                state.show_toast("Selected playlist has no items to edit", unix_now());
             }
         }
         KeyCode::Char(' ') => {
@@ -6139,7 +6419,7 @@ async fn handle_queue_modal(
                 state.show_toast("◆ Shuffled session queue", unix_now());
             }
         }
-        KeyCode::Char('c') | KeyCode::Char('C') => {
+        KeyCode::Char('C') => {
             if !state.queue.is_empty() {
                 state.queue.clear();
                 state.queue_cursor = 0;
@@ -6160,16 +6440,24 @@ async fn handle_queue_modal(
                 if state.queue_cursor + 1 < state.queue.len() {
                     state.queue_cursor += 1;
                 }
+            } else if state.playlist_focus_items {
+                if state.playlist_item_cursor + 1 < state.playlist_preview_items.len() {
+                    state.playlist_item_cursor += 1;
+                }
             } else if state.playlist_cursor + 1 < state.saved_playlists.len() {
                 state.playlist_cursor += 1;
+                state.playlist_item_cursor = 0;
                 refresh_playlist_preview(state, pool).await;
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if state.queue_focus_pane == 0 {
                 state.queue_cursor = state.queue_cursor.saturating_sub(1);
+            } else if state.playlist_focus_items {
+                state.playlist_item_cursor = state.playlist_item_cursor.saturating_sub(1);
             } else if state.playlist_cursor > 0 {
                 state.playlist_cursor -= 1;
+                state.playlist_item_cursor = 0;
                 refresh_playlist_preview(state, pool).await;
             }
         }
@@ -6177,12 +6465,29 @@ async fn handle_queue_modal(
             if state.queue_focus_pane == 0 && !state.queue.is_empty() {
                 state.queue_cursor = state.queue.move_down(state.queue_cursor);
                 persist_and_warm_queue(state, cfg, tx);
+            } else if state.queue_focus_pane == 1
+                && state.playlist_focus_items
+                && state.playlist_item_cursor + 1 < state.playlist_preview_items.len()
+            {
+                let idx = state.playlist_item_cursor;
+                state.playlist_preview_items.swap(idx, idx + 1);
+                state.playlist_item_cursor = idx + 1;
+                persist_edited_playlist_items(state, pool).await;
             }
         }
         KeyCode::Char('K') => {
             if state.queue_focus_pane == 0 && !state.queue.is_empty() {
                 state.queue_cursor = state.queue.move_up(state.queue_cursor);
                 persist_and_warm_queue(state, cfg, tx);
+            } else if state.queue_focus_pane == 1
+                && state.playlist_focus_items
+                && state.playlist_item_cursor > 0
+                && state.playlist_item_cursor < state.playlist_preview_items.len()
+            {
+                let idx = state.playlist_item_cursor;
+                state.playlist_preview_items.swap(idx, idx - 1);
+                state.playlist_item_cursor = idx - 1;
+                persist_edited_playlist_items(state, pool).await;
             }
         }
         KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
@@ -6194,6 +6499,19 @@ async fn handle_queue_modal(
                     persist_and_warm_queue(state, cfg, tx);
                     state.show_toast(
                         format!("Removed {} · Ep {}", removed.title, removed.episode),
+                        unix_now(),
+                    );
+                }
+            } else if state.playlist_focus_items {
+                if state.playlist_item_cursor < state.playlist_preview_items.len() {
+                    let removed = state.playlist_preview_items.remove(state.playlist_item_cursor);
+                    if state.playlist_item_cursor >= state.playlist_preview_items.len() {
+                        state.playlist_item_cursor =
+                            state.playlist_preview_items.len().saturating_sub(1);
+                    }
+                    persist_edited_playlist_items(state, pool).await;
+                    state.show_toast(
+                        format!("Removed {} · Ep {} from playlist", removed.title, removed.episode),
                         unix_now(),
                     );
                 }
@@ -6214,6 +6532,72 @@ async fn handle_queue_modal(
                     refresh_playlist_preview(state, pool).await;
                     state.show_toast(format!("Deleted playlist \"{}\"", pl.name), unix_now());
                 }
+            }
+        }
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            if state.queue_focus_pane == 0 {
+                if let Some(target) = state.queue.items.get(state.queue_cursor).map(|i| i.uid) {
+                    let mut next_q = String::new();
+                    state.queue.update_item_by_uid(target, |item| {
+                        item.quality = cycle_quality_str(&item.quality);
+                        next_q = item.quality.clone();
+                    });
+                    persist_and_warm_queue(state, cfg, tx);
+                    state.show_toast(format!("◆ Queue item quality -> {}", next_q), unix_now());
+                }
+            } else if state.playlist_focus_items {
+                if let Some(it) = state.playlist_preview_items.get_mut(state.playlist_item_cursor) {
+                    it.quality = cycle_quality_str(&it.quality);
+                    let q = it.quality.clone();
+                    persist_edited_playlist_items(state, pool).await;
+                    state.show_toast(format!("◆ Playlist item quality -> {}", q), unix_now());
+                }
+            }
+        }
+        KeyCode::Char('l') if state.queue_focus_pane == 0 || state.playlist_focus_items => {
+            if state.queue_focus_pane == 0 {
+                if let Some(target) = state.queue.items.get(state.queue_cursor).map(|i| i.uid) {
+                    let mut next_sub = String::new();
+                    state.queue.update_item_by_uid(target, |item| {
+                        item.sub_lang = cycle_sub_lang_str(&item.sub_lang);
+                        next_sub = item.sub_lang.clone();
+                    });
+                    persist_and_warm_queue(state, cfg, tx);
+                    state.show_toast(format!("◆ Queue item subtitle -> {}", next_sub), unix_now());
+                }
+            } else if let Some(it) = state.playlist_preview_items.get_mut(state.playlist_item_cursor) {
+                it.sub_lang = cycle_sub_lang_str(&it.sub_lang);
+                let s = it.sub_lang.clone();
+                persist_edited_playlist_items(state, pool).await;
+                state.show_toast(format!("◆ Playlist item subtitle -> {}", s), unix_now());
+            }
+        }
+        KeyCode::Char('c') if state.queue_focus_pane == 0 => {
+            if let Some(item) = state.queue.items.get(state.queue_cursor).cloned() {
+                let target_anime = match db::cache::get_anime(pool, item.anime_id).await {
+                    Ok(Some(a)) => a,
+                    _ => {
+                        let mut fallback = db::cache::Anime::default();
+                        fallback.id = item.anime_id;
+                        fallback.mal_id = item.mal_id;
+                        fallback.season_year = item.season_year;
+                        fallback.title_romaji = item.title.clone();
+                        fallback.title_english = Some(item.title.clone());
+                        fallback.episodes = Some(item.episode.max(1) as i64);
+                        fallback
+                    }
+                };
+                open_detail_from_anime(state, target_anime.clone(), pool, tx).await;
+                state.selected_episode = Some(item.episode);
+                let player = match item.player.to_lowercase().as_str() {
+                    "iina" => config::Player::Iina,
+                    "vlc" => config::Player::Vlc,
+                    _ => config::Player::Mpv,
+                };
+                state.open_playback_options(item.query.clone(), 0, item.dub, player);
+                state.playback_options_purpose =
+                    state::PlaybackOptionsPurpose::EditQueueItem { uid: item.uid };
+                trigger_stream_detection(&target_anime, item.episode, item.dub, tx);
             }
         }
         KeyCode::Char('x') => {
@@ -6239,7 +6623,24 @@ async fn handle_queue_modal(
             }
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
-            if state.queue_focus_pane == 1 {
+            if state.queue_focus_pane == 0 {
+                if let Some(target) = state.queue.items.get(state.queue_cursor).map(|i| i.uid) {
+                    let mut mode_str = "SUB";
+                    state.queue.update_item_by_uid(target, |item| {
+                        item.dub = !item.dub;
+                        mode_str = if item.dub { "DUB" } else { "SUB" };
+                    });
+                    persist_and_warm_queue(state, cfg, tx);
+                    state.show_toast(format!("◆ Queue item audio -> {}", mode_str), unix_now());
+                }
+            } else if state.queue_focus_pane == 1 && state.playlist_focus_items {
+                if let Some(it) = state.playlist_preview_items.get_mut(state.playlist_item_cursor) {
+                    it.dub = !it.dub;
+                    let mode_str = if it.dub { "DUB" } else { "SUB" };
+                    persist_edited_playlist_items(state, pool).await;
+                    state.show_toast(format!("◆ Playlist item audio -> {}", mode_str), unix_now());
+                }
+            } else if state.queue_focus_pane == 1 {
                 if let Some(pl) = state.saved_playlists.get(state.playlist_cursor).cloned() {
                     let items = db::playlists::get_playlist_items(pool, pl.id)
                         .await
@@ -6843,6 +7244,9 @@ async fn handle_playback(
                     begin_playback_flow(state, pool, cfg, false, tx).await;
                 }
             }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            cycle_active_playback_audio(state, pool, cfg, tx).await;
+        }
         _ => {}
     }
 }
@@ -7296,6 +7700,77 @@ fn build_initial_remote_audio_tracks(
     tracks
 }
 
+/// Toggle or cycle audio during active playback:
+/// - Multi-track HLS: cycles embedded `aid` in `mpv` + exact `0s` seek flush (no restart)
+/// - Separate Sub/Dub embeds: captures `time_pos` over IPC and hot-swaps stream cleanly
+async fn cycle_active_playback_audio(
+    state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    cfg:   &config::Config,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if state.now_playing.is_none() || state.selected_anime.is_none() {
+        return;
+    }
+
+    let (tracks, current_dub, current_pos) = {
+        let st = state.remote_state.read().await;
+        (st.audio_tracks.clone(), st.audio_mode == "dub", st.time_pos)
+    };
+
+    let aid_tracks: Vec<_> = tracks
+        .iter()
+        .filter(|t| t.mpv_aid.is_some())
+        .cloned()
+        .collect();
+
+    // 1. In-stream multi-audio switch via live mpv IPC (zero window restart)
+    if aid_tracks.len() > 1 {
+        let active_idx = aid_tracks.iter().position(|t| t.is_active).unwrap_or(0);
+        let next_track = &aid_tracks[(active_idx + 1) % aid_tracks.len()];
+        if let Some(aid) = next_track.mpv_aid {
+            let aid_cmd = serde_json::json!({ "command": ["set_property", "aid", aid] }).to_string();
+            let seek_cmd = serde_json::json!({ "command": ["seek", 0.0, "relative+exact"] }).to_string();
+            let osd_cmd = serde_json::json!({
+                "command": ["show-text", format!("✦ Audio: {}", next_track.label), 2500]
+            })
+            .to_string();
+            let sent = services::ipc::try_send_via_active_monitor(&aid_cmd);
+            let _ = services::ipc::try_send_via_active_monitor(&seek_cmd);
+            let _ = services::ipc::try_send_via_active_monitor(&osd_cmd);
+            if sent {
+                {
+                    let mut st = state.remote_state.write().await;
+                    for item in &mut st.audio_tracks {
+                        item.is_active = item.id == next_track.id;
+                    }
+                    st.audio_lang = next_track.label.clone();
+                    st.audio_mode = if next_track.is_dub { "dub" } else { "sub" }.to_string();
+                }
+                services::remote::broadcast_state(&state.remote_state).await;
+                state.show_toast(format!("✦ Audio: {}", next_track.label), unix_now());
+                return;
+            }
+        }
+    }
+
+    // 2. Separate Sub/Dub embed switch: guard only if verified Sub-only
+    let target_dub = !current_dub;
+    if target_dub && state.dub_available == Some(false) {
+        state.show_toast("English Dub is not available for this episode (Sub only)", unix_now());
+        return;
+    }
+
+    let ep = state.selected_episode.unwrap_or(1);
+    let resume_pos = if current_pos > 2.0 {
+        Some(current_pos)
+    } else {
+        None
+    };
+    launch_remote_stream_switch(state, pool, cfg, tx, ep, Some(target_dub), resume_pos).await;
+}
+
+/// Switches episode or Sub/Dub audio stream during active playback (invoked by the Web Remote or desktop audio cycle).
 async fn launch_remote_stream_switch(
     state: &mut AppState,
     pool: &sqlx::SqlitePool,
@@ -7739,7 +8214,7 @@ async fn start_playback(
     };
     services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
 
-    // Trigger background N+1 prefetch if any episodes wait in the Watch Queue
+    // Queue state stays saved immediately; actual N+1 stream warm-up happens Just-In-Time ~90s before EOF.
     persist_and_warm_queue(state, cfg, tx);
 
     let stdout = child.stdout.take();

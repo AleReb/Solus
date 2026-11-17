@@ -53,20 +53,19 @@ const BROWSING_BINDINGS: &[BindingRow] = &[
 
 const PLAYBACK_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "Enter/Space", desc: "Launch highlighted episode" },
-    BindingRow { key: "e / E", desc: "Enqueue ep / Batch ep range" },
-    BindingRow { key: "v", desc: "Toggle Split / List ep view" },
-    BindingRow { key: "w / +", desc: "Mark watched / Watchlist" },
+    BindingRow { key: "e / E", desc: "Config & queue / Batch range" },
+    BindingRow { key: "a (Playing)", desc: "Switch Sub/Dub stream live" },
+    BindingRow { key: "v / w", desc: "Split/List view / Mark watched" },
     BindingRow { key: "p / D", desc: "Stream opts / Offline vault" },
     BindingRow { key: "n / c", desc: "Next aired ep / LAN Cast" },
     BindingRow { key: "Esc / q", desc: "Return to previous screen" },
 ];
 
 const FEATURES_BINDINGS: &[BindingRow] = &[
-    BindingRow { key: "Q / Ctrl+Q", desc: "Watch Session Queue & Playlists" },
-    BindingRow { key: "a", desc: "Taste Analytics Bento Hub" },
-    BindingRow { key: "w", desc: "Tailored recommendation wizard" },
-    BindingRow { key: "c", desc: "Weekly airing calendar" },
-    BindingRow { key: "m", desc: "Mobile LAN remote & QR" },
+    BindingRow { key: "Q / Ctrl+Q", desc: "Queue & Playlist editor" },
+    BindingRow { key: "a (Home)", desc: "Taste Analytics Bento Hub" },
+    BindingRow { key: "w (Home)", desc: "Tailored recommendation wizard" },
+    BindingRow { key: "c / m", desc: "Airing calendar / Mobile remote" },
     BindingRow { key: "C", desc: "AirPlay / DLNA Cast Deck" },
     BindingRow { key: "L", desc: "Trackers OAuth & Merge Hub" },
     BindingRow { key: "t / T", desc: "Cycle UI theme on Home & Detail" },
@@ -475,23 +474,64 @@ fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let line = Line::from(vec![
-        dock_pill("Space/k", "Pause", theme.primary),
-        Span::raw("   "),
-        dock_pill("j/l", "Seek +-10s", theme.accent),
-        Span::raw("   "),
-        dock_pill("0-9", "Jump %", theme.secondary),
-        Span::raw("   "),
-        dock_pill("f", "Fullscreen", FG_PRIMARY),
-        Span::raw("   "),
-        dock_pill("m", "Mute", FG_PRIMARY),
-        Span::raw("   "),
-        dock_pill("c", "Subtitles", theme.primary),
-        Span::raw("   "),
-        dock_pill("q", "Exit Player", FG_MUTED),
-    ])
-    .alignment(Alignment::Center);
-    frame.render_widget(Paragraph::new(line), inner);
+    let chips: [(&str, &str, Color, u8); 8] = [
+        ("Space/k", "Pause", theme.primary, 1),
+        ("j/l", "+-10s", theme.accent, 2),
+        ("#/Ctrl+a", "Audio", theme.secondary, 1),
+        ("f", "Full", FG_PRIMARY, 4),
+        ("c", "Sub", theme.primary, 3),
+        ("m", "Mute", FG_PRIMARY, 6),
+        ("0-9", "Jump%", theme.accent, 7),
+        ("q", "Exit", FG_MUTED, 1),
+    ];
+
+    let chip_width = |key: &str, label: &str| key.chars().count() + label.chars().count() + 3;
+    let max_w = inner.width as usize;
+    let sep_w = 2usize;
+
+    let mut include = [true; 8];
+    let calc_total = |inc: &[bool; 8]| -> usize {
+        let mut count = 0usize;
+        let mut total = 0usize;
+        for (idx, (k, l, _, _)) in chips.iter().enumerate() {
+            if inc[idx] {
+                if count > 0 {
+                    total += sep_w;
+                }
+                total += chip_width(k, l);
+                count += 1;
+            }
+        }
+        total
+    };
+
+    while calc_total(&include) > max_w {
+        if let Some((drop_idx, _)) = chips
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| include[*idx])
+            .max_by_key(|(idx, (_, _, _, prio))| (*prio, *idx))
+        {
+            include[drop_idx] = false;
+        } else {
+            break;
+        }
+    }
+
+    let mut spans = Vec::new();
+    for (idx, (key, label, color, _)) in chips.iter().enumerate() {
+        if !include[idx] {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(dock_pill(key, label, *color));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        inner,
+    );
 }
 
 fn render_action_dock(frame: &mut Frame, area: Rect, theme: &ThemePalette, show_rule: bool) {
@@ -611,9 +651,11 @@ mod tests {
             );
             assert!(text.contains("Settings Hub"), "missing Settings action dock at {}x{}", w, h);
             assert!(text.contains("System Doctor"), "missing Doctor action dock at {}x{}", w, h);
-            assert!(text.contains("Watch Session Queue"), "missing Queue keybind in help matrix");
+            assert!(text.contains("Queue & Playlist editor"), "missing Queue keybind in help matrix");
             if h >= 32 {
                 assert!(text.contains("In-Player (mpv YouTube Keys)"), "missing player bar");
+                assert!(text.contains("[q] Exit"), "player strip must not clip [q] Exit mid-word at {}x{}", w, h);
+                assert!(text.contains("[#/Ctrl+a] Audio"), "missing audio switch keybind at {}x{}", w, h);
             }
         }
     }
@@ -634,6 +676,7 @@ mod tests {
             text.contains("Detail & Playback◆ ACTIVE") || text.contains("Detail & Playback ◆ ACTIVE"),
             "expected Detail & Playback card to carry ACTIVE badge"
         );
+        assert!(text.contains("[q] Exit"), "player strip must include intact [q] Exit");
     }
 
     #[test]

@@ -281,6 +281,65 @@ pub async fn toggle_playlist_loop(
     Ok(Some(next != 0))
 }
 
+/// Replace the ordered items of an existing playlist owned by `profile_id` inside one transaction.
+pub async fn update_playlist_items(
+    pool:        &SqlitePool,
+    profile_id:  &str,
+    playlist_id: i64,
+    items:       &[PlaylistItemDraft],
+    now:         i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let owned: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM playlists WHERE id = ? AND profile_id = ?",
+    )
+    .bind(playlist_id)
+    .bind(profile_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if owned.is_none() {
+        return Ok(false);
+    }
+
+    sqlx::query("DELETE FROM playlist_items WHERE playlist_id = ?")
+        .bind(playlist_id)
+        .execute(&mut *tx)
+        .await?;
+
+    for (pos, item) in items.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_items (
+                playlist_id, position, anime_id, mal_id, title, query, episode,
+                season_year, quality, dub, sub_lang, player
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(playlist_id)
+        .bind(pos as i64)
+        .bind(item.anime_id)
+        .bind(item.mal_id)
+        .bind(&item.title)
+        .bind(&item.query)
+        .bind(item.episode as i64)
+        .bind(item.season_year)
+        .bind(&item.quality)
+        .bind(if item.dub { 1i64 } else { 0i64 })
+        .bind(&item.sub_lang)
+        .bind(&item.player)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query("UPDATE playlists SET updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(playlist_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +414,45 @@ mod tests {
         // Toggle loop flag works for owner
         let toggled = toggle_playlist_loop(&pool, "guest", id_b, 3_000).await.unwrap();
         assert_eq!(toggled, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_update_playlist_items_reorders_and_persists_edits() {
+        let pool = db::init(":memory:").await.unwrap();
+        let pid = save_playlist(
+            &pool,
+            "default",
+            "Reordered Night",
+            false,
+            &[
+                draft(1, "Cowboy Bebop", 1, Some(1998)),
+                draft(21, "Frieren", 2, Some(2023)),
+                draft(1535, "Death Note", 3, Some(2006)),
+            ],
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        let mut updated = vec![
+            draft(1535, "Death Note", 3, Some(2006)),
+            draft(1, "Cowboy Bebop", 1, Some(1998)),
+        ];
+        updated[0].dub = true;
+        updated[0].sub_lang = "Arabic".to_string();
+
+        // Wrong profile rejected
+        assert!(!update_playlist_items(&pool, "other", pid, &updated, 2_000).await.unwrap());
+        // Owner updates atomically
+        assert!(update_playlist_items(&pool, "default", pid, &updated, 2_000).await.unwrap());
+
+        let items = get_playlist_items(&pool, pid).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Death Note");
+        assert!(items[0].dub);
+        assert_eq!(items[0].sub_lang, "Arabic");
+        assert_eq!(items[0].position, 0);
+        assert_eq!(items[1].title, "Cowboy Bebop");
+        assert_eq!(items[1].position, 1);
     }
 }

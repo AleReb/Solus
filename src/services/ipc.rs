@@ -440,6 +440,7 @@ where
     let mut last_saved_pos = 0.0;
     let mut last_save_time = tokio::time::Instant::now();
     let mut scrobbled = false;
+    let mut near_eof_prefetched = false;
     let mut skipped_intervals: HashSet<String> = HashSet::new();
     let mut last_audio_tracks: Vec<crate::services::remote::RemoteAudioTrack> = Vec::new();
     let mut in_loading_screen = has_loading_screen;
@@ -603,6 +604,17 @@ where
                                         episode
                                     )))
                                     .await;
+                            }
+
+                            // 2b. Trigger Just-In-Time N+1 queue prefetch strictly within 90s of EOF
+                            // so CDN stream URLs never expire while watching long episodes.
+                            if !near_eof_prefetched
+                                && current_duration > 60.0
+                                && current_duration > current_pos
+                                && (current_duration - current_pos) <= 90.0
+                            {
+                                near_eof_prefetched = true;
+                                let _ = tx.send(AppMessage::NearEofPrefetch(anime_id, episode)).await;
                             }
 
                             // 3. Throttle progress updates to UI and database

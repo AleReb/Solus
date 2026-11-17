@@ -159,6 +159,15 @@ pub enum EpisodeViewMode {
     Split,
 }
 
+/// Purpose of the `PlaybackOptions` overlay (play now, pre-configure queue item, or edit existing entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaybackOptionsPurpose {
+    #[default]
+    LaunchNow,
+    EnqueueSingle,
+    EditQueueItem { uid: u64 },
+}
+
 #[derive(Clone)]
 struct DetailSnapshot {
     anime: Anime,
@@ -302,6 +311,9 @@ pub struct AppState {
 
     /// Playback options: pending sub/dub mode for the next launch
     pub pending_dub:       bool,
+
+    /// Playback options purpose (LaunchNow, EnqueueSingle, or EditQueueItem)
+    pub playback_options_purpose: PlaybackOptionsPurpose,
 
     /// Playback: oneshot sender to stop the background player task
     pub player_stop:      Option<tokio::sync::oneshot::Sender<()>>,
@@ -606,6 +618,8 @@ pub struct AppState {
     pub queue_focus_pane:        usize,
     pub queue_cursor:            usize,
     pub playlist_cursor:         usize,
+    pub playlist_focus_items:    bool,
+    pub playlist_item_cursor:    usize,
     pub queue_save_mode:         bool,
     pub queue_save_input:        String,
 
@@ -614,6 +628,8 @@ pub struct AppState {
     pub batch_queue_mode:          usize,
     pub batch_queue_range:         String,
     pub batch_queue_dub:           bool,
+    pub batch_queue_quality:       String,
+    pub batch_queue_sub_lang:      String,
 }
 
 impl AppState {
@@ -665,6 +681,7 @@ impl AppState {
             pending_master_url: None,
             pending_playback_query: None,
             pending_dub: false,
+            playback_options_purpose: PlaybackOptionsPurpose::LaunchNow,
             player_stop:      None,
             now_playing:      None,
             playback_logs:    Vec::new(),
@@ -790,12 +807,16 @@ impl AppState {
             queue_focus_pane: 0,
             queue_cursor: 0,
             playlist_cursor: 0,
+            playlist_focus_items: false,
+            playlist_item_cursor: 0,
             queue_save_mode: false,
             queue_save_input: String::new(),
             is_batch_queue_modal_open: false,
             batch_queue_mode: 0,
             batch_queue_range: String::new(),
             batch_queue_dub: false,
+            batch_queue_quality: "1080p".to_string(),
+            batch_queue_sub_lang: "English".to_string(),
         }
     }
 
@@ -1052,6 +1073,8 @@ impl AppState {
         self.saved_playlists = playlists;
         self.queue_save_mode = false;
         self.queue_save_input.clear();
+        self.playlist_focus_items = false;
+        self.playlist_item_cursor = 0;
         if self.queue_cursor >= self.queue.len() {
             self.queue_cursor = self.queue.len().saturating_sub(1);
         }
@@ -1065,7 +1088,20 @@ impl AppState {
     }
 
     /// Open the Detail batch quick-queue preset / range modal (`[E]`).
+    #[allow(dead_code)]
     pub fn open_batch_queue_modal(&mut self, default_dub: bool) {
+        let q = self.batch_queue_quality.clone();
+        let sub = self.batch_queue_sub_lang.clone();
+        self.open_batch_queue_modal_with_prefs(default_dub, &q, &sub);
+    }
+
+    /// Open the Detail batch quick-queue modal seeded with active user quality and subtitle defaults.
+    pub fn open_batch_queue_modal_with_prefs(
+        &mut self,
+        default_dub: bool,
+        quality:     &str,
+        sub_lang:    &str,
+    ) {
         let ep = self.selected_episode.unwrap_or(1);
         let max_aired = self
             .selected_anime
@@ -1082,6 +1118,16 @@ impl AppState {
             format!("{ep}")
         };
         self.batch_queue_dub = default_dub;
+        self.batch_queue_quality = if quality.trim().is_empty() {
+            "1080p".to_string()
+        } else {
+            quality.to_string()
+        };
+        self.batch_queue_sub_lang = if sub_lang.trim().is_empty() {
+            "English".to_string()
+        } else {
+            sub_lang.to_string()
+        };
     }
 
     /// Open the in-app update modal dialog.
@@ -1240,6 +1286,7 @@ impl AppState {
 
     /// Open the playback options overlay after a query has been chosen.
     pub fn open_playback_options(&mut self, query: String, quality_idx: usize, dub: bool, player: crate::config::Player) {
+        self.playback_options_purpose = PlaybackOptionsPurpose::LaunchNow;
         self.pending_playback_query = Some(query);
         self.playback_qualities.clear();
         self.playback_quality_cursor = quality_idx;
