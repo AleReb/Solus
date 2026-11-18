@@ -32,6 +32,25 @@ Watching anime on the web usually means choosing between a bloated streaming sit
 
 ## ❖ One-Command Installation
 
+### Raspberry Pi / uConsole — Linux ARM64
+
+This branch adds an optional native ARM64 installer, kept separate from the original
+installers and Rust application so the changes can be reviewed and merged independently.
+From this checkout, choose **Foot** (Wayland), **Kitty**, or keep your current terminal:
+
+```bash
+bash scripts/raspberry-pi/install.sh
+# Or choose without prompting:
+bash scripts/raspberry-pi/install.sh --terminal foot
+bash scripts/raspberry-pi/install.sh --terminal kitty
+```
+
+Use a **64-bit OS** (`uname -m` must report `aarch64`). The first installation compiles
+locally and can take considerable time and memory. Both Foot and Kitty displayed
+cover art in testing on a Raspberry Pi Compute Module 5 uConsole running Debian 13.
+See the [Raspberry Pi guide](docs/raspberry-pi.md) for USB downloads, build requirements,
+checks, limitations, and Spanish instructions. Original installation instructions follow.
+
 Paste **one command** for your platform—it automatically installs `solus`, `mpv`, `ani-cli`, `yt-dlp`, `ffmpeg`, and an image-capable terminal (`Kitty` on macOS/Linux, `WezTerm` on Windows) so everything works immediately.
 
 ### macOS & Linux
