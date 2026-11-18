@@ -38,6 +38,12 @@ pub struct PlayOptions {
     pub sub_style: Option<crate::services::substyler::SubtitleStyleConfig>,
     /// Optional Y2K loading screen image shown in `mpv` while the stream prefetches
     pub loading_image: Option<String>,
+    /// Persistent subtitle synchronization delay in milliseconds (0 = no delay)
+    #[serde(default)]
+    pub sub_delay_ms: i32,
+    /// Explicit "No subtitles" toggle (disables subtitle tracks across mpv/iina/vlc)
+    #[serde(default)]
+    pub subtitles_disabled: bool,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -380,7 +386,15 @@ elif [[ "$REAL_PLAYER" =~ vlc ]] || [[ "$REAL_PLAYER" =~ VLC ]]; then
     is_vlc=1
 fi
 
-if [ -n "$SOLUS_SUB_URL" ]; then
+if [ "$SOLUS_SUB_DISABLED" = "1" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-sid=no" "--mpv-sub-visibility=no")
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=("--no-spu")
+    else
+        args+=("--sid=no" "--sub-visibility=no")
+    fi
+elif [ -n "$SOLUS_SUB_URL" ]; then
     if [ "$is_iina" -eq 1 ]; then
         escaped_sub="${SOLUS_SUB_URL//:/\\:}"
         args+=("--mpv-sub-files=$escaped_sub" "--mpv-sub-visibility=yes")
@@ -388,6 +402,14 @@ if [ -n "$SOLUS_SUB_URL" ]; then
         args+=(":sub-file=$SOLUS_SUB_URL")
     else
         args+=("--sub-file=$SOLUS_SUB_URL" "--sub-visibility=yes" "--sub-auto=fuzzy")
+    fi
+fi
+
+if [ -n "$SOLUS_SUB_DELAY" ] && [ "$SOLUS_SUB_DELAY" != "0" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-sub-delay=$SOLUS_SUB_DELAY")
+    elif [ "$is_vlc" -eq 0 ]; then
+        args+=("--sub-delay=$SOLUS_SUB_DELAY")
     fi
 fi
 
@@ -733,12 +755,24 @@ pub fn build_mpv_direct_args(
         opts.title, opts.episode
     ));
 
-    if let Some(ref url) = opts.sub_url {
+    let subs_disabled = opts.subtitles_disabled
+        || opts
+            .sub_lang
+            .as_deref()
+            .is_some_and(|l| l.eq_ignore_ascii_case("none"));
+    if subs_disabled {
+        args.push("--sid=no".to_string());
+        args.push("--sub-visibility=no".to_string());
+    } else if let Some(ref url) = opts.sub_url {
         if !url.is_empty() {
             args.push(format!("--sub-file={}", url));
             args.push("--sub-visibility=yes".to_string());
             args.push("--sub-auto=fuzzy".to_string());
         }
+    }
+    if opts.sub_delay_ms != 0 {
+        let delay_secs = opts.sub_delay_ms as f64 / 1000.0;
+        args.push(format!("--sub-delay={:.3}", delay_secs));
     }
     if let Some(master_url) = derive_master_playlist_url(direct_url) {
         args.push(format!("--audio-file={}", master_url));
@@ -809,6 +843,12 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
 
             let mut cmd = Command::new(&player);
 
+            let subs_disabled = opts.subtitles_disabled
+                || opts
+                    .sub_lang
+                    .as_deref()
+                    .is_some_and(|l| l.eq_ignore_ascii_case("none"));
+
             if is_vlc {
                 // VLC-native arguments:
                 // --play-and-exit ensures VLC immediately quits when playback finishes or the window is closed
@@ -822,10 +862,18 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 } else {
                     cmd.arg("--audio-language=ja,jpn");
                 }
+                if subs_disabled {
+                    cmd.arg("--no-spu");
+                }
+                if opts.sub_delay_ms != 0 {
+                    cmd.arg(format!("--sub-delay={}", opts.sub_delay_ms / 100));
+                }
                 cmd.arg(direct_url);
-                if let Some(ref url) = opts.sub_url {
-                    if !url.is_empty() {
-                        cmd.arg(format!(":sub-file={}", url));
+                if !subs_disabled {
+                    if let Some(ref url) = opts.sub_url {
+                        if !url.is_empty() {
+                            cmd.arg(format!(":sub-file={}", url));
+                        }
                     }
                 }
                 if let Some(pos) = opts.start_pos {
@@ -851,11 +899,17 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                     cmd.env("SOLUS_IPC_SOCKET", sock);
                     cmd.arg(format!("--mpv-input-ipc-server={}", sock));
                 }
-                if let Some(ref url) = opts.sub_url {
+                if subs_disabled {
+                    cmd.arg("--mpv-sid=no");
+                    cmd.arg("--mpv-sub-visibility=no");
+                } else if let Some(ref url) = opts.sub_url {
                     if !url.is_empty() {
                         cmd.arg(format!("--mpv-sub-file={}", url));
                         cmd.arg("--mpv-sub-visibility=yes");
                     }
+                }
+                if opts.sub_delay_ms != 0 {
+                    cmd.arg(format!("--mpv-sub-delay={:.3}", opts.sub_delay_ms as f64 / 1000.0));
                 }
                 if opts.dub {
                     cmd.arg("--mpv-alang=en,eng,English");
@@ -943,10 +997,18 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.env("SOLUS_AUDIO_DUB", "0");
             }
 
-            if let Some(ref url) = opts.sub_url {
+            if subs_disabled {
+                cmd.env("SOLUS_SUB_DISABLED", "1");
+            } else if let Some(ref url) = opts.sub_url {
                 if !url.is_empty() {
                     cmd.env("SOLUS_SUB_URL", url);
                 }
+            }
+            if opts.sub_delay_ms != 0 {
+                cmd.env(
+                    "SOLUS_SUB_DELAY",
+                    format!("{:.3}", opts.sub_delay_ms as f64 / 1000.0),
+                );
             }
 
             return cmd
@@ -1088,7 +1150,23 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         }
     }
 
-    if let Some(ref url) = opts.sub_url {
+    let subs_disabled = opts.subtitles_disabled
+        || opts
+            .sub_lang
+            .as_deref()
+            .is_some_and(|l| l.eq_ignore_ascii_case("none"));
+    if subs_disabled {
+        cmd.env("SOLUS_SUB_DISABLED", "1");
+        if player.contains("iina") {
+            player_flags.push("--mpv-sid=no".to_string());
+            player_flags.push("--mpv-sub-visibility=no".to_string());
+        } else if player.contains("vlc") {
+            player_flags.push("--no-spu".to_string());
+        } else {
+            player_flags.push("--sid=no".to_string());
+            player_flags.push("--sub-visibility=no".to_string());
+        }
+    } else if let Some(ref url) = opts.sub_url {
         if !url.is_empty() {
             if player.contains("iina") {
                 player_flags.push(format!("--mpv-sub-file={}", url));
@@ -1104,6 +1182,15 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 player_flags.push("--sub-visibility=yes".to_string());
                 player_flags.push("--sub-auto=fuzzy".to_string());
             }
+        }
+    }
+    if opts.sub_delay_ms != 0 {
+        let secs = format!("{:.3}", opts.sub_delay_ms as f64 / 1000.0);
+        cmd.env("SOLUS_SUB_DELAY", &secs);
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-sub-delay={}", secs));
+        } else if !player.contains("vlc") {
+            player_flags.push(format!("--sub-delay={}", secs));
         }
     }
 
@@ -1147,6 +1234,8 @@ mod tests {
             glsl_shaders: None,
             sub_style: None,
             loading_image: None,
+            sub_delay_ms: 0,
+            subtitles_disabled: false,
         }
     }
 
@@ -1209,6 +1298,8 @@ mod tests {
             glsl_shaders: None,
             sub_style: None,
             loading_image: None,
+            sub_delay_ms: 0,
+            subtitles_disabled: false,
         });
         assert_eq!(
             args,
@@ -1243,6 +1334,8 @@ mod tests {
             glsl_shaders: None,
             sub_style: None,
             loading_image: None,
+            sub_delay_ms: 0,
+            subtitles_disabled: false,
         });
         assert_eq!(
             args,
@@ -1342,5 +1435,25 @@ mod tests {
         assert_eq!(args[first_group + 2], "--}");
         assert_eq!(args[first_group + 3], "--{");
         assert_eq!(args.last().unwrap(), "--}");
+    }
+
+    #[test]
+    fn test_no_subtitles_and_sub_delay_mpv_flags() {
+        let mut o = opts("Cowboy Bebop", 1, "1080p", true);
+        o.subtitles_disabled = true;
+        o.sub_url = Some("https://cdn.example.com/eng.vtt".to_string());
+        o.sub_delay_ms = -250;
+
+        let args = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
+        assert!(args.contains(&"--sid=no".to_string()));
+        assert!(args.contains(&"--sub-visibility=no".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--sub-file=")));
+        assert!(args.contains(&"--sub-delay=-0.250".to_string()));
+
+        o.subtitles_disabled = false;
+        o.sub_delay_ms = 250;
+        let args_pos = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
+        assert!(args_pos.contains(&"--sub-file=https://cdn.example.com/eng.vtt".to_string()));
+        assert!(args_pos.contains(&"--sub-delay=0.250".to_string()));
     }
 }

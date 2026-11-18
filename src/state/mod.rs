@@ -168,6 +168,36 @@ pub enum PlaybackOptionsPurpose {
     EditQueueItem { uid: u64 },
 }
 
+/// Confidence source ranking for canonical episode metadata and thumbnails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub enum ThumbnailSource {
+    Fallback = 0,
+    AniListIndexFallback = 1,
+    Kitsu = 2,
+    AniListTitle = 3,
+    AniZip = 4,
+}
+
+/// Canonical episode metadata & source-ranked thumbnail record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeMediaMetadata {
+    pub anime_id: i64,
+    pub episode: u32,
+    pub title: String,
+    pub synopsis: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub thumbnail_source: ThumbnailSource,
+}
+
+/// Per-episode thumbnail lifecycle state preventing repeated untrimmed replacement flicker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeThumbnailState {
+    Empty,
+    Fallback,
+    Loading,
+    Ready,
+}
+
 #[derive(Clone)]
 struct DetailSnapshot {
     anime: Anime,
@@ -638,6 +668,16 @@ pub struct AppState {
     pub batch_queue_dub:           bool,
     pub batch_queue_quality:       String,
     pub batch_queue_sub_lang:      String,
+
+    /// Playback & metadata request generations + shared subtitle/thumbnail reliability state
+    pub playback_request_generation: u64,
+    pub episode_metadata_generation: u64,
+    pub subtitle_delay_ms:           i32,
+    pub preferred_subtitle_code:     String,
+    pub episode_media_meta:          HashMap<u32, EpisodeMediaMetadata>,
+    pub episode_raw_thumbnails:      HashMap<u32, image::DynamicImage>,
+    pub episode_thumbnail_states:    HashMap<u32, EpisodeThumbnailState>,
+    pub thumbnail_geometry_key:      Option<(u16, u16, u16, u16)>,
 }
 
 impl AppState {
@@ -831,6 +871,36 @@ impl AppState {
             batch_queue_dub: false,
             batch_queue_quality: "1080p".to_string(),
             batch_queue_sub_lang: "English".to_string(),
+            playback_request_generation: 0,
+            episode_metadata_generation: 0,
+            subtitle_delay_ms: 0,
+            preferred_subtitle_code: String::new(),
+            episode_media_meta: HashMap::new(),
+            episode_raw_thumbnails: HashMap::new(),
+            episode_thumbnail_states: HashMap::new(),
+            thumbnail_geometry_key: None,
+        }
+    }
+
+    pub fn bump_playback_request_generation(&mut self) -> u64 {
+        self.playback_request_generation = self.playback_request_generation.saturating_add(1);
+        self.playback_request_generation
+    }
+
+    pub fn bump_episode_metadata_generation(&mut self) -> u64 {
+        self.episode_metadata_generation = self.episode_metadata_generation.saturating_add(1);
+        self.episode_metadata_generation
+    }
+
+    pub fn subtitle_delay_secs(&self) -> f64 {
+        self.subtitle_delay_ms as f64 / 1000.0
+    }
+
+    pub fn format_subtitle_delay(&self) -> String {
+        if self.subtitle_delay_ms == 0 {
+            "0ms (0.0s)".to_string()
+        } else {
+            format!("{:+}ms ({:+.1}s)", self.subtitle_delay_ms, self.subtitle_delay_secs())
         }
     }
 
@@ -1029,6 +1099,11 @@ impl AppState {
         self.episode_thumbnails.clear();
         self.episode_fallback_thumbnails.clear();
         self.loading_episode_thumbnails.clear();
+        self.episode_media_meta.clear();
+        self.episode_raw_thumbnails.clear();
+        self.episode_thumbnail_states.clear();
+        self.bump_episode_metadata_generation();
+        self.bump_playback_request_generation();
         self.current_card_img = None;
         self.loading_episode_metadata = true;
         self.anime_progress.clear();
@@ -1300,6 +1375,7 @@ impl AppState {
 
     /// Open the playback options overlay after a query has been chosen.
     pub fn open_playback_options(&mut self, query: String, quality_idx: usize, dub: bool, player: crate::config::Player) {
+        self.bump_playback_request_generation();
         self.playback_options_purpose = PlaybackOptionsPurpose::LaunchNow;
         self.pending_playback_query = Some(query);
         self.playback_qualities.clear();
@@ -1320,7 +1396,17 @@ impl AppState {
         self.is_loading_subs = true;
         self.pending_master_url = None;
         self.playback_audio_tracks.clear();
-        self.playback_sub_languages = vec![crate::api::subtitles::SubtitleOption::default_english()];
+        self.playback_sub_languages = vec![
+            crate::api::subtitles::SubtitleOption::none_option(),
+            crate::api::subtitles::SubtitleOption::default_english(),
+        ];
+        self.playback_sub_cursor = if self.preferred_subtitle_code.eq_ignore_ascii_case("none")
+            || (dub && self.preferred_subtitle_code.trim().is_empty())
+        {
+            0
+        } else {
+            1
+        };
         self.screen = Screen::PlaybackOptions;
     }
 
@@ -1365,6 +1451,9 @@ impl AppState {
 
             if !prov.subtitles.is_empty() {
                 self.playback_sub_languages = prov.subtitles.clone();
+                crate::api::subtitles::SubtitleOption::ensure_none_option_first(
+                    &mut self.playback_sub_languages,
+                );
                 if let Some(ref code) = curr_sub_code {
                     self.playback_sub_cursor = self
                         .playback_sub_languages
@@ -1904,5 +1993,78 @@ mod tests {
         assert!(state.resolve_cover_protocol(77, 19, 11, 0.20, true).is_some());
         assert!(state.fitted_cover_cache.contains_key(&(77, 16, 11)));
         assert!(state.fitted_cover_cache.contains_key(&(77, 19, 11)));
+    }
+
+    #[test]
+    fn test_playback_request_and_metadata_generation_isolation() {
+        assert!(ThumbnailSource::AniZip > ThumbnailSource::AniListTitle);
+        assert!(ThumbnailSource::AniListTitle > ThumbnailSource::Kitsu);
+        assert!(ThumbnailSource::Kitsu > ThumbnailSource::AniListIndexFallback);
+        assert!(ThumbnailSource::AniListIndexFallback > ThumbnailSource::Fallback);
+
+        let mut state = AppState::new();
+        let anime = crate::db::cache::Anime {
+            id: 11061,
+            title_romaji: "Hunter x Hunter (2011)".to_string(),
+            episodes: Some(148),
+            ..Default::default()
+        };
+
+        state.open_detail(anime);
+        let gen1 = state.episode_metadata_generation;
+        assert!(gen1 > 0);
+
+        state.open_playback_options(
+            "Hunter x Hunter (2011)".to_string(),
+            0,
+            true,
+            crate::config::Player::Mpv,
+        );
+        let pb_gen1 = state.playback_request_generation;
+        assert!(pb_gen1 > 0);
+        // Optimistically seeded with "No subtitles" first and Dub default at index 0.
+        assert!(!state.playback_sub_languages.is_empty());
+        assert!(state.playback_sub_languages[0].is_none());
+        assert_eq!(state.playback_sub_cursor, 0);
+
+        let pb_gen2 = state.bump_playback_request_generation();
+        assert!(pb_gen2 > pb_gen1);
+
+        // Provider sync preserves "No subtitles" ahead of provider tracks.
+        state.playback_providers = vec![crate::api::subtitles::ProviderOption {
+            id: "zoko".into(),
+            name: "Zoko".into(),
+            server_label: "Zoko".into(),
+            supports_sub: true,
+            supports_dub: true,
+            master_url: None,
+            qualities: vec![],
+            subtitles: vec![crate::api::subtitles::SubtitleOption {
+                name: "English".into(),
+                code: "eng".into(),
+                url: "https://example.com/en.vtt".into(),
+                stream_label: "Zoko".into(),
+            }],
+        }];
+        state.playback_provider_cursor = 0;
+        state.sync_active_provider();
+        assert_eq!(state.playback_sub_languages.len(), 2);
+        assert!(state.playback_sub_languages[0].is_none());
+        assert_eq!(state.playback_sub_languages[1].code, "eng");
+
+        // Opening another anime bumps episode metadata generation & clears stale raw thumbnails.
+        let other = crate::db::cache::Anime {
+            id: 21,
+            title_romaji: "ONE PIECE".to_string(),
+            episodes: Some(1000),
+            ..Default::default()
+        };
+        state.episode_raw_thumbnails.insert(
+            13,
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(16, 9)),
+        );
+        state.open_detail(other);
+        assert!(state.episode_metadata_generation > gen1);
+        assert!(state.episode_raw_thumbnails.is_empty());
     }
 }

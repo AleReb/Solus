@@ -596,6 +596,78 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
     frame.render_widget(Paragraph::new(Line::from(btn_spans)), btn_area);
 }
 
+/// Render an episode's 16:9 thumbnail (or lazy fallback banner) inside `thumb_area`,
+/// rebuilding cached image protocols only when the widget geometry or font size changes.
+fn render_episode_thumbnail_slot(
+    frame: &mut Frame,
+    state: &mut AppState,
+    ep: u32,
+    thumb_area: Rect,
+) -> bool {
+    let font_size = state.picker.map(|p| p.font_size).unwrap_or((12, 24));
+    let geo_key = (thumb_area.width, thumb_area.height, font_size.0, font_size.1);
+    if thumb_area.width > 0 && thumb_area.height > 0 && state.thumbnail_geometry_key != Some(geo_key) {
+        let had_prev_geo = state.thumbnail_geometry_key.is_some();
+        state.thumbnail_geometry_key = Some(geo_key);
+        if had_prev_geo {
+            if let Some(picker) = state.picker {
+                let raw_eps: Vec<(u32, image::DynamicImage)> = state
+                    .episode_raw_thumbnails
+                    .iter()
+                    .map(|(&ep_k, img)| (ep_k, img.clone()))
+                    .collect();
+                for (ep_k, raw) in raw_eps {
+                    let prepared = crate::ui::components::cover::scale_to_frame_cover(
+                        raw,
+                        thumb_area.width,
+                        thumb_area.height,
+                        picker.font_size,
+                        0.20,
+                    );
+                    state.episode_thumbnails.insert(
+                        ep_k,
+                        crate::ui::components::cover::build_stateful_protocol(picker, prepared),
+                    );
+                }
+                state.episode_fallback_thumbnails.clear();
+            }
+        }
+    }
+
+    if !state.has_image_support() {
+        return false;
+    }
+
+    if let Some(thumb) = state.episode_thumbnails.get_mut(&ep) {
+        frame.render_stateful_widget(
+            crate::ui::components::cover::hd_image_widget(),
+            thumb_area,
+            thumb,
+        );
+        return true;
+    }
+
+    if !state.episode_fallback_thumbnails.contains_key(&ep) {
+        if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
+            let proto = crate::ui::components::cover::build_stateful_protocol(
+                picker,
+                card_img.clone(),
+            );
+            state.episode_fallback_thumbnails.insert(ep, proto);
+        }
+    }
+    if let Some(fallback_thumb) = state.episode_fallback_thumbnails.get_mut(&ep) {
+        frame.render_stateful_widget(
+            crate::ui::components::cover::hd_image_widget(),
+            thumb_area,
+            fallback_thumb,
+        );
+        return true;
+    }
+
+    false
+}
+
 /// Dispatch episode browser to selected layout (List or Split-Deck).
 fn render_episodes(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
     match state.episode_view_mode {
@@ -658,7 +730,8 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
     let end_idx = (state.episode_offset + visible_cards).min(total_items);
 
     let mut current_y = inner.y;
-    for &ep in &state.episode_list[state.episode_offset..end_idx] {
+    let visible_eps: Vec<u32> = state.episode_list[state.episode_offset..end_idx].to_vec();
+    for ep in visible_eps {
         if current_y + card_height > inner.y + inner.height {
             break;
         }
@@ -748,35 +821,7 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 
         // ── Render 16:9 Thumbnail (Dedicated per-episode StatefulProtocol — zero Kitty collisions) ──
         let thumb_rect = card_cols[0];
-        let mut rendered_img = false;
-        if state.has_image_support() {
-            if let Some(thumb) = state.episode_thumbnails.get_mut(&ep) {
-                frame.render_stateful_widget(
-                    crate::ui::components::cover::hd_image_widget(),
-                    thumb_rect,
-                    thumb,
-                );
-                rendered_img = true;
-            } else {
-                if !state.episode_fallback_thumbnails.contains_key(&ep) {
-                    if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
-                        let proto = crate::ui::components::cover::build_stateful_protocol(
-                            picker,
-                            card_img.clone(),
-                        );
-                        state.episode_fallback_thumbnails.insert(ep, proto);
-                    }
-                }
-                if let Some(fallback_thumb) = state.episode_fallback_thumbnails.get_mut(&ep) {
-                    frame.render_stateful_widget(
-                        crate::ui::components::cover::hd_image_widget(),
-                        thumb_rect,
-                        fallback_thumb,
-                    );
-                    rendered_img = true;
-                }
-            }
-        }
+        let rendered_img = render_episode_thumbnail_slot(frame, state, ep, thumb_rect);
 
         if !rendered_img {
             // Stylized placeholder card
@@ -1095,36 +1140,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     let specs_area = top_split[1];
     let is_aired = selected_ep <= max_aired;
     let is_watched = state.watched_episodes.contains(&selected_ep);
-
-    let mut rendered_img = false;
-    if state.has_image_support() {
-        if let Some(thumb) = state.episode_thumbnails.get_mut(&selected_ep) {
-            frame.render_stateful_widget(
-                crate::ui::components::cover::hd_image_widget(),
-                thumb_area,
-                thumb,
-            );
-            rendered_img = true;
-        } else {
-            if !state.episode_fallback_thumbnails.contains_key(&selected_ep) {
-                if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
-                    let proto = crate::ui::components::cover::build_stateful_protocol(
-                        picker,
-                        card_img.clone(),
-                    );
-                    state.episode_fallback_thumbnails.insert(selected_ep, proto);
-                }
-            }
-            if let Some(fallback_thumb) = state.episode_fallback_thumbnails.get_mut(&selected_ep) {
-                frame.render_stateful_widget(
-                    crate::ui::components::cover::hd_image_widget(),
-                    thumb_area,
-                    fallback_thumb,
-                );
-                rendered_img = true;
-            }
-        }
-    }
+    let rendered_img = render_episode_thumbnail_slot(frame, state, selected_ep, thumb_area);
 
     if !rendered_img {
         let bg = if !is_aired { Color::Rgb(20, 20, 25) } else { Color::Rgb(30, 25, 45) };

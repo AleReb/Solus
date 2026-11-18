@@ -861,6 +861,131 @@ pub async fn get_audio_mode(pool: &SqlitePool, anime_id: i64) -> Result<Option<A
     }))
 }
 
+/// Persistent per-profile playback defaults (shared across TUI, queue, remote, and mpv launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilePlaybackSettings {
+    pub profile_id:        String,
+    pub dub:               bool,
+    pub subtitle_code:     String,
+    pub subtitle_delay_ms: i32,
+    pub quality:           String,
+    pub preferred_player:  String,
+}
+
+impl Default for ProfilePlaybackSettings {
+    fn default() -> Self {
+        Self {
+            profile_id:        "default".to_string(),
+            dub:               false,
+            subtitle_code:     "eng".to_string(),
+            subtitle_delay_ms: 0,
+            quality:           "1080p".to_string(),
+            preferred_player:  "mpv".to_string(),
+        }
+    }
+}
+
+/// Fetch profile-scoped playback settings if previously stored.
+pub async fn get_profile_playback_settings(
+    pool:       &SqlitePool,
+    profile_id: &str,
+) -> Option<ProfilePlaybackSettings> {
+    let row = sqlx::query(
+        "SELECT profile_id, dub, subtitle_code, subtitle_delay_ms, quality, preferred_player
+         FROM profile_playback_settings WHERE profile_id = ?",
+    )
+    .bind(profile_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    Some(ProfilePlaybackSettings {
+        profile_id:        row.get("profile_id"),
+        dub:               row.get::<i64, _>("dub") != 0,
+        subtitle_code:     row.get("subtitle_code"),
+        subtitle_delay_ms: row.get::<i64, _>("subtitle_delay_ms") as i32,
+        quality:           row.get("quality"),
+        preferred_player:  row.get("preferred_player"),
+    })
+}
+
+/// Save complete profile-scoped playback settings.
+pub async fn save_profile_playback_settings(
+    pool:     &SqlitePool,
+    settings: &ProfilePlaybackSettings,
+    now:      i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO profile_playback_settings (
+            profile_id, dub, subtitle_code, subtitle_delay_ms, quality, preferred_player, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(profile_id) DO UPDATE SET
+            dub               = excluded.dub,
+            subtitle_code     = excluded.subtitle_code,
+            subtitle_delay_ms = excluded.subtitle_delay_ms,
+            quality           = excluded.quality,
+            preferred_player  = excluded.preferred_player,
+            updated_at        = excluded.updated_at",
+    )
+    .bind(&settings.profile_id)
+    .bind(if settings.dub { 1i64 } else { 0i64 })
+    .bind(&settings.subtitle_code)
+    .bind(settings.subtitle_delay_ms as i64)
+    .bind(&settings.quality)
+    .bind(&settings.preferred_player)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Persist updated subtitle delay in milliseconds for the active profile.
+pub async fn save_profile_subtitle_delay_ms(
+    pool:       &SqlitePool,
+    profile_id: &str,
+    delay_ms:   i32,
+    now:        i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO profile_playback_settings (
+            profile_id, subtitle_delay_ms, updated_at
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(profile_id) DO UPDATE SET
+            subtitle_delay_ms = excluded.subtitle_delay_ms,
+            updated_at        = excluded.updated_at",
+    )
+    .bind(profile_id)
+    .bind(delay_ms as i64)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Persist updated subtitle selection code (`"none"` or track code) for the active profile.
+pub async fn save_profile_subtitle_code(
+    pool:          &SqlitePool,
+    profile_id:    &str,
+    subtitle_code: &str,
+    now:           i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO profile_playback_settings (
+            profile_id, subtitle_code, updated_at
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(profile_id) DO UPDATE SET
+            subtitle_code = excluded.subtitle_code,
+            updated_at    = excluded.updated_at",
+    )
+    .bind(profile_id)
+    .bind(subtitle_code)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Update or insert continue_watching without marking episode in history as completed yet.
 pub async fn touch_continue_watching(
     pool:     &SqlitePool,
@@ -2761,5 +2886,39 @@ mod tests {
         assert!(delete_profile(&pool, &brother.id).await.unwrap());
         assert!(!delete_profile(&pool, "default").await.unwrap());
         assert_eq!(get_watched_episodes(&pool, 777).await.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_profile_playback_settings_roundtrip() {
+        let pool = setup().await;
+
+        assert!(get_profile_playback_settings(&pool, "default").await.is_none());
+
+        let settings = ProfilePlaybackSettings {
+            profile_id: "default".to_string(),
+            dub: true,
+            subtitle_code: "none".to_string(),
+            subtitle_delay_ms: -350,
+            quality: "1080p".to_string(),
+            preferred_player: "mpv".to_string(),
+        };
+        save_profile_playback_settings(&pool, &settings, 5000)
+            .await
+            .unwrap();
+
+        let loaded = get_profile_playback_settings(&pool, "default")
+            .await
+            .expect("settings should persist");
+        assert_eq!(loaded, settings);
+
+        save_profile_subtitle_delay_ms(&pool, "default", 250, 5100)
+            .await
+            .unwrap();
+        save_profile_subtitle_code(&pool, "default", "eng", 5200)
+            .await
+            .unwrap();
+        let updated = get_profile_playback_settings(&pool, "default").await.unwrap();
+        assert_eq!(updated.subtitle_delay_ms, 250);
+        assert_eq!(updated.subtitle_code, "eng");
     }
 }

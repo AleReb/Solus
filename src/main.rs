@@ -113,7 +113,7 @@ enum AppMessage {
     /// Home banner watched-episode count for the active anime
     BannerProgress(i64, usize),
     /// Dynamic stream info (qualities, subtitles, master_url) detected for an anime episode
-    StreamInfoDetected(i64, u32, bool, api::subtitles::StreamInfo),
+    StreamInfoDetected(i64, u32, bool, u64, api::subtitles::StreamInfo),
     /// Airing status and next episode refreshed from AniList
     AiringStatusUpdated(i64, Option<String>, Option<i64>, Option<i64>),
     /// Local JSON archive import completed (stats or error message)
@@ -136,10 +136,10 @@ enum AppMessage {
     },
     /// Weekly release calendar fetch failed for `week_offset`
     CalendarWeekFailed(i32, String),
-    /// Episode titles, streaming thumbnails and synopses loaded (anime_id, map of ep -> (title, Option<thumbnail_url>, Option<synopsis>))
-    EpisodeMetadataReady(i64, std::collections::HashMap<u32, (String, Option<String>, Option<String>)>),
-    /// Episode thumbnail image downloaded and decoded (anime_id, episode_num, image)
-    EpisodeThumbnailReady(i64, u32, image::DynamicImage),
+    /// Episode titles, streaming thumbnails, synopses and confidence metadata loaded
+    EpisodeMetadataReady(i64, u64, std::collections::HashMap<u32, state::EpisodeMediaMetadata>),
+    /// Episode thumbnail image downloaded and decoded (anime_id, episode_num, metadata_generation, source_url, image)
+    EpisodeThumbnailReady(i64, u32, u64, String, image::DynamicImage),
     /// Show's 16:9 banner image downloaded and decoded (anime_id, image)
     AnimeBannerReady(i64, image::DynamicImage),
     /// Live playback progress updated via mpv IPC (anime_id, episode, pos_secs, duration_secs)
@@ -194,6 +194,10 @@ enum AppMessage {
     RemoteQueuePlayIndex(usize),
     /// Mobile companion toggled Queue Auto-Advance
     RemoteQueueToggleAuto,
+    /// Mobile companion changed live subtitle delay (milliseconds)
+    RemoteSubDelayChanged(i32),
+    /// Mobile companion changed subtitle track selection (or disabled subtitles)
+    RemoteSubtitleSelectionChanged(api::subtitles::SubtitleSelection),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -385,11 +389,16 @@ async fn main() -> anyhow::Result<()> {
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
+    if let Some(pb_settings) = db::user::get_profile_playback_settings(&pool, &state.active_profile_id).await {
+        state.subtitle_delay_ms = pb_settings.subtitle_delay_ms.clamp(-30_000, 30_000);
+        state.preferred_subtitle_code = pb_settings.subtitle_code;
+    }
     state.queue = services::queue::load_active_queue(&state.active_profile_id, boot_now as u64);
     {
         let mut st = state.remote_state.write().await;
         st.active_profile = state.active_profile_name.clone();
         st.profile_icon = state.active_profile_icon.clone();
+        st.sub_delay = state.subtitle_delay_secs();
         st.queue_auto_advance = state.queue.auto_advance;
         st.queue_loop = state.queue.loop_mode;
         st.queue = build_remote_queue_snapshot(&state.queue, boot_now as u64);
@@ -613,7 +622,6 @@ async fn main() -> anyhow::Result<()> {
                         state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
                         if state.current_card_img.is_none() {
                             state.current_card_img = Some(prepare_16_9_thumbnail_cover(img, font_size));
-                            state.episode_fallback_thumbnails.clear();
                         }
                     }
                     if state.cover_anime_id == Some(anime_id) {
@@ -773,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
                         state.banner_progress = Some((anime_id, watched));
                     }
                 }
-                AppMessage::StreamInfoDetected(anime_id, ep, is_dub, info) => {
+                AppMessage::StreamInfoDetected(anime_id, ep, is_dub, req_gen, mut info) => {
                     if info.dub_available {
                         let pool_dub = pool.clone();
                         tokio::spawn(async move {
@@ -785,10 +793,12 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
+                    if req_gen == state.playback_request_generation
+                        && state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
                         && state.selected_episode == Some(ep)
                         && state.pending_dub == is_dub
                     {
+                        api::subtitles::SubtitleOption::ensure_none_option_first(&mut info.subtitles);
                         state.playback_qualities = info.qualities;
                         state.playback_sub_languages = info.subtitles;
                         state.playback_audio_tracks = info.audio_tracks;
@@ -812,19 +822,37 @@ async fn main() -> anyhow::Result<()> {
                             .position(|q| q.label.eq_ignore_ascii_case(pref_str))
                             .unwrap_or(0);
 
-                        let pref_sub = edit_item
-                            .as_ref()
-                            .map(|i| i.sub_lang.clone())
-                            .unwrap_or_else(|| cfg.default_sub_lang.clone());
-                        state.playback_sub_cursor = state
-                            .playback_sub_languages
-                            .iter()
-                            .position(|s| {
-                                s.name.to_lowercase().contains(&pref_sub.to_lowercase())
-                                    || s.code.to_lowercase().starts_with(&pref_sub.to_lowercase())
-                                    || s.stream_label.to_lowercase().contains(&pref_sub.to_lowercase())
-                            })
-                            .unwrap_or(0);
+                        let pref_sub = if let Some(ref item) = edit_item {
+                            item.sub_lang.clone()
+                        } else if !state.preferred_subtitle_code.trim().is_empty() {
+                            state.preferred_subtitle_code.clone()
+                        } else if is_dub {
+                            "none".to_string()
+                        } else {
+                            cfg.default_sub_lang.clone()
+                        };
+                        let pref_lower = pref_sub.trim().to_ascii_lowercase();
+                        state.playback_sub_cursor = if matches!(
+                            pref_lower.as_str(),
+                            "none" | "off" | "no" | "no subtitles"
+                        ) {
+                            0
+                        } else {
+                            state
+                                .playback_sub_languages
+                                .iter()
+                                .enumerate()
+                                .skip(1)
+                                .find(|(_, s)| {
+                                    s.name.to_lowercase().contains(&pref_lower)
+                                        || s.code.to_lowercase().starts_with(&pref_lower)
+                                        || s.stream_label.to_lowercase().contains(&pref_lower)
+                                })
+                                .map(|(idx, _)| idx)
+                                .unwrap_or_else(|| {
+                                    usize::from(state.playback_sub_languages.len() > 1)
+                                })
+                        };
 
                         state.sync_active_provider();
                         state.is_loading_subs = false;
@@ -1034,29 +1062,72 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                AppMessage::EpisodeMetadataReady(anime_id, meta) => {
-                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                AppMessage::EpisodeMetadataReady(anime_id, meta_gen, meta) => {
+                    if meta_gen == state.episode_metadata_generation
+                        && state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
+                    {
                         state.loading_episode_metadata = false;
-                        for (ep, (title, thumb_url, synopsis)) in meta {
-                            state.episode_titles.insert(ep, title);
-                            if let Some(syn) = synopsis {
-                                state.episode_synopses.insert(ep, syn);
+                        for (ep, item) in meta {
+                            let existing_generic = state
+                                .episode_titles
+                                .get(&ep)
+                                .is_none_or(|t| t.starts_with("Episode "));
+                            if !item.title.is_empty()
+                                && (existing_generic || !item.title.starts_with("Episode "))
+                            {
+                                state.episode_titles.insert(ep, item.title.clone());
                             }
-                            if let Some(url) = thumb_url {
-                                state.episode_thumbnail_urls.insert(ep, url);
+                            if let Some(ref syn) = item.synopsis {
+                                state.episode_synopses.insert(ep, syn.clone());
                             }
+                            if let Some(ref new_url) = item.thumbnail_url {
+                                let prev_meta = state.episode_media_meta.get(&ep);
+                                let prev_src = prev_meta.map(|m| m.thumbnail_source);
+                                let prev_url = state.episode_thumbnail_urls.get(&ep).cloned();
+                                let should_replace_url = prev_url.is_none()
+                                    || prev_src.is_none_or(|src| item.thumbnail_source >= src);
+                                if should_replace_url {
+                                    if prev_url.as_ref() != Some(new_url) {
+                                        state.episode_thumbnails.remove(&ep);
+                                        state.episode_raw_thumbnails.remove(&ep);
+                                        state.episode_thumbnail_states.remove(&ep);
+                                        state.loading_episode_thumbnails.remove(&ep);
+                                    }
+                                    state.episode_thumbnail_urls.insert(ep, new_url.clone());
+                                }
+                            }
+                            state.episode_media_meta.insert(ep, item);
                         }
                         preload_nearby_episode_thumbnails(&mut state, &tx);
                     }
                 }
-                AppMessage::EpisodeThumbnailReady(anime_id, ep, img) => {
-                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                AppMessage::EpisodeThumbnailReady(anime_id, ep, meta_gen, source_url, img) => {
+                    if meta_gen == state.episode_metadata_generation
+                        && state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
+                    {
                         state.loading_episode_thumbnails.remove(&ep);
-                        let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
-                        let card_thumb = prepare_16_9_thumbnail_cover(img, font_size);
-                        if let Some(picker) = state.picker {
-                            let proto = build_stateful_protocol(picker, card_thumb);
-                            state.episode_thumbnails.insert(ep, proto);
+                        if state.episode_thumbnail_urls.get(&ep) == Some(&source_url) {
+                            state.episode_raw_thumbnails.insert(ep, img.clone());
+                            state
+                                .episode_thumbnail_states
+                                .insert(ep, state::EpisodeThumbnailState::Ready);
+                            if let Some(picker) = state.picker {
+                                let prepared = if let Some((tw, th, fw, fh)) =
+                                    state.thumbnail_geometry_key
+                                {
+                                    ui::components::cover::scale_to_frame_cover(
+                                        img,
+                                        tw,
+                                        th,
+                                        (fw, fh),
+                                        0.20,
+                                    )
+                                } else {
+                                    prepare_16_9_thumbnail_cover(img, picker.font_size)
+                                };
+                                let proto = build_stateful_protocol(picker, prepared);
+                                state.episode_thumbnails.insert(ep, proto);
+                            }
                         }
                     }
                 }
@@ -1068,10 +1139,11 @@ async fn main() -> anyhow::Result<()> {
                         let proto = build_stateful_protocol(picker, card_banner.clone());
                         state.anime_banners.insert(anime_id, proto);
                     }
-                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
+                        && state.current_card_img.is_none()
+                    {
                         let thumb_banner = prepare_16_9_thumbnail_cover(img, font_size);
                         state.current_card_img = Some(thumb_banner);
-                        state.episode_fallback_thumbnails.clear();
                     }
                 }
                 AppMessage::PlaybackProgressUpdated(anime_id, ep, pos, dur) => {
@@ -1343,6 +1415,41 @@ async fn main() -> anyhow::Result<()> {
                         ),
                         unix_now(),
                     );
+                }
+                AppMessage::RemoteSubDelayChanged(delay_ms) => {
+                    let clamped = delay_ms.clamp(-30_000, 30_000);
+                    state.subtitle_delay_ms = clamped;
+                    if let Some(ref mut opts) = state.last_play_options {
+                        opts.sub_delay_ms = clamped;
+                    }
+                    persist_profile_playback_settings_fields(&state, &pool).await;
+                    state.show_toast(
+                        format!("◈ Subtitle delay: {}", state.format_subtitle_delay()),
+                        unix_now(),
+                    );
+                }
+                AppMessage::RemoteSubtitleSelectionChanged(selection) => {
+                    let code = match selection {
+                        api::subtitles::SubtitleSelection::None => "none".to_string(),
+                        api::subtitles::SubtitleSelection::Track { code, .. } => code,
+                    };
+                    state.preferred_subtitle_code = code.clone();
+                    if let Some(idx) = state.playback_sub_languages.iter().position(|s| {
+                        s.code.eq_ignore_ascii_case(&code)
+                            || s.lang_keyword().eq_ignore_ascii_case(&code)
+                    }) {
+                        state.playback_sub_cursor = idx;
+                    } else if code == "none" && !state.playback_sub_languages.is_empty() {
+                        state.playback_sub_cursor = 0;
+                    }
+                    if let Some(ref mut opts) = state.last_play_options {
+                        opts.subtitles_disabled = code == "none";
+                        opts.sub_lang = Some(code.clone());
+                        if opts.subtitles_disabled {
+                            opts.sub_url = None;
+                        }
+                    }
+                    persist_profile_playback_settings_fields(&state, &pool).await;
                 }
             }
         }
@@ -1714,26 +1821,6 @@ async fn handle_update_modal(
             }
         }
     }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let popup_layout = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
-            ratatui::layout::Constraint::Percentage(percent_y),
-            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([
-            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
-            ratatui::layout::Constraint::Percentage(percent_x),
-            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 async fn handle_mouse(
@@ -2133,87 +2220,89 @@ async fn handle_mouse(
                     false
                 }
                 Screen::PlaybackOptions => {
-                    let modal_area = centered_rect(84, 70, term_area);
-                    if mx < modal_area.x || mx >= modal_area.right() || my < modal_area.y || my >= modal_area.bottom() {
+                    let layout = ui::play_options::compute_layout(term_area);
+                    let pos = ratatui::layout::Position { x: mx, y: my };
+                    if !layout.modal_rect.contains(pos) {
                         state.go_back();
                         return true;
                     }
-                    // Header options: row 2 of modal
-                    if my == modal_area.y + 2 {
-                        let rel_x = mx.saturating_sub(modal_area.x);
-                            if rel_x < 28 {
-                                state.cycle_playback_player();
-                                state.show_toast(format!("Player: {}", state.selected_player().as_str()), unix_now());
-                                return true;
-                            } else if rel_x < 55 {
-                                if !state.pending_dub && state.dub_available == Some(false) {
-                                    state.show_toast("English Dub is not available for this anime (Sub only)", unix_now());
-                                } else {
-                                    state.pending_dub = !state.pending_dub;
-                                    state.is_loading_subs = true;
-                                    state.playback_qualities.clear();
-                                    state.playback_sub_languages.clear();
-                                    state.playback_quality_cursor = 0;
-                                    state.playback_sub_cursor = 0;
-                                    if let Some(ref anime) = state.selected_anime {
-                                        let ep = state.selected_episode.unwrap_or(1);
-                                        trigger_stream_detection(anime, ep, state.pending_dub, tx);
-                                    }
-                                }
-                                return true;
-                            } else {
-                                state.toggle_anime4k();
-                                state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
-                                return true;
-                            }
-                        }
-                    // Footer
-                    if my >= modal_area.bottom().saturating_sub(3) {
-                        let rel_x = mx.saturating_sub(modal_area.x);
-                        if rel_x < 16 {
-                            let enter_key = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                            handle_playback_options(enter_key, state, pool, cfg, tx).await;
-                            return true;
-                        } else if rel_x >= modal_area.width.saturating_sub(15) {
-                            state.go_back();
-                            return true;
-                        }
+                    if layout.player_chip_rect.contains(pos) {
+                        state.cycle_playback_player();
+                        state.show_toast(
+                            format!("Player: {}", state.selected_player().as_str()),
+                            unix_now(),
+                        );
+                        return true;
                     }
-                    // Columns
-                    if my >= modal_area.y + 4 && my < modal_area.bottom().saturating_sub(3) {
-                        let rel_x = mx.saturating_sub(modal_area.x);
-                        let w = modal_area.width;
-                        let col0_w = (w * 20) / 100;
-                        let col1_w = (w * 24) / 100;
-                        let col2_w = (w * 22) / 100;
-                        let rel_item_row = (my - (modal_area.y + 5)) as usize;
-
-                        if rel_x < col0_w {
-                            state.playback_focus_column = 0;
-                            if rel_item_row < state.playback_players.len() {
-                                state.playback_player_cursor = rel_item_row;
-                                return true;
-                            }
-                        } else if rel_x < col0_w + col1_w {
-                            state.playback_focus_column = 1;
-                            if rel_item_row < state.playback_providers.len() {
-                                state.playback_provider_cursor = rel_item_row;
-                                state.sync_active_provider();
-                                return true;
-                            }
-                        } else if rel_x < col0_w + col1_w + col2_w {
-                            state.playback_focus_column = 2;
-                            if rel_item_row < state.playback_qualities.len() {
-                                state.playback_quality_cursor = rel_item_row;
-                                return true;
-                            }
+                    if layout.audio_chip_rect.contains(pos) {
+                        if !state.pending_dub && state.dub_available == Some(false) {
+                            state.show_toast(
+                                "English Dub is not available for this anime (Sub only)",
+                                unix_now(),
+                            );
                         } else {
-                            state.playback_focus_column = 3;
-                            if rel_item_row < state.playback_sub_languages.len() {
-                                state.playback_sub_cursor = rel_item_row;
-                                return true;
+                            state.pending_dub = !state.pending_dub;
+                            state.is_loading_subs = true;
+                            if let Some(ref anime) = state.selected_anime {
+                                let anime_c = anime.clone();
+                                let ep = state.selected_episode.unwrap_or(1);
+                                let dub = state.pending_dub;
+                                let req_gen = state.bump_playback_request_generation();
+                                trigger_stream_detection(&anime_c, ep, dub, req_gen, tx);
                             }
                         }
+                        return true;
+                    }
+                    if layout.anime4k_chip_rect.contains(pos) {
+                        state.toggle_anime4k();
+                        state.show_toast(
+                            format!("Anime4K: {}", state.anime4k_mode.as_str()),
+                            unix_now(),
+                        );
+                        return true;
+                    }
+                    if layout.launch_btn_rect.contains(pos) {
+                        let enter_key = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                        handle_playback_options(enter_key, state, pool, cfg, tx).await;
+                        return true;
+                    }
+                    if layout.back_btn_rect.contains(pos) {
+                        state.go_back();
+                        return true;
+                    }
+
+                    let clicked_col = [
+                        (0usize, layout.player_rect),
+                        (1usize, layout.provider_rect),
+                        (2usize, layout.quality_rect),
+                        (3usize, layout.subtitle_rect),
+                    ]
+                    .into_iter()
+                    .find(|(_, rect)| rect.contains(pos));
+
+                    if let Some((col_idx, rect)) = clicked_col {
+                        state.playback_focus_column = col_idx;
+                        state.playback_sub_focused = col_idx == 3;
+                        if my > rect.y && my + 1 < rect.bottom() {
+                            let rel_item_row = (my - (rect.y + 1)) as usize;
+                            match col_idx {
+                                0 if rel_item_row < state.playback_players.len() => {
+                                    state.playback_player_cursor = rel_item_row;
+                                }
+                                1 if rel_item_row < state.playback_providers.len() => {
+                                    state.playback_provider_cursor = rel_item_row;
+                                    state.sync_active_provider();
+                                }
+                                2 if rel_item_row < state.playback_qualities.len() => {
+                                    state.playback_quality_cursor = rel_item_row;
+                                }
+                                3 if rel_item_row < state.playback_sub_languages.len() => {
+                                    state.playback_sub_cursor = rel_item_row;
+                                }
+                                _ => {}
+                            }
+                        }
+                        return true;
                     }
                     false
                 }
@@ -2603,7 +2692,13 @@ async fn open_detail_from_anime(
     if should_check_airing {
         trigger_airing_check(anime_id, pool.clone(), tx.clone());
     }
-    trigger_episode_metadata_fetch(anime_id, title_romaji, title_english, tx.clone());
+    trigger_episode_metadata_fetch(
+        anime_id,
+        state.episode_metadata_generation,
+        title_romaji,
+        title_english,
+        tx.clone(),
+    );
 }
 
 /// Query AnimeFillerList in the background to scrape filler classifications.
@@ -2715,7 +2810,7 @@ async fn open_episode_options_flow(
             default_player,
         );
         state.playback_options_purpose = purpose;
-        trigger_stream_detection(&anime, ep, use_dub, tx);
+        trigger_stream_detection(&anime, ep, use_dub, state.playback_request_generation, tx);
     } else if anime.playback_queries().len() > 1 {
         state.open_playback_query_picker(&anime);
         state.playback_options_purpose = purpose;
@@ -2727,7 +2822,7 @@ async fn open_episode_options_flow(
             default_player,
         );
         state.playback_options_purpose = purpose;
-        trigger_stream_detection(&anime, ep, use_dub, tx);
+        trigger_stream_detection(&anime, ep, use_dub, state.playback_request_generation, tx);
     }
 }
 
@@ -2735,6 +2830,7 @@ fn trigger_stream_detection(
     anime: &db::cache::Anime,
     episode: u32,
     is_dub: bool,
+    request_generation: u64,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let anime_id = anime.id;
@@ -2743,7 +2839,15 @@ fn trigger_stream_detection(
     let tx = tx.clone();
     tokio::spawn(async move {
         let info = api::subtitles::fetch_stream_info_with_mal(anime_id, mal_id, &title, episode, is_dub).await;
-        let _ = tx.send(AppMessage::StreamInfoDetected(anime_id, episode, is_dub, info)).await;
+        let _ = tx
+            .send(AppMessage::StreamInfoDetected(
+                anime_id,
+                episode,
+                is_dub,
+                request_generation,
+                info,
+            ))
+            .await;
     });
 }
 
@@ -3235,6 +3339,15 @@ async fn handle_detail(
                 cycle_active_playback_audio(state, pool, cfg, tx).await;
             }
         }
+        KeyCode::Char('[') | KeyCode::Char('-') if state.now_playing.is_some() => {
+            adjust_subtitle_delay(state, pool, Some(-100)).await;
+        }
+        KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') if state.now_playing.is_some() => {
+            adjust_subtitle_delay(state, pool, Some(100)).await;
+        }
+        KeyCode::Char('0') if state.now_playing.is_some() => {
+            adjust_subtitle_delay(state, pool, None).await;
+        }
 
         KeyCode::Char('e') => {
             open_episode_options_flow(
@@ -3541,11 +3654,67 @@ async fn handle_playback_query(
                 );
                 state.playback_options_purpose = purpose;
                 let ep = state.selected_episode.unwrap_or(1);
-                trigger_stream_detection(&anime, ep, is_dub, tx);
+                trigger_stream_detection(&anime, ep, is_dub, state.playback_request_generation, tx);
             }
         }
         _ => {}
     }
+}
+
+async fn persist_profile_playback_settings_fields(state: &AppState, pool: &sqlx::SqlitePool) {
+    let quality = state
+        .playback_qualities
+        .get(state.playback_quality_cursor)
+        .map(|q| q.label.clone())
+        .unwrap_or_else(|| "1080p".to_string());
+    let settings = db::user::ProfilePlaybackSettings {
+        profile_id: state.active_profile_id.clone(),
+        dub: state.pending_dub,
+        subtitle_code: state.preferred_subtitle_code.clone(),
+        subtitle_delay_ms: state.subtitle_delay_ms.clamp(-30_000, 30_000),
+        quality,
+        preferred_player: state.selected_player().as_str().to_string(),
+    };
+    let _ = db::user::save_profile_playback_settings(pool, &settings, unix_now()).await;
+}
+
+async fn adjust_subtitle_delay(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    delta_ms: Option<i32>,
+) {
+    let target_ms = match delta_ms {
+        Some(d) => state.subtitle_delay_ms.saturating_add(d).clamp(-30_000, 30_000),
+        None => 0,
+    };
+    if state.now_playing.is_some() {
+        let sock = services::ipc::get_active_socket_path()
+            .unwrap_or_else(|| "/tmp/solus-mpv.sock".to_string());
+        let delay_secs = target_ms as f64 / 1000.0;
+        let cmd = serde_json::json!({ "command": ["set_property", "sub-delay", delay_secs] });
+        if !services::remote::send_mpv_json_command(&sock, cmd).await {
+            state.show_toast("Subtitle delay requires active mpv IPC connection", unix_now());
+            return;
+        }
+    }
+    state.subtitle_delay_ms = target_ms;
+    if let Some(ref mut opts) = state.last_play_options {
+        opts.sub_delay_ms = target_ms;
+    }
+    persist_profile_playback_settings_fields(state, pool).await;
+    let delay_secs = state.subtitle_delay_secs();
+    let r_state = state.remote_state.clone();
+    tokio::spawn(async move {
+        {
+            let mut st = r_state.write().await;
+            st.sub_delay = delay_secs;
+        }
+        services::remote::broadcast_state(&r_state).await;
+    });
+    state.show_toast(
+        format!("Subtitle delay: {}", state.format_subtitle_delay()),
+        unix_now(),
+    );
 }
 
 async fn handle_playback_options(
@@ -3644,14 +3813,22 @@ async fn handle_playback_options(
             }
             state.pending_dub = !state.pending_dub;
             state.is_loading_subs = true;
-            state.playback_qualities.clear();
-            state.playback_sub_languages.clear();
-            state.playback_quality_cursor = 0;
-            state.playback_sub_cursor = 0;
             if let Some(ref anime) = state.selected_anime {
+                let anime_c = anime.clone();
                 let ep = state.selected_episode.unwrap_or(1);
-                trigger_stream_detection(anime, ep, state.pending_dub, tx);
+                let dub = state.pending_dub;
+                let req_gen = state.bump_playback_request_generation();
+                trigger_stream_detection(&anime_c, ep, dub, req_gen, tx);
             }
+        }
+        KeyCode::Char('[') | KeyCode::Char('-') => {
+            adjust_subtitle_delay(state, pool, Some(-100)).await;
+        }
+        KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
+            adjust_subtitle_delay(state, pool, Some(100)).await;
+        }
+        KeyCode::Char('0') => {
+            adjust_subtitle_delay(state, pool, None).await;
         }
         KeyCode::Char('u') | KeyCode::Char('U') => {
             state.toggle_anime4k();
@@ -3686,8 +3863,17 @@ async fn handle_playback_options(
 
                 let chosen_provider = state.playback_providers.get(state.playback_provider_cursor);
                 let chosen_sub = state.playback_sub_languages.get(state.playback_sub_cursor);
-                let sub_lang = chosen_sub.map(|s| s.lang_keyword().to_string());
-                let sub_url = chosen_sub.map(|s| s.url.clone()).filter(|u| !u.is_empty());
+                let subtitles_disabled = chosen_sub.is_some_and(|s| s.is_none());
+                let sub_lang = if subtitles_disabled {
+                    Some("none".to_string())
+                } else {
+                    chosen_sub.map(|s| s.lang_keyword().to_string())
+                };
+                let sub_url = if subtitles_disabled {
+                    None
+                } else {
+                    chosen_sub.map(|s| s.url.clone()).filter(|u| !u.is_empty())
+                };
 
                 let chosen_qual = state.playback_qualities.get(state.playback_quality_cursor);
                 let quality_label = chosen_qual
@@ -3732,11 +3918,23 @@ async fn handle_playback_options(
                     state.playback_options_purpose
                 };
 
-                let chosen_sub_str = sub_lang
-                    .clone()
-                    .or_else(|| chosen_sub.map(|s| s.name.clone()))
-                    .unwrap_or_else(|| cfg.default_sub_lang.clone());
+                let chosen_sub_str = if subtitles_disabled {
+                    "none".to_string()
+                } else {
+                    sub_lang
+                        .clone()
+                        .or_else(|| chosen_sub.map(|s| s.name.clone()))
+                        .unwrap_or_else(|| cfg.default_sub_lang.clone())
+                };
                 let is_dub = audio == config::AudioMode::Dub;
+                state.preferred_subtitle_code = if subtitles_disabled {
+                    "none".to_string()
+                } else if is_dub || !chosen_sub_str.eq_ignore_ascii_case(&cfg.default_sub_lang) {
+                    chosen_sub_str.clone()
+                } else {
+                    String::new()
+                };
+                persist_profile_playback_settings_fields(state, pool).await;
 
                 match effective_purpose {
                     state::PlaybackOptionsPurpose::EnqueueSingle => {
@@ -3799,6 +3997,8 @@ async fn handle_playback_options(
                             start_pos:  None,
                             glsl_shaders,
                             sub_style:  Some(cfg.subtitle_style.clone()),
+                            sub_delay_ms: state.subtitle_delay_ms,
+                            subtitles_disabled,
                             loading_image: None,
                         };
                         start_playback(state, opts, title, ep, tx, pool, cfg).await;
@@ -5466,6 +5666,15 @@ async fn apply_profile_switch(
     state.active_profile_icon = target_profile.avatar_icon.clone();
     state.theme_index = (target_profile.theme_index.max(0) as usize) % ui::theme::THEMES.len();
     state.auth = config::AuthConfig::load_for_profile(&target_profile.id);
+    if let Some(pb_settings) =
+        db::user::get_profile_playback_settings(pool, &state.active_profile_id).await
+    {
+        state.subtitle_delay_ms = pb_settings.subtitle_delay_ms.clamp(-30_000, 30_000);
+        state.preferred_subtitle_code = pb_settings.subtitle_code;
+    } else {
+        state.subtitle_delay_ms = 0;
+        state.preferred_subtitle_code.clear();
+    }
     state.queue = services::queue::load_active_queue(&target_profile.id, now as u64);
     state.queue_cursor = 0;
     state.playlist_cursor = 0;
@@ -5484,6 +5693,7 @@ async fn apply_profile_switch(
     let r_state = state.remote_state.clone();
     let p_name = state.active_profile_name.clone();
     let p_icon = state.active_profile_icon.clone();
+    let p_sub_delay = state.subtitle_delay_secs();
     let p_queue = build_remote_queue_snapshot(&state.queue, now as u64);
     let p_auto = state.queue.auto_advance;
     let p_loop = state.queue.loop_mode;
@@ -5492,6 +5702,7 @@ async fn apply_profile_switch(
             let mut st = r_state.write().await;
             st.active_profile = p_name;
             st.profile_icon = p_icon;
+            st.sub_delay = p_sub_delay;
             st.queue = p_queue;
             st.queue_auto_advance = p_auto;
             st.queue_loop = p_loop;
@@ -6043,10 +6254,15 @@ async fn play_queue_item(
 
     if let Some(ref pre) = resolved_pre {
         state.playback_sub_languages = pre.subtitles.clone();
+        api::subtitles::SubtitleOption::ensure_none_option_first(
+            &mut state.playback_sub_languages,
+        );
         state.playback_audio_tracks = pre.audio_tracks.clone();
         state.pending_master_url = pre.master_url.clone();
         state.dub_available = Some(pre.dub_available || item.dub);
-        if let Some(ref chosen_lang) = pre.options.sub_lang {
+        if pre.options.subtitles_disabled {
+            state.playback_sub_cursor = 0;
+        } else if let Some(ref chosen_lang) = pre.options.sub_lang {
             state.playback_sub_cursor = state
                 .playback_sub_languages
                 .iter()
@@ -6058,6 +6274,10 @@ async fn play_queue_item(
         }
     }
 
+    let sub_disabled = matches!(
+        item.sub_lang.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "no" | "no subtitles"
+    );
     let mut opts = resolved_pre
         .map(|r| r.options)
         .unwrap_or_else(|| api::player::PlayOptions {
@@ -6066,19 +6286,26 @@ async fn play_queue_item(
             quality: item.quality.clone(),
             dub: item.dub,
             player: item.player.clone(),
-            sub_lang: Some(item.sub_lang.clone()),
+            sub_lang: if sub_disabled {
+                Some("none".to_string())
+            } else {
+                Some(item.sub_lang.clone())
+            },
             sub_url: None,
             stream_url: None,
             ipc_socket: None,
             start_pos: None,
             glsl_shaders: None,
             sub_style: Some(cfg.subtitle_style.clone()),
+            sub_delay_ms: state.subtitle_delay_ms,
+            subtitles_disabled: sub_disabled,
             loading_image: None,
         });
 
     opts.ipc_socket = None;
     opts.loading_image = None;
     opts.sub_style = Some(cfg.subtitle_style.clone());
+    opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
         opts.glsl_shaders =
             services::shaders::build_shader_arg_for_year(state.anime4k_mode, item.season_year);
@@ -6788,7 +7015,13 @@ async fn handle_queue_modal(
                 state.open_playback_options(item.query.clone(), 0, item.dub, player);
                 state.playback_options_purpose =
                     state::PlaybackOptionsPurpose::EditQueueItem { uid: item.uid };
-                trigger_stream_detection(&target_anime, item.episode, item.dub, tx);
+                trigger_stream_detection(
+                    &target_anime,
+                    item.episode,
+                    item.dub,
+                    state.playback_request_generation,
+                    tx,
+                );
             }
         }
         KeyCode::Char('x') => {
@@ -7391,6 +7624,15 @@ async fn handle_playback(
         KeyCode::Char('a') | KeyCode::Char('A') => {
             cycle_active_playback_audio(state, pool, cfg, tx).await;
         }
+        KeyCode::Char('[') | KeyCode::Char('-') => {
+            adjust_subtitle_delay(state, pool, Some(-100)).await;
+        }
+        KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
+            adjust_subtitle_delay(state, pool, Some(100)).await;
+        }
+        KeyCode::Char('0') => {
+            adjust_subtitle_delay(state, pool, None).await;
+        }
         _ => {}
     }
 }
@@ -7954,10 +8196,21 @@ async fn launch_remote_stream_switch(
         .as_ref()
         .map(|o| o.quality.clone())
         .unwrap_or_else(|| cfg.quality.as_str().to_string());
-    let pref_sub_lang = prev
-        .as_ref()
-        .and_then(|o| o.sub_lang.clone())
-        .unwrap_or_else(|| cfg.default_sub_lang.clone());
+    let pref_sub_lang = if prev.as_ref().is_some_and(|o| o.subtitles_disabled) {
+        "none".to_string()
+    } else if !state.preferred_subtitle_code.trim().is_empty() {
+        state.preferred_subtitle_code.clone()
+    } else {
+        prev.as_ref()
+            .and_then(|o| o.sub_lang.clone())
+            .unwrap_or_else(|| {
+                if is_dub {
+                    "none".to_string()
+                } else {
+                    cfg.default_sub_lang.clone()
+                }
+            })
+    };
     let was_direct_stream = prev
         .as_ref()
         .map(|o| o.stream_url.is_some())
@@ -7975,7 +8228,8 @@ async fn launch_remote_stream_switch(
     }
 
     // Resolve fresh stream URL and subtitle track for the requested episode & audio stream
-    let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
+    let mut stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
+    api::subtitles::SubtitleOption::ensure_none_option_first(&mut stream_info.subtitles);
     state.playback_qualities = stream_info.qualities.clone();
     state.playback_sub_languages = stream_info.subtitles.clone();
     state.playback_audio_tracks = stream_info.audio_tracks.clone();
@@ -7995,22 +8249,47 @@ async fn launch_remote_stream_switch(
             .or_else(|| stream_info.master_url.clone());
     }
 
-    let chosen_sub = stream_info
-        .subtitles
-        .iter()
-        .find(|s| {
-            s.name.to_lowercase().contains(&pref_sub_lang.to_lowercase())
-                || s.code.to_lowercase().starts_with(&pref_sub_lang.to_lowercase())
-                || s.lang_keyword().eq_ignore_ascii_case(&pref_sub_lang)
-        })
-        .or_else(|| stream_info.subtitles.first());
+    let pref_lower = pref_sub_lang.trim().to_ascii_lowercase();
+    let mut subtitles_disabled = matches!(
+        pref_lower.as_str(),
+        "none" | "off" | "no" | "no subtitles"
+    );
+    let chosen_idx = if subtitles_disabled {
+        Some(0)
+    } else {
+        state
+            .playback_sub_languages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, s)| {
+                s.name.to_lowercase().contains(&pref_lower)
+                    || s.code.to_lowercase().starts_with(&pref_lower)
+                    || s.lang_keyword().eq_ignore_ascii_case(&pref_lower)
+            })
+            .map(|(i, _)| i)
+            .or_else(|| (state.playback_sub_languages.len() > 1).then_some(1))
+    };
+    state.playback_sub_cursor = chosen_idx.unwrap_or(0);
+    let chosen_sub = chosen_idx.and_then(|i| state.playback_sub_languages.get(i));
+    if chosen_sub.is_some_and(|s| s.is_none()) {
+        subtitles_disabled = true;
+    }
 
-    let sub_lang = chosen_sub
-        .map(|s| s.lang_keyword().to_string())
-        .or(Some(pref_sub_lang));
-    let sub_url = chosen_sub
-        .map(|s| s.url.clone())
-        .filter(|u| !u.is_empty());
+    let sub_lang = if subtitles_disabled {
+        Some("none".to_string())
+    } else {
+        chosen_sub
+            .map(|s| s.lang_keyword().to_string())
+            .or(Some(pref_sub_lang))
+    };
+    let sub_url = if subtitles_disabled {
+        None
+    } else {
+        chosen_sub
+            .map(|s| s.url.clone())
+            .filter(|u| !u.is_empty())
+    };
 
     let glsl_shaders = services::shaders::build_shader_arg_for_year(
         state.anime4k_mode,
@@ -8030,6 +8309,8 @@ async fn launch_remote_stream_switch(
         start_pos: resume_pos,
         glsl_shaders,
         sub_style: Some(cfg.subtitle_style.clone()),
+        sub_delay_ms: state.subtitle_delay_ms,
+        subtitles_disabled,
         loading_image: None,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
@@ -8204,6 +8485,8 @@ async fn start_playback(
     let r_queue_snapshot = build_remote_queue_snapshot(&state.queue, unix_now() as u64);
     let r_queue_auto = state.queue.auto_advance;
     let r_queue_loop = state.queue.loop_mode;
+    let r_sub_delay = opts.sub_delay_ms as f64 / 1000.0;
+    let r_sub_active = !opts.subtitles_disabled;
 
     tokio::spawn(async move {
         {
@@ -8221,6 +8504,8 @@ async fn start_playback(
                 st.subtitles = r_subs;
             }
             st.sub_preset = r_sub_preset;
+            st.sub_delay = r_sub_delay;
+            st.sub_active = r_sub_active;
             st.anime4k = r_anime4k;
             st.audio_mode = r_audio_mode;
             st.audio_lang = r_audio_lang;
@@ -8236,14 +8521,15 @@ async fn start_playback(
 
     // 4. Subtitle auto-sync (only needed for external [Auto-Synced] community subtitles;
     // native stream subtitles are already synced and loaded directly by mpv in parallel)
-    let needs_subsync = opts.sub_url.as_ref().is_some_and(|u| {
-        (u.starts_with("http://") || u.starts_with("https://"))
-            && state
-                .playback_sub_languages
-                .iter()
-                .find(|s| s.url == *u)
-                .is_some_and(|s| s.stream_label.contains("[Auto-Synced]"))
-    });
+    let needs_subsync = !opts.subtitles_disabled
+        && opts.sub_url.as_ref().is_some_and(|u| {
+            (u.starts_with("http://") || u.starts_with("https://"))
+                && state
+                    .playback_sub_languages
+                    .iter()
+                    .find(|s| s.url == *u)
+                    .is_some_and(|s| s.stream_label.contains("[Auto-Synced]"))
+        });
     if needs_subsync {
         if let Some(ref sub_u) = opts.sub_url {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
@@ -8497,6 +8783,7 @@ fn preload_nearby_episode_thumbnails(
         return;
     };
     let anime_id = anime.id;
+    let meta_gen = state.episode_metadata_generation;
     let selected = state.selected_episode.unwrap_or(1);
     let win_start = selected.saturating_sub(3).max(1);
     let win_end = selected + 6;
@@ -8514,7 +8801,10 @@ fn preload_nearby_episode_thumbnails(
                 && !state.loading_episode_thumbnails.contains(&ep)
             {
                 state.loading_episode_thumbnails.insert(ep);
-                trigger_episode_thumbnail_download(anime_id, ep, url, tx.clone());
+                state
+                    .episode_thumbnail_states
+                    .insert(ep, state::EpisodeThumbnailState::Loading);
+                trigger_episode_thumbnail_download(anime_id, ep, meta_gen, url, tx.clone());
             }
         }
     }
@@ -8617,25 +8907,65 @@ async fn download_cover_image(
         .flatten()
 }
 
+fn merge_episode_metadata(
+    anime_id: i64,
+    map: &mut std::collections::HashMap<u32, state::EpisodeMediaMetadata>,
+    ep_num: u32,
+    title: String,
+    synopsis: Option<String>,
+    thumbnail_url: Option<String>,
+    source: state::ThumbnailSource,
+) {
+    let entry = map.entry(ep_num).or_insert_with(|| state::EpisodeMediaMetadata {
+        anime_id,
+        episode: ep_num,
+        title: title.clone(),
+        synopsis: synopsis.clone(),
+        thumbnail_url: thumbnail_url.clone(),
+        thumbnail_source: source,
+    });
+    if entry.title.starts_with("Episode ") && !title.starts_with("Episode ") {
+        entry.title = title;
+    }
+    if entry.synopsis.is_none() && synopsis.is_some() {
+        entry.synopsis = synopsis;
+    }
+    if let Some(url) = thumbnail_url {
+        if entry.thumbnail_url.is_none() || source > entry.thumbnail_source {
+            entry.thumbnail_url = Some(url);
+            entry.thumbnail_source = source;
+        }
+    }
+}
+
 fn trigger_episode_metadata_fetch(
     anime_id: i64,
+    metadata_generation: u64,
     title_romaji: String,
     title_english: Option<String>,
     tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        // ep_num -> (title, Option<thumbnail_url>, Option<synopsis>)
-        let mut map: std::collections::HashMap<u32, (String, Option<String>, Option<String>)> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<u32, state::EpisodeMediaMetadata> =
+            std::collections::HashMap::new();
 
-        // 1. Primary: Fetch from api.ani.zip by exact AniList ID (provides TVDB 16:9 screencaps, titles, and synopses)
+        // 1. Primary: Fetch from api.ani.zip by exact AniList ID (highest confidence TVDB 16:9 screencaps)
         if let Some(anizip_map) = api::kitsu::fetch_anizip_episodes(&client, anime_id).await {
             for (ep_num, info) in anizip_map {
-                map.insert(ep_num, (info.title, info.thumbnail_url, info.synopsis));
+                merge_episode_metadata(
+                    anime_id,
+                    &mut map,
+                    ep_num,
+                    info.title,
+                    info.synopsis,
+                    info.thumbnail_url,
+                    state::ThumbnailSource::AniZip,
+                );
             }
         }
 
-        // 2. Fetch from AniList (bannerImage + streamingEpisodes fallback)
+        // 2. Fetch from AniList (bannerImage + streamingEpisodes confidence-checked by title)
         if let Ok(meta) = api::anilist::fetch_anime_streaming_and_banner(&client, anime_id).await {
             if let Some(banner_url) = meta.banner_image {
                 trigger_anime_banner_download(anime_id, banner_url, tx.clone());
@@ -8643,40 +8973,67 @@ fn trigger_episode_metadata_fetch(
 
             for (idx, ep) in meta.streaming_episodes.into_iter().enumerate() {
                 let raw_title = ep.title.unwrap_or_else(|| format!("Episode {}", idx + 1));
-                let (ep_num, cleaned) = api::anilist::parse_episode_title_and_number(&raw_title, (idx + 1) as u32);
-                let entry = map.entry(ep_num).or_insert_with(|| (cleaned.clone(), None, None));
-                if entry.0.starts_with("Episode ") && !cleaned.starts_with("Episode ") {
-                    entry.0 = cleaned;
+                let parsed =
+                    api::anilist::parse_streaming_episode_title(&raw_title, (idx + 1) as u32);
+                if parsed.is_special_or_ambiguous {
+                    continue;
                 }
-                if entry.1.is_none() && ep.thumbnail.is_some() {
-                    entry.1 = ep.thumbnail;
-                }
+                let src = if parsed.explicit_number {
+                    state::ThumbnailSource::AniListTitle
+                } else {
+                    state::ThumbnailSource::AniListIndexFallback
+                };
+                merge_episode_metadata(
+                    anime_id,
+                    &mut map,
+                    parsed.episode,
+                    parsed.title,
+                    None,
+                    ep.thumbnail,
+                    src,
+                );
             }
         }
 
-        // 3. Fallback: Fetch from Kitsu API if any episode is still missing a thumbnail or synopsis
-        let needs_kitsu = map.is_empty() || map.values().any(|(_, thumb, syn)| thumb.is_none() || syn.is_none());
+        // 3. Kitsu API fallback (higher confidence than AniListIndexFallback)
+        let needs_kitsu = map.is_empty()
+            || map.values().any(|m| {
+                m.thumbnail_url.is_none()
+                    || m.synopsis.is_none()
+                    || m.thumbnail_source == state::ThumbnailSource::AniListIndexFallback
+            });
         if needs_kitsu {
             let primary = title_english.as_deref().unwrap_or(&title_romaji);
-            let fallback = if title_english.is_some() { Some(title_romaji.as_str()) } else { None };
+            let fallback = if title_english.is_some() {
+                Some(title_romaji.as_str())
+            } else {
+                None
+            };
 
-            if let Some(kitsu_map) = api::kitsu::fetch_kitsu_episodes(&client, primary, fallback).await {
+            if let Some(kitsu_map) =
+                api::kitsu::fetch_kitsu_episodes(&client, primary, fallback).await
+            {
                 for (ep_num, k_info) in kitsu_map {
-                    let entry = map.entry(ep_num).or_insert_with(|| (k_info.title.clone(), None, None));
-                    if entry.1.is_none() && k_info.thumbnail_url.is_some() {
-                        entry.1 = k_info.thumbnail_url;
-                    }
-                    if entry.0.starts_with("Episode ") && !k_info.title.starts_with("Episode ") {
-                        entry.0 = k_info.title;
-                    }
-                    if entry.2.is_none() && k_info.synopsis.is_some() {
-                        entry.2 = k_info.synopsis;
-                    }
+                    merge_episode_metadata(
+                        anime_id,
+                        &mut map,
+                        ep_num,
+                        k_info.title,
+                        k_info.synopsis,
+                        k_info.thumbnail_url,
+                        state::ThumbnailSource::Kitsu,
+                    );
                 }
             }
         }
 
-        let _ = tx.send(AppMessage::EpisodeMetadataReady(anime_id, map)).await;
+        let _ = tx
+            .send(AppMessage::EpisodeMetadataReady(
+                anime_id,
+                metadata_generation,
+                map,
+            ))
+            .await;
     });
 }
 
@@ -8721,15 +9078,35 @@ async fn download_anime_banner(
     Some(img)
 }
 
+pub(crate) fn hash_thumbnail_url(url: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub(crate) fn thumbnail_cache_filename(anime_id: i64, episode: u32, url: &str) -> String {
+    format!("{}_{}_{:016x}.jpg", anime_id, episode, hash_thumbnail_url(url))
+}
+
 fn trigger_episode_thumbnail_download(
     anime_id: i64,
     episode: u32,
+    metadata_generation: u64,
     url: String,
     tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     tokio::spawn(async move {
         if let Some(img) = download_episode_thumbnail(anime_id, episode, &url).await {
-            let _ = tx.send(AppMessage::EpisodeThumbnailReady(anime_id, episode, img)).await;
+            let _ = tx
+                .send(AppMessage::EpisodeThumbnailReady(
+                    anime_id,
+                    episode,
+                    metadata_generation,
+                    url,
+                    img,
+                ))
+                .await;
         }
     });
 }
@@ -8743,7 +9120,7 @@ async fn download_episode_thumbnail(
         .map(|d| d.join("episodes"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/solus_episodes"));
     let _ = std::fs::create_dir_all(&cache_dir);
-    let file_path = cache_dir.join(format!("{}_{}.jpg", anime_id, episode));
+    let file_path = cache_dir.join(thumbnail_cache_filename(anime_id, episode, url));
 
     if file_path.exists() {
         if let Ok(bytes) = std::fs::read(&file_path) {
@@ -8758,6 +9135,9 @@ async fn download_episode_thumbnail(
         .build()
         .ok()?;
     let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
     let bytes = resp.bytes().await.ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     let _ = std::fs::write(&file_path, &bytes);
@@ -9151,5 +9531,62 @@ mod tests {
             Some("Sarah".to_string())
         );
         assert_eq!(parse_cli_profile_arg(&[]), None);
+    }
+
+    #[test]
+    fn test_thumbnail_cache_filename_url_hash_distinct() {
+        let f1 = thumbnail_cache_filename(11061, 13, "https://cdn.example.com/ep13-old.jpg");
+        let f2 = thumbnail_cache_filename(11061, 13, "https://cdn.example.com/ep13-tvdb.jpg");
+        assert!(f1.starts_with("11061_13_"));
+        assert!(f2.starts_with("11061_13_"));
+        assert!(f1.ends_with(".jpg"));
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn test_merge_episode_metadata_confidence_prevents_episode_73_overwriting_13() {
+        let mut map = std::collections::HashMap::new();
+        // Simulates array-index fallback for ep 13 before Kitsu/AniZip arrives.
+        merge_episode_metadata(
+            11061,
+            &mut map,
+            13,
+            "Episode 13".to_string(),
+            None,
+            Some("https://anilist.example.com/index-fallback-13.jpg".to_string()),
+            state::ThumbnailSource::AniListIndexFallback,
+        );
+        // Mislabeled entry sitting at streaming_episodes[13] actually claims "Episode 73".
+        let parsed_ep73 = api::anilist::parse_streaming_episode_title("Episode 73 - Insanity", 14);
+        assert_eq!(parsed_ep73.episode, 73);
+        assert!(parsed_ep73.explicit_number);
+        merge_episode_metadata(
+            11061,
+            &mut map,
+            parsed_ep73.episode,
+            parsed_ep73.title,
+            None,
+            Some("https://anilist.example.com/ep73.jpg".to_string()),
+            state::ThumbnailSource::AniListTitle,
+        );
+        // Verified Kitsu/AniZip for ep 13 cleanly upgrades the low-confidence AniListIndexFallback.
+        merge_episode_metadata(
+            11061,
+            &mut map,
+            13,
+            "Letter x From x Gon".to_string(),
+            Some("Verified synopsis".to_string()),
+            Some("https://tvdb.example.com/ep13.jpg".to_string()),
+            state::ThumbnailSource::AniZip,
+        );
+
+        let ep13 = map.get(&13).expect("episode 13 entry exists");
+        assert_eq!(ep13.title, "Letter x From x Gon");
+        assert_eq!(
+            ep13.thumbnail_url.as_deref(),
+            Some("https://tvdb.example.com/ep13.jpg")
+        );
+        assert_eq!(ep13.thumbnail_source, state::ThumbnailSource::AniZip);
+        assert_eq!(map.get(&73).unwrap().title, "Insanity");
     }
 }

@@ -23,6 +23,17 @@ pub struct SubtitleOption {
     pub url: String,
 }
 
+/// Explicit subtitle preference for launch intent, queue persistence, and profile defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubtitleSelection {
+    None,
+    Track {
+        code: String,
+        name: String,
+        url: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioTrackOption {
     pub code: String,
@@ -209,6 +220,8 @@ impl SubtitleOption {
             "Malay"
         } else if self.code.starts_with("eng") {
             "English"
+        } else if self.is_none() {
+            "none"
         } else {
             // First alphabetic word from stream_label
             self.stream_label
@@ -217,6 +230,40 @@ impl SubtitleOption {
                 .filter(|w| !w.is_empty())
                 .unwrap_or("English")
         }
+    }
+
+    /// Synthetic option representing explicit "No subtitles".
+    pub fn none_option() -> Self {
+        Self {
+            code: "none".to_string(),
+            name: "No subtitles".to_string(),
+            stream_label: "Off".to_string(),
+            url: String::new(),
+        }
+    }
+
+    /// True if this entry disables subtitles explicitly.
+    pub fn is_none(&self) -> bool {
+        self.code.eq_ignore_ascii_case("none")
+    }
+
+    /// Convert this option into an explicit `SubtitleSelection`.
+    pub fn to_selection(&self) -> SubtitleSelection {
+        if self.is_none() {
+            SubtitleSelection::None
+        } else {
+            SubtitleSelection::Track {
+                code: self.code.clone(),
+                name: self.name.clone(),
+                url: (!self.url.is_empty()).then(|| self.url.clone()),
+            }
+        }
+    }
+
+    /// Ensure `"No subtitles"` is present once at index `0` of `subtitles`.
+    pub fn ensure_none_option_first(subtitles: &mut Vec<SubtitleOption>) {
+        subtitles.retain(|s| !s.is_none());
+        subtitles.insert(0, Self::none_option());
     }
 }
 
@@ -452,12 +499,15 @@ pub async fn fetch_stream_info_with_mal(
         }
     }
 
-    // Prioritize English, Arabic, Russian, and Bahasa Indonesia at the top of the track list
+    // Prioritize English, Arabic, Russian, and Bahasa Indonesia at the top of the track list,
+    // with "No subtitles" deterministically available as index 0.
     prioritize_subtitles(&mut info.subtitles);
+    SubtitleOption::ensure_none_option_first(&mut info.subtitles);
 
     // Populate provider-specific capabilities dynamically
     let zoko_qualities = info.qualities.clone();
-    let all_subtitles = info.subtitles.clone();
+    let mut all_subtitles = info.subtitles.clone();
+    SubtitleOption::ensure_none_option_first(&mut all_subtitles);
     let dub_avail = info.dub_available;
 
     for prov in &mut info.providers {

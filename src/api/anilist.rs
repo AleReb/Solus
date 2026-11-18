@@ -1235,49 +1235,114 @@ pub async fn resolve_mal_id(client: &reqwest::Client, anilist_id: i64) -> Option
     data.pointer("/data/Media/idMal")?.as_i64()
 }
 
+/// Structured parse result for streaming episode entries (tracks explicit vs fallback numbering).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStreamingEpisode {
+    pub episode: u32,
+    pub title: String,
+    pub explicit_number: bool,
+    pub is_special_or_ambiguous: bool,
+}
+
+fn clean_after_ep_number(after: &str, ep_num: u32) -> String {
+    let clean = after
+        .trim()
+        .strip_prefix('-')
+        .or_else(|| after.trim().strip_prefix(':'))
+        .or_else(|| after.trim().strip_prefix('.'))
+        .unwrap_or(after.trim())
+        .trim();
+    if clean.is_empty() {
+        format!("Episode {}", ep_num)
+    } else {
+        clean.to_string()
+    }
+}
+
+fn contains_special_marker(lower: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| matches!(tok, "ova" | "oad" | "special" | "recap" | "pv" | "prologue"))
+}
+
+/// Confidence-aware parser for AniList `streamingEpisodes` titles.
+/// Supports `"Episode N -"`, `"Ep N:"`, `"Ep. N -"`, `"EN Title"`, `"#N Title"`, and `"N - Title"`.
+pub fn parse_streaming_episode_title(raw_title: &str, fallback_index: u32) -> ParsedStreamingEpisode {
+    let trimmed = raw_title.trim();
+    let lower = trimmed.to_lowercase();
+    let is_special = contains_special_marker(&lower);
+
+    let prefixes: &[&str] = &["episode ", "ep. ", "ep "];
+    for prefix in prefixes {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(num) = digits.parse::<u32>() {
+                let after = &trimmed[prefix.len() + digits.len()..];
+                let fractional = after.starts_with('.')
+                    && after[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
+                return ParsedStreamingEpisode {
+                    episode: num,
+                    title: clean_after_ep_number(after, num),
+                    explicit_number: !fractional,
+                    is_special_or_ambiguous: is_special || fractional,
+                };
+            }
+        }
+    }
+
+    // "E13 Title" or "#13 Title"
+    let first_byte = trimmed.as_bytes().first().copied();
+    if matches!(first_byte, Some(b'E') | Some(b'e') | Some(b'#')) {
+        let rest = &trimmed[1..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let after = &rest[digits.len()..];
+            let boundary_ok = after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || c == '-' || c == ':');
+            if boundary_ok {
+                if let Ok(num) = digits.parse::<u32>() {
+                    return ParsedStreamingEpisode {
+                        episode: num,
+                        title: clean_after_ep_number(after, num),
+                        explicit_number: true,
+                        is_special_or_ambiguous: is_special,
+                    };
+                }
+            }
+        }
+    }
+
+    // "13 - Title" or "13: Title"
+    let leading_digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !leading_digits.is_empty() {
+        let after = &trimmed[leading_digits.len()..];
+        let after_trim = after.trim_start();
+        if after_trim.starts_with('-') || after_trim.starts_with(':') {
+            if let Ok(num) = leading_digits.parse::<u32>() {
+                return ParsedStreamingEpisode {
+                    episode: num,
+                    title: clean_after_ep_number(after, num),
+                    explicit_number: true,
+                    is_special_or_ambiguous: is_special,
+                };
+            }
+        }
+    }
+
+    ParsedStreamingEpisode {
+        episode: fallback_index,
+        title: trimmed.to_string(),
+        explicit_number: false,
+        is_special_or_ambiguous: is_special,
+    }
+}
+
 /// Helper to extract episode number and cleaned title from streaming episode entries.
 /// E.g. "Episode 1 - Ryomen Sukuna" -> (1, "Ryomen Sukuna")
 /// E.g. "Episode 12 - EAGLE EYE" -> (12, "EAGLE EYE")
 pub fn parse_episode_title_and_number(raw_title: &str, fallback_index: u32) -> (u32, String) {
-    let trimmed = raw_title.trim();
-    let lower = trimmed.to_lowercase();
-
-    // Check for "episode X" or "ep X" or "eX"
-    if let Some(rest) = lower.strip_prefix("episode ") {
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(num) = num_str.parse::<u32>() {
-            let after_num = trimmed["episode ".len() + num_str.len()..].trim();
-            let clean = after_num
-                .strip_prefix('-')
-                .or_else(|| after_num.strip_prefix(':'))
-                .unwrap_or(after_num)
-                .trim();
-            let final_title = if clean.is_empty() {
-                format!("Episode {}", num)
-            } else {
-                clean.to_string()
-            };
-            return (num, final_title);
-        }
-    } else if let Some(rest) = lower.strip_prefix("ep ") {
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(num) = num_str.parse::<u32>() {
-            let after_num = trimmed["ep ".len() + num_str.len()..].trim();
-            let clean = after_num
-                .strip_prefix('-')
-                .or_else(|| after_num.strip_prefix(':'))
-                .unwrap_or(after_num)
-                .trim();
-            let final_title = if clean.is_empty() {
-                format!("Episode {}", num)
-            } else {
-                clean.to_string()
-            };
-            return (num, final_title);
-        }
-    }
-
-    (fallback_index, trimmed.to_string())
+    let parsed = parse_streaming_episode_title(raw_title, fallback_index);
+    (parsed.episode, parsed.title)
 }
 
 impl Default for AniListClient {
@@ -1437,5 +1502,23 @@ mod tests {
             parse_episode_title_and_number("Some Random ONA Title", 42),
             (42, "Some Random ONA Title".to_string())
         );
+    }
+
+    #[test]
+    fn test_hunter_x_hunter_episode_13_rejects_mismatched_later_episode_at_index_13() {
+        // Long-running series like Hunter x Hunter often list Episode 73 at array index 13.
+        let p = parse_streaming_episode_title("Episode 73 - Insanity x And x Sanity", 13);
+        assert_eq!(p.episode, 73);
+        assert!(p.explicit_number);
+        assert!(!p.is_special_or_ambiguous);
+        assert_eq!(p.title, "Insanity x And x Sanity");
+
+        let p2 = parse_streaming_episode_title("E13 Letter x From x Gon", 99);
+        assert_eq!(p2.episode, 13);
+        assert!(p2.explicit_number);
+        assert_eq!(p2.title, "Letter x From x Gon");
+
+        let p_special = parse_streaming_episode_title("Episode 13.5 - Recap Special", 13);
+        assert!(p_special.is_special_or_ambiguous);
     }
 }

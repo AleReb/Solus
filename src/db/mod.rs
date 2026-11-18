@@ -443,7 +443,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("PRAGMA user_version = 3;").execute(pool).await;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS profile_playback_settings (
+            profile_id        TEXT PRIMARY KEY,
+            dub               INTEGER NOT NULL DEFAULT 0,
+            subtitle_code     TEXT    NOT NULL DEFAULT 'eng',
+            subtitle_delay_ms INTEGER NOT NULL DEFAULT 0,
+            quality           TEXT    NOT NULL DEFAULT '1080p',
+            preferred_player  TEXT    NOT NULL DEFAULT 'mpv',
+            updated_at        INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("PRAGMA user_version = 4;").execute(pool).await;
 
     Ok(())
 }
@@ -479,6 +493,7 @@ mod tests {
         assert!(tables.contains(&"tracker_entries".to_string()));
         assert!(tables.contains(&"playlists".to_string()));
         assert!(tables.contains(&"playlist_items".to_string()));
+        assert!(tables.contains(&"profile_playback_settings".to_string()));
     }
 
     #[tokio::test]

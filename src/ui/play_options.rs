@@ -11,12 +11,29 @@ use ratatui::{
 
 use crate::state::AppState;
 
-/// Render the playback options overlay on top of the detail screen.
-pub fn render_overlay(frame: &mut Frame, state: &AppState) {
-    let area = centered_rect(84, 70, frame.area());
-    frame.render_widget(Clear, area);
-    let theme = state.theme();
+/// Exact geometry for every interactive region in the Playback Options modal.
+/// Shared by both `render_overlay` and mouse hit-testing so click coordinates
+/// never drift across terminal sizes or loading/loaded state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackOptionsLayout {
+    pub modal_rect:        Rect,
+    pub header_rect:       Rect,
+    pub header_bar_row:    u16,
+    pub player_chip_rect:  Rect,
+    pub audio_chip_rect:   Rect,
+    pub anime4k_chip_rect: Rect,
+    pub player_rect:       Rect,
+    pub provider_rect:     Rect,
+    pub quality_rect:      Rect,
+    pub subtitle_rect:     Rect,
+    pub footer_rect:       Rect,
+    pub launch_btn_rect:   Rect,
+    pub back_btn_rect:     Rect,
+}
 
+/// Compute invariant modal geometry from the full terminal frame.
+pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
+    let modal_rect = centered_rect(84, 70, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,7 +41,96 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Constraint::Min(0),    // 4-column body (Player + Provider + Quality + Subtitles)
             Constraint::Length(3), // Footer hints
         ])
-        .split(area);
+        .split(modal_rect);
+
+    let header_rect = chunks[0];
+    let body_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(24),
+            Constraint::Percentage(22),
+            Constraint::Percentage(34),
+        ])
+        .split(chunks[1]);
+    let footer_rect = chunks[2];
+
+    let header_bar_row = header_rect.y.saturating_add(2);
+    let inner_x = header_rect.x.saturating_add(1);
+    let inner_w = header_rect.width.saturating_sub(2);
+    let third = (inner_w / 3).max(1);
+    let player_chip_rect = Rect {
+        x: inner_x,
+        y: header_bar_row,
+        width: third.min(inner_w),
+        height: 1,
+    };
+    let audio_chip_rect = Rect {
+        x: inner_x.saturating_add(third),
+        y: header_bar_row,
+        width: third.min(inner_w.saturating_sub(third)),
+        height: 1,
+    };
+    let a4k_x = inner_x.saturating_add(third.saturating_mul(2));
+    let anime4k_chip_rect = Rect {
+        x: a4k_x,
+        y: header_bar_row,
+        width: inner_x.saturating_add(inner_w).saturating_sub(a4k_x),
+        height: 1,
+    };
+
+    let f_inner_h = footer_rect.height.min(3);
+    let launch_w = 18.min(footer_rect.width);
+    let back_w = 16.min(footer_rect.width);
+    let launch_btn_rect = Rect {
+        x: footer_rect.x,
+        y: footer_rect.y,
+        width: launch_w,
+        height: f_inner_h,
+    };
+    let back_btn_rect = Rect {
+        x: footer_rect.right().saturating_sub(back_w),
+        y: footer_rect.y,
+        width: back_w,
+        height: f_inner_h,
+    };
+
+    PlaybackOptionsLayout {
+        modal_rect,
+        header_rect,
+        header_bar_row,
+        player_chip_rect,
+        audio_chip_rect,
+        anime4k_chip_rect,
+        player_rect: body_cols[0],
+        provider_rect: body_cols[1],
+        quality_rect: body_cols[2],
+        subtitle_rect: body_cols[3],
+        footer_rect,
+        launch_btn_rect,
+        back_btn_rect,
+    }
+}
+
+fn clamp_label(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let prefix: String = text.chars().take(max_chars - 1).collect();
+    format!("{}…", prefix.trim_end())
+}
+
+/// Render the playback options overlay on top of the detail screen.
+pub fn render_overlay(frame: &mut Frame, state: &AppState) {
+    let layout = compute_layout(frame.area());
+    frame.render_widget(Clear, layout.modal_rect);
+    let theme = state.theme();
 
     let audio_label = if state.pending_dub {
         "Dub"
@@ -38,12 +144,14 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         crate::state::PlaybackOptionsPurpose::EditQueueItem { .. } => (" ◈ EDIT QUEUE ENTRY: ", String::new()),
     };
 
+    let title_budget = (layout.header_rect.width as usize).saturating_sub(36).max(10);
     let title_line = state
         .selected_anime
         .as_ref()
         .map(|a| {
             let ep = state.selected_episode.unwrap_or(1);
-            format!("{} • Episode {}{}", a.short_title(), ep, title_suffix)
+            let raw = format!("{} • Ep {}{}", a.short_title(), ep, title_suffix);
+            clamp_label(&raw, title_budget)
         })
         .unwrap_or_else(|| "Choose options before launch".to_string());
 
@@ -121,7 +229,20 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled("([u] toggle)", Style::default().fg(theme.text_dim)),
+            Span::styled(" ([u])", Style::default().fg(theme.text_dim)),
+            Span::raw("   "),
+            Span::styled("Delay: ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                if state.subtitle_delay_ms == 0 {
+                    " 0ms ".to_string()
+                } else {
+                    format!(" {:+}ms ", state.subtitle_delay_ms)
+                },
+                Style::default()
+                    .fg(if state.subtitle_delay_ms == 0 { Color::White } else { Color::Black })
+                    .bg(if state.subtitle_delay_ms == 0 { theme.border_idle } else { theme.accent })
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ])
     .block(
@@ -136,18 +257,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_focus)),
     );
-    frame.render_widget(header, chunks[0]);
-
-    // Split body into 4 columns: Player (col 0), Provider (col 1), Quality (col 2), Subtitles (col 3)
-    let body_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Percentage(24),
-            Constraint::Percentage(22),
-            Constraint::Percentage(34),
-        ])
-        .split(chunks[1]);
+    frame.render_widget(header, layout.header_rect);
 
     // ── Col 0: Media Player Selection ────────────────────────────────────
     let pl_focused = state.playback_focus_column == 0;
@@ -166,9 +276,10 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(pl_border_style);
 
-    let pl_inner = pl_block.inner(body_cols[0]);
-    frame.render_widget(pl_block, body_cols[0]);
+    let pl_inner = pl_block.inner(layout.player_rect);
+    frame.render_widget(pl_block, layout.player_rect);
 
+    let pl_budget = (pl_inner.width as usize).saturating_sub(7).max(4);
     let pl_items: Vec<ListItem> = state
         .playback_players
         .iter()
@@ -204,7 +315,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 
             ListItem::new(Line::from(vec![
                 Span::styled(radio, radio_style),
-                Span::styled(name, style),
+                Span::styled(clamp_label(name, pl_budget), style),
             ]))
         })
         .collect();
@@ -229,20 +340,17 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(p_border_style);
 
-    let p_inner = p_block.inner(body_cols[1]);
-    frame.render_widget(p_block, body_cols[1]);
+    let p_inner = p_block.inner(layout.provider_rect);
+    frame.render_widget(p_block, layout.provider_rect);
 
-    if state.playback_providers.is_empty() {
-        let empty_p = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Default Provider",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-        ]);
-        frame.render_widget(empty_p, p_inner);
+    let p_budget = (p_inner.width as usize).saturating_sub(7).max(4);
+    let p_items: Vec<ListItem> = if state.playback_providers.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled(" [●] ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(clamp_label("Default Provider", p_budget), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]))]
     } else {
-        let p_items: Vec<ListItem> = state
+        state
             .playback_providers
             .iter()
             .enumerate()
@@ -269,14 +377,16 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
-                    Span::styled(label, style),
+                    Span::styled(clamp_label(&label, p_budget), style),
                 ]))
             })
-            .collect();
+            .collect()
+    };
 
-        let mut p_state = ListState::default().with_selected(Some(state.playback_provider_cursor));
-        frame.render_stateful_widget(List::new(p_items), p_inner, &mut p_state);
-    }
+    let mut p_state = ListState::default().with_selected(Some(
+        state.playback_provider_cursor.min(p_items.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(List::new(p_items), p_inner, &mut p_state);
 
     // ── Col 2: Quality Selection ──────────────────────────────────────────
     let q_focused = state.playback_focus_column == 2;
@@ -288,41 +398,41 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 
     let q_block = Block::default()
         .title(Span::styled(
-            if q_focused { " 󰗃 Stream Quality (Active) " } else { " 󰗃 Stream Quality " },
+            if q_focused { " 󰗃 Quality (Active) " } else { " 󰗃 Stream Quality " },
             q_border_style.add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(q_border_style);
 
-    let q_inner = q_block.inner(body_cols[2]);
-    frame.render_widget(q_block, body_cols[2]);
+    let q_inner = q_block.inner(layout.quality_rect);
+    frame.render_widget(q_block, layout.quality_rect);
 
-    if state.is_loading_subs {
-        let loading_q = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  󰑮 Detecting resolutions...",
-                Style::default().fg(theme.primary),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Verifying stream codecs...",
-                Style::default().fg(theme.text_dim),
-            )),
-        ]);
-        frame.render_widget(loading_q, q_inner);
+    let q_budget = (q_inner.width as usize).saturating_sub(7).max(4);
+    let (q_items, q_sel): (Vec<ListItem>, usize) = if state.is_loading_subs && state.playback_qualities.is_empty() {
+        (
+            vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled(" [·] ", Style::default().fg(theme.primary)),
+                    Span::styled(clamp_label("Detecting resolutions...", q_budget), Style::default().fg(theme.text_dim)),
+                ])),
+                ListItem::new(Line::from(vec![
+                    Span::styled("     ", Style::default()),
+                    Span::styled(clamp_label("Verifying codecs...", q_budget), Style::default().fg(theme.text_dim)),
+                ])),
+            ],
+            0,
+        )
     } else if state.playback_qualities.is_empty() {
-        let empty_q = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Default Stream",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-        ]);
-        frame.render_widget(empty_q, q_inner);
+        (
+            vec![ListItem::new(Line::from(vec![
+                Span::styled(" [●] ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(clamp_label("Default Stream", q_budget), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]))],
+            0,
+        )
     } else {
-        let q_items: Vec<ListItem> = state
+        let items: Vec<ListItem> = state
             .playback_qualities
             .iter()
             .enumerate()
@@ -343,14 +453,16 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
-                    Span::styled(&quality.label, style),
+                    Span::styled(clamp_label(&quality.label, q_budget), style),
                 ]))
             })
             .collect();
+        let sel = state.playback_quality_cursor.min(items.len().saturating_sub(1));
+        (items, sel)
+    };
 
-        let mut q_state = ListState::default().with_selected(Some(state.playback_quality_cursor));
-        frame.render_stateful_widget(List::new(q_items), q_inner, &mut q_state);
-    }
+    let mut q_state = ListState::default().with_selected(Some(q_sel));
+    frame.render_stateful_widget(List::new(q_items), q_inner, &mut q_state);
 
     // ── Col 3: Subtitle Language Selection ───────────────────────────────
     let sub_focused = state.playback_focus_column == 3;
@@ -362,32 +474,33 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 
     let sub_block = Block::default()
         .title(Span::styled(
-            if sub_focused { " 󰨖 Available Subtitles (Active) " } else { " 󰨖 Available Subtitles " },
+            if sub_focused { " 󰨖 Subtitles (Active) " } else { " 󰨖 Available Subtitles " },
             sub_border_style.add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(sub_border_style);
 
-    let sub_inner = sub_block.inner(body_cols[3]);
-    frame.render_widget(sub_block, body_cols[3]);
+    let sub_inner = sub_block.inner(layout.subtitle_rect);
+    frame.render_widget(sub_block, layout.subtitle_rect);
 
-    if state.is_loading_subs {
-        let loading_p = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  󰑮 Detecting stream languages...",
-                Style::default().fg(theme.primary),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Checking available subtitle tracks...",
-                Style::default().fg(theme.text_dim),
-            )),
-        ]);
-        frame.render_widget(loading_p, sub_inner);
+    let sub_budget = (sub_inner.width as usize).saturating_sub(7).max(4);
+    let (sub_items, sub_sel): (Vec<ListItem>, usize) = if state.is_loading_subs && state.playback_sub_languages.len() <= 2 {
+        (
+            vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled(" [·] ", Style::default().fg(theme.primary)),
+                    Span::styled(clamp_label("No subtitles", sub_budget), Style::default().fg(theme.text_dim)),
+                ])),
+                ListItem::new(Line::from(vec![
+                    Span::styled("     ", Style::default()),
+                    Span::styled(clamp_label("Detecting subtitle tracks...", sub_budget), Style::default().fg(theme.text_dim)),
+                ])),
+            ],
+            0,
+        )
     } else {
-        let sub_items: Vec<ListItem> = state
+        let items: Vec<ListItem> = state
             .playback_sub_languages
             .iter()
             .enumerate()
@@ -409,14 +522,16 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
-                    Span::styled(&sub.name, style),
+                    Span::styled(clamp_label(&sub.name, sub_budget), style),
                 ]))
             })
             .collect();
+        let sel = state.playback_sub_cursor.min(items.len().saturating_sub(1));
+        (items, sel)
+    };
 
-        let mut sub_state = ListState::default().with_selected(Some(state.playback_sub_cursor));
-        frame.render_stateful_widget(List::new(sub_items), sub_inner, &mut sub_state);
-    }
+    let mut sub_state = ListState::default().with_selected(Some(sub_sel));
+    frame.render_stateful_widget(List::new(sub_items), sub_inner, &mut sub_state);
 
     // ── Footer: Keymap Bar ───────────────────────────────────────────────
     let enter_label = match state.playback_options_purpose {
@@ -437,16 +552,14 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     footer_spans.extend([
         Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Col  "),
-        Span::styled(" 1-4 ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::raw(" Jump  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Pick  "),
         Span::styled(" p ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Player  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
-        Span::styled(" u ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::raw(" A4K  "),
+        Span::styled(" [/] ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::raw(" Delay  "),
         Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(theme.border_idle)),
         Span::raw(" Back"),
     ]);
@@ -457,7 +570,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_focus)),
     );
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, layout.footer_rect);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -478,4 +591,106 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn test_play_options_modal_geometry_identical_between_loading_and_loaded() {
+        for &(w, h) in &[(84u16, 28u16), (90, 28), (120, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            let layout_loading = compute_layout(area);
+            let layout_loaded = compute_layout(area);
+            assert_eq!(layout_loading, layout_loaded);
+
+            // Ensure loading state renders without overlapping or shifting box geometry.
+            let mut loading_state = AppState::new();
+            loading_state.selected_episode = Some(13);
+            loading_state.open_playback_options(
+                "Hunter x Hunter (2011)".to_string(),
+                0,
+                true,
+                crate::config::Player::Mpv,
+            );
+
+            let mut loaded_state = AppState::new();
+            loaded_state.selected_episode = Some(13);
+            loaded_state.open_playback_options(
+                "Hunter x Hunter (2011)".to_string(),
+                0,
+                true,
+                crate::config::Player::Mpv,
+            );
+            loaded_state.is_loading_subs = false;
+            loaded_state.playback_providers = vec![crate::api::subtitles::ProviderOption {
+                id: "hd1".into(),
+                name: "HD-1 Very Long Stream Provider Label Name".into(),
+                server_label: "HD-1".into(),
+                supports_sub: true,
+                supports_dub: true,
+                master_url: None,
+                qualities: vec![],
+                subtitles: vec![],
+            }];
+            loaded_state.playback_qualities = vec![
+                crate::api::subtitles::QualityOption {
+                    label: "1080p".into(),
+                    url: String::new(),
+                },
+                crate::api::subtitles::QualityOption {
+                    label: "720p".into(),
+                    url: String::new(),
+                },
+            ];
+            loaded_state.playback_sub_languages = vec![
+                crate::api::subtitles::SubtitleOption::none_option(),
+                crate::api::subtitles::SubtitleOption {
+                    name: "English (US) [Official]".into(),
+                    code: "eng".into(),
+                    url: "https://example.com/en.vtt".into(),
+                    stream_label: "Primary".into(),
+                },
+                crate::api::subtitles::SubtitleOption {
+                    name: "Arabic [Auto-Synced]".into(),
+                    code: "ara".into(),
+                    url: "https://example.com/ar.vtt".into(),
+                    stream_label: "Auto-Synced".into(),
+                },
+            ];
+
+            let mut term_loading = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term_loading
+                .draw(|f| render_overlay(f, &loading_state))
+                .unwrap();
+
+            let mut term_loaded = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term_loaded
+                .draw(|f| render_overlay(f, &loaded_state))
+                .unwrap();
+
+            // Verify header top border and column border x-positions match identically.
+            let buf_loading = term_loading.backend().buffer();
+            let buf_loaded = term_loaded.backend().buffer();
+            let body_top_y = layout_loading.provider_rect.y;
+            for rect in [
+                layout_loading.player_rect,
+                layout_loading.provider_rect,
+                layout_loading.quality_rect,
+                layout_loading.subtitle_rect,
+            ] {
+                assert_eq!(rect.y, body_top_y);
+                assert_eq!(
+                    buf_loading.cell((rect.x, rect.y)).unwrap().symbol(),
+                    buf_loaded.cell((rect.x, rect.y)).unwrap().symbol()
+                );
+                assert_eq!(
+                    buf_loading.cell((rect.right() - 1, rect.bottom() - 1)).unwrap().symbol(),
+                    buf_loaded.cell((rect.right() - 1, rect.bottom() - 1)).unwrap().symbol()
+                );
+            }
+        }
+    }
 }

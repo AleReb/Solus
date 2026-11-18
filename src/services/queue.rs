@@ -775,23 +775,29 @@ pub async fn resolve_item_prefetch(
         _ => return None,
     };
 
-    let pref_lower = item.sub_lang.to_lowercase();
-    let chosen_sub = stream_info
-        .subtitles
-        .iter()
-        .find(|s| {
-            s.name.to_lowercase().contains(&pref_lower)
-                || s.code.to_lowercase().starts_with(&pref_lower)
-                || s.lang_keyword().eq_ignore_ascii_case(&item.sub_lang)
-        })
-        .or_else(|| stream_info.subtitles.first());
+    let pref_lower = item.sub_lang.trim().to_lowercase();
+    let subs_disabled = pref_lower == "none" || pref_lower == "off" || pref_lower == "no subtitles";
+    let (chosen_sub, sub_lang, mut sub_url) = if subs_disabled {
+        (None, Some("none".to_string()), None)
+    } else {
+        let chosen = stream_info
+            .subtitles
+            .iter()
+            .filter(|s| !s.is_none())
+            .find(|s| {
+                s.name.to_lowercase().contains(&pref_lower)
+                    || s.code.to_lowercase().starts_with(&pref_lower)
+                    || s.lang_keyword().eq_ignore_ascii_case(&item.sub_lang)
+            })
+            .or_else(|| stream_info.subtitles.iter().find(|s| !s.is_none()))
+            .or_else(|| stream_info.subtitles.first());
 
-    let sub_lang = chosen_sub
-        .map(|s| s.lang_keyword().to_string())
-        .or_else(|| Some(item.sub_lang.clone()));
-    let mut sub_url = chosen_sub
-        .map(|s| s.url.clone())
-        .filter(|u| !u.is_empty());
+        let lang = chosen
+            .map(|s| s.lang_keyword().to_string())
+            .or_else(|| Some(item.sub_lang.clone()));
+        let url = chosen.map(|s| s.url.clone()).filter(|u| !u.is_empty());
+        (chosen, lang, url)
+    };
     let mut sub_synced = false;
 
     let needs_subsync = chosen_sub.is_some_and(|s| {
@@ -855,6 +861,8 @@ pub async fn resolve_item_prefetch(
         glsl_shaders,
         sub_style: Some(sub_style),
         loading_image: None,
+        sub_delay_ms: 0,
+        subtitles_disabled: subs_disabled,
     };
 
     Some(ResolvedPrefetch {
@@ -903,6 +911,8 @@ mod tests {
                 glsl_shaders: None,
                 sub_style: None,
                 loading_image: None,
+                sub_delay_ms: 0,
+                subtitles_disabled: false,
             },
             resolved_at,
             sub_synced: false,

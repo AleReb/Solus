@@ -779,7 +779,7 @@ async fn handle_remote_action(
         }
         "set_sub" => {
             if let Some(sub_id) = req.sub_id {
-                let (target_url, target_code, target_label, anime_id, episode) = {
+                let (target_url, target_code, target_label, anime_id, episode, is_playing) = {
                     let st = state.read().await;
                     let track = st.subtitles.iter().find(|s| s.id == sub_id);
                     (
@@ -788,8 +788,38 @@ async fn handle_remote_action(
                         track.map(|s| s.label.clone()).unwrap_or_default(),
                         st.anime_id,
                         st.episode,
+                        st.is_playing,
                     )
                 };
+
+                if target_code.eq_ignore_ascii_case("none") {
+                    let sid_ok = send_mpv_json_command(
+                        sock_path,
+                        serde_json::json!({ "command": ["set_property", "sid", "no"] }),
+                    )
+                    .await;
+                    let vis_ok = send_mpv_json_command(
+                        sock_path,
+                        serde_json::json!({ "command": ["set_property", "sub-visibility", "no"] }),
+                    )
+                    .await;
+                    if !is_playing || sid_ok || vis_ok {
+                        let mut st = state.write().await;
+                        for s in &mut st.subtitles {
+                            s.is_active = s.id == sub_id;
+                        }
+                        st.sub_active = false;
+                        st.sub_lang = "No subtitles".to_string();
+                        if let Some(tx) = tx_app {
+                            let _ = tx
+                                .send(crate::AppMessage::RemoteSubtitleSelectionChanged(
+                                    crate::api::subtitles::SubtitleSelection::None,
+                                ))
+                                .await;
+                        }
+                    }
+                    return;
+                }
 
                 let mut sub_applied = false;
 
@@ -813,39 +843,50 @@ async fn handle_remote_action(
                         let cmd = serde_json::json!({
                             "command": ["sub-add", local_path, "select", title, lang]
                         });
-                        let _ = send_mpv_json_command(sock_path, cmd).await;
-                        sub_applied = true;
+                        sub_applied = send_mpv_json_command(sock_path, cmd).await;
                     } else if !url.is_empty() {
                         let title = if target_label.is_empty() { "Subtitle" } else { &target_label };
                         let lang = if target_code.is_empty() { "sub" } else { &target_code };
                         let cmd = serde_json::json!({
                             "command": ["sub-add", url, "select", title, lang]
                         });
-                        let _ = send_mpv_json_command(sock_path, cmd).await;
-                        sub_applied = true;
+                        sub_applied = send_mpv_json_command(sock_path, cmd).await;
                     }
                 }
 
                 if !sub_applied {
                     let cmd = serde_json::json!({ "command": ["set_property", "sid", sub_id] });
-                    let _ = send_mpv_json_command(sock_path, cmd).await;
+                    sub_applied = send_mpv_json_command(sock_path, cmd).await;
                 }
 
                 let vis_cmd = serde_json::json!({ "command": ["set_property", "sub-visibility", "yes"] });
-                let _ = send_mpv_json_command(sock_path, vis_cmd).await;
+                let vis_ok = send_mpv_json_command(sock_path, vis_cmd).await;
 
-                let mut st = state.write().await;
-                let mut active_label = None;
-                for s in &mut st.subtitles {
-                    s.is_active = s.id == sub_id;
-                    if s.is_active {
-                        active_label = Some(s.label.clone());
+                if !is_playing || sub_applied || vis_ok {
+                    let mut st = state.write().await;
+                    let mut active_label = None;
+                    for s in &mut st.subtitles {
+                        s.is_active = s.id == sub_id;
+                        if s.is_active {
+                            active_label = Some(s.label.clone());
+                        }
+                    }
+                    if let Some(lbl) = active_label {
+                        st.sub_lang = lbl;
+                    }
+                    st.sub_active = true;
+                    if let Some(tx) = tx_app {
+                        let _ = tx
+                            .send(crate::AppMessage::RemoteSubtitleSelectionChanged(
+                                crate::api::subtitles::SubtitleSelection::Track {
+                                    code: target_code,
+                                    name: target_label,
+                                    url: target_url,
+                                },
+                            ))
+                            .await;
                     }
                 }
-                if let Some(lbl) = active_label {
-                    st.sub_lang = lbl;
-                }
-                st.sub_active = true;
             }
         }
         "toggle_sub_visibility" => {
@@ -856,18 +897,34 @@ async fn handle_remote_action(
             }
         }
         "set_sub_delay" => {
-            let delta = req.delta.unwrap_or(0.25);
-            let cmd = serde_json::json!({ "command": ["add", "sub-delay", delta] });
+            let delta_ms = (req.delta.unwrap_or(0.25) * 1000.0).round() as i32;
+            let cur_ms = {
+                let st = state.read().await;
+                (st.sub_delay * 1000.0).round() as i32
+            };
+            let new_delay_ms = cur_ms + delta_ms;
+            let new_delay_secs = new_delay_ms as f64 / 1000.0;
+            let cmd = serde_json::json!({ "command": ["set_property", "sub-delay", new_delay_secs] });
             if send_mpv_json_command(sock_path, cmd).await {
-                let mut st = state.write().await;
-                st.sub_delay += delta;
+                {
+                    let mut st = state.write().await;
+                    st.sub_delay = new_delay_secs;
+                }
+                if let Some(tx) = tx_app {
+                    let _ = tx.send(crate::AppMessage::RemoteSubDelayChanged(new_delay_ms)).await;
+                }
             }
         }
         "reset_sub_delay" => {
             let cmd = serde_json::json!({ "command": ["set_property", "sub-delay", 0.0] });
             if send_mpv_json_command(sock_path, cmd).await {
-                let mut st = state.write().await;
-                st.sub_delay = 0.0;
+                {
+                    let mut st = state.write().await;
+                    st.sub_delay = 0.0;
+                }
+                if let Some(tx) = tx_app {
+                    let _ = tx.send(crate::AppMessage::RemoteSubDelayChanged(0)).await;
+                }
             }
         }
         "set_sub_preset" => {
