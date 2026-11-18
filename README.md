@@ -4,6 +4,8 @@
 
 No ads. No browser tabs. No extra setup screens.
 
+https://github.com/user-attachments/assets/a7c6c35f-ac28-49ef-bb0f-fbfc72bc4177
+
 ## What Solus includes
 
 - Anime discovery and search
