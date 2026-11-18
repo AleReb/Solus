@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: build.sh [--jobs N] [--help]
+Usage: build.sh [--jobs N] [--dry-run] [--help]
 Build Solus natively on 64-bit Raspberry Pi OS / Debian ARM64.
 Defaults to one build job and opt-level=1 for the Solus package to reduce RAM use.
 Requires Rust >= 1.88, a C compiler, pkg-config and OpenSSL development headers.
@@ -12,9 +12,11 @@ EOF
 }
 
 jobs=1
+dry_run=false
 while (($#)); do
     case "$1" in
         --jobs) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; jobs=$2; shift 2 ;;
+        --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -44,6 +46,23 @@ IFS=. read -r major minor _ <<< "$version_number"
 }
 command -v cc >/dev/null
 pkg-config --exists openssl || { echo 'Install pkg-config and libssl-dev.' >&2; exit 1; }
+
+available_kb=$(df -Pk -- "$root" 2>/dev/null | awk 'NR==2 {print $4}')
+if [[ $available_kb =~ ^[0-9]+$ && $available_kb -lt 2097152 ]]; then
+    echo 'Warning: less than 2 GB free in the build filesystem; native builds may fail.' >&2
+fi
+if command -v free >/dev/null; then
+    available_mb=$(free -m 2>/dev/null | awk '/^Mem:/ {print $7}')
+    if [[ $available_mb =~ ^[0-9]+$ && $available_mb -lt 512 ]]; then
+        echo 'Warning: less than 512 MB memory available; a one-job build is recommended.' >&2
+    fi
+fi
+
+printf 'Build plan: rust stable, --locked, jobs=%s, opt-level=1 for solus\n' "$jobs"
+if $dry_run; then
+    echo 'Dry run complete. No build or generated files will change.'
+    exit 0
+fi
 
 cd -- "$root"
 # Only this invocation uses the lower optimization level; no Cargo.toml changes.

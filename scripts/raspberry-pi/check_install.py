@@ -31,6 +31,14 @@ def main():
             assert (result.returncode == 0) == ok, result.stdout + result.stderr
             return result
 
+        dry_run = install("--dry-run", "--terminal", "keep",
+                          "--download-dir", str(downloads))
+        assert "Raspberry Pi ARM64 installer preview" in dry_run.stdout
+        assert "Dry run complete" in dry_run.stdout
+        assert not prefix.exists()
+        assert not (home / ".config/solus/config.toml").exists()
+        assert not (home / "Movies/Solus").exists()
+
         for terminal in ("foot", "kitty", "keep"):
             install("--terminal", terminal, "--download-dir", str(downloads))
         launcher = prefix / "bin/solus"
@@ -42,10 +50,36 @@ def main():
         with config.open("rb") as stream:
             data = tomllib.load(stream)
         assert data["update"] == {"check_on_startup": False, "auto_install": False}
-        config.write_text("# existing user configuration must survive\n")
+        config.write_text("# existing user configuration must survive\nquality = \"1080p\"\n[update]\ncheck_on_startup = false\nauto_install = false\n[cache]\ntrending_ttl = 1234\n")
+        merge_helper = installer.with_name("merge_config.py")
+        result = subprocess.run([sys.executable, str(merge_helper), str(config)],
+                                env=env, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        merged = config.read_text()
+        assert "existing user configuration must survive" in merged
+        assert 'quality = "1080p"' in merged
+        assert "check_on_startup = false" in merged
+        assert "auto_install = false" in merged
+        assert "stable_ttl = 604800" in merged
+        assert "detail_ttl = 172800" in merged
+
         install("--terminal", "keep")
-        assert config.read_text() == "# existing user configuration must survive\n"
+        assert "existing user configuration must survive" in config.read_text()
         assert list((prefix / "bin").glob("solus.backup-*"))
+        assert list((config.parent).glob("config.toml.backup-*"))
+
+        vault = home / "Movies/Solus"
+        wrong_target = home / "wrong-vault"
+        wrong_target.mkdir()
+        vault.unlink()
+        vault.symlink_to(wrong_target)
+        install("--terminal", "keep", "--download-dir", str(downloads), ok=False)
+        install("--terminal", "keep", "--download-dir", str(downloads), "--replace-vault-link")
+        assert vault.resolve() == downloads
+        verify = install("--verify")
+        assert "verification passed" in verify.stdout
+        bad_sha = "0" * 64
+        install("--sha256", bad_sha, ok=False)
 
         # The selected folder and existing download contents must survive refusals.
         (downloads / "episode.mkv").write_text("existing download")
@@ -83,7 +117,7 @@ def main():
         result = subprocess.run(common + ["--terminal", "keep"], env=guarded_env,
                                 text=True, capture_output=True)
         assert result.returncode == 0 and "test-uuid" in settings.read_text(), result.stderr
-        assert config.read_text() == "# existing user configuration must survive\n"
+        assert "existing user configuration must survive" in config.read_text()
         findmnt.write_text('#!/bin/sh\nexit 1\n')
         udisks = mock_dir / "udisksctl"
         udisks.write_text('#!/bin/sh\nexit 1\n')
@@ -95,7 +129,15 @@ def main():
         (home / "Movies/Solus/keep.mkv").write_text("do not replace")
         install("--terminal", "keep", "--download-dir", str(downloads), ok=False)
         assert (home / "Movies/Solus/keep.mkv").read_text() == "do not replace"
-    print("PASS: terminal choices, installation, backups, configuration preservation,")
+
+        # Lifecycle operations remove only installation files, preserving user data.
+        install("--uninstall")
+        assert not launcher.exists()
+        assert not installed_binary.exists()
+        assert "existing user configuration must survive" in config.read_text()
+        assert (downloads / "episode.mkv").read_text() == "existing download"
+        install("--verify", ok=False)
+    print("PASS: dry-run, lifecycle, terminal choices, installation, backups, configuration preservation,")
     print("      paths with spaces, download protection, and USB launcher guards.")
 
 

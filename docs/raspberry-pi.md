@@ -111,7 +111,10 @@ bash scripts/raspberry-pi/install.sh --terminal keep --download-dir "$HOME/Video
 
 ```sh
 bash scripts/raspberry-pi/build.sh --jobs 1
+bash scripts/raspberry-pi/build.sh --dry-run --jobs 1
 ```
+
+The build preview reports the locked Cargo command, job count, and low disk/memory warnings.
 
 With dependencies already installed and a trusted native ARM64 executable:
 
@@ -123,6 +126,48 @@ bash scripts/raspberry-pi/install.sh --terminal keep --skip-deps \
 `--prefix /absolute/path` allows installation under another user-owned prefix.
 `--skip-deps` skips apt and ani-cli installation, not compilation. Use `--binary`
 as well to skip building. Do not set root as the installation user.
+
+Before making changes, preview the installation:
+
+```sh
+bash scripts/raspberry-pi/install.sh --dry-run --terminal keep
+```
+
+A supplied binary or downloaded helper can be checksum-verified:
+
+```sh
+bash scripts/raspberry-pi/install.sh --binary /absolute/path/to/solus \
+  --sha256 <64-character-SHA256>
+```
+
+Use `--ani-cli-sha256` or `--rustup-sha256` when those helpers are downloaded.
+No supplied checksum means the download is clearly warned rather than silently trusted.
+
+Lifecycle commands:
+
+```sh
+bash scripts/raspberry-pi/install.sh --verify
+bash scripts/raspberry-pi/install.sh --repair
+bash scripts/raspberry-pi/install.sh --uninstall
+bash scripts/raspberry-pi/install.sh --uninstall --purge-config
+```
+
+`--verify` checks the installed binary, launcher, launcher config, and download directory.
+`--repair` follows the normal installer and preserves existing configuration and downloads.
+`--uninstall` removes Solus's Raspberry Pi installation files but preserves user configuration,
+profiles, and downloads. `--purge-config` is a separate explicit opt-in removal of the Solus config directory.
+
+Existing Solus TOML files are preserved and only missing supported defaults are appended.
+Existing keys, update preferences, comments, and unknown settings are not overwritten.
+A backup named `config.toml.backup-<timestamp>` is created only when a merge changes the file.
+
+If `~/Movies/Solus` is already a symlink to a different location, the installer refuses to replace it
+unless `--replace-vault-link` is supplied. Real directories are never replaced automatically.
+
+```sh
+bash scripts/raspberry-pi/install.sh --replace-vault-link \
+  --download-dir /absolute/path/to/downloads
+```
 
 ## Validation and limits
 
@@ -145,6 +190,12 @@ python3 scripts/raspberry-pi/check_install.py /absolute/path/to/solus
 These checks cover installation, reinstallation, preservation of configuration and
 existing downloads, paths with spaces, and refusal to launch on the wrong USB.
 They do not perform a fresh apt/rustup installation or download episodes.
+
+Pull requests that touch this Raspberry Pi support run a dedicated `.github/workflows/raspberry-pi.yml`:
+ShellCheck and bash syntax checks run on Linux, Python helpers are compiled and tested,
+TOML merge behavior is checked, and a Debian 13 ARM64 container performs a native
+release build plus the temporary-HOME installer regression script. Container emulation
+adds coverage but does not replace a real Raspberry Pi smoke test.
 
 ## En español
 
