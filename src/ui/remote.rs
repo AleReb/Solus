@@ -32,7 +32,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 pub fn render_remote_modal(frame: &mut Frame, state: &AppState) {
-    let area = centered_rect(64, 76, frame.area());
+    let area = centered_rect(72, 86, frame.area());
     frame.render_widget(Clear, area);
 
     let theme = state.theme();
@@ -68,16 +68,32 @@ pub fn render_remote_modal(frame: &mut Frame, state: &AppState) {
     ])).alignment(Alignment::Center);
     frame.render_widget(header_p, chunks[0]);
 
-    // 2. ASCII QR Code
-    let qr_text = state
-        .remote_qr
-        .as_deref()
-        .unwrap_or("Generating QR code...");
+    // 2. Crisp QR Code (auto-falls back to compact Dense1x2 if terminal height/width is tight)
+    let large_qr = state.remote_qr.as_deref().unwrap_or("Generating QR code...");
+    let large_max_w = large_qr.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    let large_h = large_qr.lines().count();
 
-    let qr_lines: Vec<Line> = qr_text
-        .lines()
-        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White).bg(Color::Rgb(10, 12, 18)))))
-        .collect();
+    let compact_fallback = if large_h > chunks[1].height as usize
+        || large_max_w > chunks[1].width as usize
+    {
+        crate::services::remote::generate_compact_terminal_qr(&state.remote_url)
+    } else {
+        None
+    };
+    let qr_text = compact_fallback.as_deref().unwrap_or(large_qr);
+
+    let mut qr_lines: Vec<Line> = Vec::new();
+    let qr_h = qr_text.lines().count();
+    let v_pad = (chunks[1].height as usize).saturating_sub(qr_h) / 2;
+    for _ in 0..v_pad {
+        qr_lines.push(Line::from(""));
+    }
+    for l in qr_text.lines() {
+        qr_lines.push(Line::from(Span::styled(
+            l,
+            Style::default().fg(Color::Rgb(245, 242, 222)).bg(Color::Rgb(10, 12, 18)),
+        )));
+    }
 
     let qr_p = Paragraph::new(qr_lines).alignment(Alignment::Center);
     frame.render_widget(qr_p, chunks[1]);

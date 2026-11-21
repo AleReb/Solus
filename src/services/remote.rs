@@ -495,8 +495,32 @@ pub fn get_local_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-/// Generates a compact terminal-renderable ASCII QR code using Unicode Dense1x2 blocks.
+/// Generates a large, crisp terminal-renderable QR code (`2 cols x 1 row` per module) for roomy modals.
 pub fn generate_terminal_qr(url: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
+    let w = code.width();
+    let colors = code.to_colors();
+    let quiet = 2usize;
+    let total_w = w + quiet * 2;
+    let mut out = String::with_capacity((total_w * 2 + 1) * (w + quiet * 2));
+    for r in 0..(w + quiet * 2) {
+        if r > 0 {
+            out.push('\n');
+        }
+        for c in 0..total_w {
+            let is_dark = r >= quiet
+                && r < w + quiet
+                && c >= quiet
+                && c < w + quiet
+                && colors[(r - quiet) * w + (c - quiet)] == qrcode::Color::Dark;
+            out.push_str(if is_dark { "██" } else { "  " });
+        }
+    }
+    Some(out)
+}
+
+/// Generates a compact terminal-renderable QR code using Unicode Dense1x2 half-blocks for smaller panes.
+pub fn generate_compact_terminal_qr(url: &str) -> Option<String> {
     let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
     let qr_str = code
         .render::<qrcode::render::unicode::Dense1x2>()

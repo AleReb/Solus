@@ -96,7 +96,7 @@ fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
     } else {
         match state.screen {
             Screen::UpdateModal => (64, 45),
-            Screen::RemoteModal => (64, 76),
+            Screen::RemoteModal => (72, 86),
             Screen::CastModal => (68, 55),
             Screen::ProfileModal => crate::ui::profile::modal_pct(frame_area),
             Screen::QueueModal => crate::ui::queue::modal_pct(frame_area),
@@ -865,9 +865,9 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
         .is_some_and(|m| m.intersects(cover_inner));
     if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state
-            .anime_banners
+            .banner_cache
             .get_mut(&anime.id)
-            .or_else(|| state.banner_cache.get_mut(&anime.id))
+            .or_else(|| state.anime_banners.get_mut(&anime.id))
         {
             frame.render_stateful_widget(
                 crate::ui::components::cover::hd_image_widget(),
