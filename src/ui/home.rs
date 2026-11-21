@@ -101,6 +101,7 @@ fn active_modal_rect(frame_area: Rect, state: &AppState) -> Option<Rect> {
             Screen::ProfileModal => crate::ui::profile::modal_pct(frame_area),
             Screen::QueueModal => crate::ui::queue::modal_pct(frame_area),
             Screen::Help => crate::ui::help::modal_pct(frame_area),
+            Screen::Settings => crate::ui::settings::modal_pct(frame_area),
             Screen::Setup => crate::ui::setup::modal_pct(frame_area),
             Screen::AniListLogin => crate::ui::login::modal_pct(frame_area),
             Screen::Calendar => {
@@ -362,11 +363,24 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
     } else {
         format!("◆ Queue: {}  ·  ", state.queue.len())
     };
+    let net_badge = if state.network_mode.is_congested() {
+        format!("[ {} ]  ·  ", state.network_mode.short_tag())
+    } else {
+        String::new()
+    };
     let profile_badge = format!(
         "{} {} [P]",
         state.active_profile_icon, state.active_profile_name
     );
-    let right_text = format!("{}{}  ·  {}  ·  ◈ {} ", queue_badge, profile_badge, user_badge, theme.name);
+    let right_text = format!(
+        "{}{}{}{}  ·  {}  ·  ◈ {} ",
+        queue_badge,
+        net_badge,
+        profile_badge,
+        "",
+        user_badge,
+        theme.name
+    );
     let right_width = right_text.chars().count() as u16 + 2;
 
     for (num, row, label) in top_bar_shelves(data) {
@@ -408,6 +422,18 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, data: &HomeDa
                 Style::default()
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+        }
+        if state.network_mode.is_congested() {
+            let net_fg = match state.network_mode {
+                crate::config::NetworkMode::CongestedWifi => Color::Rgb(245, 185, 66),
+                crate::config::NetworkMode::UltraSaver => Color::Rgb(80, 220, 145),
+                crate::config::NetworkMode::Normal => theme.text_dim,
+            };
+            spans.push(Span::styled(
+                format!("[ {} ]", state.network_mode.short_tag()),
+                Style::default().fg(net_fg).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
         }

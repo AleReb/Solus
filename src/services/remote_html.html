@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="lain-wired" data-shape="chamfer" data-art="companion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#060b08">
+  <title>Solus Companion</title>
+  <style>
+    :root {
+      --bg: #060b08;
+      --bg-2: #0a140f;
+      --card: #0b1610;
+      --card-2: #102018;
+      --border: #1e4230;
+      --border-hi: #347a57;
+      --text: #dffce9;
+      --text-muted: #78a98c;
+      --accent: #6ee787;
+      --accent-fg: #03150b;
+      --accent-soft: rgba(110, 231, 135, 0.14);
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --radius-card: 10px;
+      --radius-btn: 6px;
+      --border-w: 1px;
+      --shadow-card: 0 12px 30px rgba(0, 0, 0, 0.48);
+      --shadow-btn: none;
+      --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+      --safe-b: env(safe-area-inset-bottom, 0px);
+      --safe-t: env(safe-area-inset-top, 0px);
+    }
+
+    /* ── Theme Definitions (12 Multi-Genre Skins) ─────────────────────────── */
+    html[data-theme="lain-wired"] {
+      --bg: #050a07; --bg-2: #08120c; --card: #09150f; --card-2: #0f2218;
+      --border: #1b432e; --border-hi: #6ee787; --text: #dcffe6; --text-muted: #76ad8b;
+      --accent: #6ee787; --accent-fg: #04150a; --accent-soft: rgba(110, 231, 135, 0.15);
+      --radius-card: 4px; --radius-btn: 3px; --border-w: 1px;
+      --shadow-card: 0 0 0 1px rgba(110, 231, 135, 0.12), 0 14px 32px rgba(0, 0, 0, 0.65);
+    }
+    html[data-theme="chrome-y2k"] {
+      --bg: #0b101b; --bg-2: #121c2e; --card: #131d2f; --card-2: #1c2a44;
+      --border: #4b6188; --border-hi: #bae6fd; --text: #eff6ff; --text-muted: #93afd3;
+      --accent: #7dd3fc; --accent-fg: #061829; --accent-soft: rgba(125, 211, 252, 0.18);
+      --radius-card: 16px; --radius-btn: 12px; --border-w: 1.5px;
+      --shadow-card: inset 0 1px 0 rgba(255,255,255,0.22), 0 16px 36px rgba(0, 8, 28, 0.58);
+    }
+    html[data-theme="neon-cat"] {
+      --bg: #0d0719; --bg-2: #160c29; --card: #150b26; --card-2: #21123a;
+      --border: #4d297d; --border-hi: #f472b6; --text: #fdf2f8; --text-muted: #c09cd8;
+      --accent: #f472b6; --accent-fg: #270518; --accent-soft: rgba(244, 114, 182, 0.18);
+      --radius-card: 14px; --radius-btn: 10px; --border-w: 1.5px;
+      --shadow-card: 0 0 24px rgba(244, 114, 182, 0.12), 0 14px 30px rgba(0, 0, 0, 0.6);
+    }
+    html[data-theme="shibuya-punk"] {
+      --bg: #f4efe4; --bg-2: #ebe2d0; --card: #ffffff; --card-2: #f7f2e8;
+      --border: #141414; --border-hi: #ef233c; --text: #111111; --text-muted: #55514a;
+      --accent: #ef233c; --accent-fg: #ffffff; --accent-soft: rgba(239, 35, 60, 0.14);
+      --warn: #b45309; --danger: #b91c1c;
+      --radius-card: 6px; --radius-btn: 4px; --border-w: 2.5px;
+      --shadow-card: 5px 5px 0 #141414; --shadow-btn: 3px 3px 0 #141414;
+    }
+    html[data-theme="manga-ink"] {
+      --bg: #f7f6f2; --bg-2: #e9e7e0; --card: #ffffff; --card-2: #f2f1ec;
+      --border: #18181b; --border-hi: #18181b; --text: #111113; --text-muted: #52525b;
+      --accent: #18181b; --accent-fg: #ffffff; --accent-soft: rgba(24, 24, 27, 0.10);
+      --warn: #a16207; --danger: #b91c1c;
+      --radius-card: 2px; --radius-btn: 2px; --border-w: 2.5px;
+      --shadow-card: 5px 5px 0 #18181b; --shadow-btn: 2px 2px 0 #18181b;
+    }
+    html[data-theme="akira-tokyo"] {
+      --bg: #110709; --bg-2: #1c0b0f; --card: #190a0e; --card-2: #281016;
+      --border: #5f1d28; --border-hi: #fb7185; --text: #fff1f2; --text-muted: #d1969f;
+      --accent: #f43f5e; --accent-fg: #ffffff; --accent-soft: rgba(244, 63, 94, 0.18);
+      --radius-card: 4px; --radius-btn: 3px; --border-w: 1.5px;
+      --shadow-card: 0 12px 28px rgba(0, 0, 0, 0.68);
+    }
+    html[data-theme="nerv-hud"] {
+      --bg: #0b0905; --bg-2: #151008; --card: #120d06; --card-2: #1e160a;
+      --border: #613d12; --border-hi: #fb923c; --text: #ffedd5; --text-muted: #cba170;
+      --accent: #fb923c; --accent-fg: #1f0e02; --accent-soft: rgba(251, 146, 60, 0.16);
+      --radius-card: 2px; --radius-btn: 2px; --border-w: 1.5px;
+      --shadow-card: inset 0 0 0 1px rgba(251, 146, 60, 0.14), 0 14px 30px rgba(0, 0, 0, 0.65);
+    }
+    html[data-theme="arcade-16bit"] {
+      --bg: #120c2e; --bg-2: #1a1140; --card: #1b1347; --card-2: #261c63;
+      --border: #5542b6; --border-hi: #facc15; --text: #fefce8; --text-muted: #b7addf;
+      --accent: #facc15; --accent-fg: #1b1200; --accent-soft: rgba(250, 204, 21, 0.18);
+      --radius-card: 0px; --radius-btn: 0px; --border-w: 2px;
+      --shadow-card: 4px 4px 0 #09061a; --shadow-btn: 2px 2px 0 #09061a;
+    }
+    html[data-theme="pocket-dmg"] {
+      --bg: #c4d69c; --bg-2: #b4c78b; --card: #d5e4b2; --card-2: #b8ca90;
+      --border: #203d20; --border-hi: #0f290f; --text: #0f280f; --text-muted: #355835;
+      --accent: #274f27; --accent-fg: #e2efc4; --accent-soft: rgba(39, 79, 39, 0.16);
+      --warn: #6b4600; --danger: #7a1c1c;
+      --radius-card: 0px; --radius-btn: 0px; --border-w: 2px;
+      --shadow-card: 4px 4px 0 #203d20; --shadow-btn: 2px 2px 0 #203d20;
+    }
+    html[data-theme="kyoto-sumi"] {
+      --bg: #111615; --bg-2: #171e1c; --card: #161d1b; --card-2: #1e2825;
+      --border: #2e3d38; --border-hi: #86bda2; --text: #e6efea; --text-muted: #93aba0;
+      --accent: #86bda2; --accent-fg: #0b1913; --accent-soft: rgba(134, 189, 162, 0.15);
+      --radius-card: 18px; --radius-btn: 14px; --border-w: 1px;
+      --shadow-card: 0 12px 30px rgba(0, 0, 0, 0.42);
+    }
+    html[data-theme="washi-zen"] {
+      --bg: #f3ede2; --bg-2: #e8dfd0; --card: #faf6ee; --card-2: #ede5d8;
+      --border: #c9bca7; --border-hi: #a64b34; --text: #2a241f; --text-muted: #6f6255;
+      --accent: #a64b34; --accent-fg: #fdfaf5; --accent-soft: rgba(166, 75, 52, 0.13);
+      --warn: #9a5b0c; --danger: #9f2720;
+      --radius-card: 16px; --radius-btn: 12px; --border-w: 1px;
+      --shadow-card: 0 8px 24px rgba(64, 48, 30, 0.10);
+    }
+    html[data-theme="cassette-hifi"] {
+      --bg: #151311; --bg-2: #1f1b18; --card: #1d1a17; --card-2: #28231f;
+      --border: #463c33; --border-hi: #f59e0b; --text: #fef3c7; --text-muted: #baa78f;
+      --accent: #f59e0b; --accent-fg: #1d1100; --accent-soft: rgba(245, 158, 11, 0.17);
+      --radius-card: 8px; --radius-btn: 5px; --border-w: 1.5px;
+      --shadow-card: inset 0 1px 0 rgba(255,255,255,0.08), 0 14px 28px rgba(0, 0, 0, 0.58);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+
+    body {
+      min-height: 100dvh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      position: relative;
+      transition: background 0.25s ease, color 0.25s ease;
+    }
+
+    /* Ambient textures tailored per skin family */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.45;
+    }
+    html[data-theme="lain-wired"] body::before,
+    html[data-theme="nerv-hud"] body::before,
+    html[data-theme="akira-tokyo"] body::before {
+      background-image: repeating-linear-gradient(0deg, rgba(255,255,255,0.028) 0 1px, transparent 1px 4px);
+    }
+    html[data-shape="comic"] body::before {
+      opacity: 0.22;
+      background-image: radial-gradient(var(--border) 1px, transparent 1px);
+      background-size: 12px 12px;
+    }
+    html[data-shape="pixel"] body::before {
+      opacity: 0.14;
+      background-image: linear-gradient(to right, var(--border) 1px, transparent 1px),
+                        linear-gradient(to bottom, var(--border) 1px, transparent 1px);
+      background-size: 16px 16px;
+    }
+    html[data-shape="deck"] body::before {
+      opacity: 0.22;
+      background-image: repeating-linear-gradient(90deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 6px);
+    }
+
+    /* Blended portrait background layer */
+    #art-backdrop {
+      position: fixed;
+      inset: 0;
+      background-size: cover;
+      background-position: center 18%;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 0;
+      transition: opacity 0.35s ease;
+      filter: saturate(0.9) contrast(1.04);
+    }
+    html[data-art="blend"] #art-backdrop {
+      opacity: 0.22;
+    }
+    #art-backdrop::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, var(--bg) 0%, transparent 34%, var(--bg) 96%);
+    }
+
+    .app-shell {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      max-width: 520px;
+      margin: 0 auto;
+      padding: calc(10px + var(--safe-t)) 14px calc(86px + var(--safe-b));
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      flex: 1;
+    }
+
+    /* ── Top Sticky Bar ───────────────────────────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 11px;
+      background: var(--card);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+    }
+    .brand-col {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .ws-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 99px;
+      background: var(--danger);
+      flex-shrink: 0;
+      transition: background 0.2s, box-shadow 0.2s;
+    }
+    .ws-dot.ok {
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+    }
+    .brand-text {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .brand-kicker {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .pill-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 6px 9px;
+      background: var(--card-2);
+      color: var(--text);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      box-shadow: var(--shadow-btn);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: transform 0.08s ease, border-color 0.15s ease, background 0.15s ease;
+    }
+    .pill-btn:active { transform: scale(0.95); }
+    .pill-btn.net-wifi { border-color: var(--warn); color: var(--warn); }
+    .pill-btn.net-eco { border-color: var(--accent); color: var(--accent); }
+    .pill-btn svg, .icon-box svg { width: 15px; height: 15px; display: block; flex-shrink: 0; }
+
+    /* ── Character Portrait Card (Companion / Poster / Off / Blend) ───────── */
+    .art-card {
+      background: var(--card);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 11px;
+    }
+    html[data-art="off"] .art-card,
+    html[data-art="blend"] .art-card {
+      display: none;
+    }
+    html[data-art="poster"] .art-card {
+      flex-direction: column;
+      align-items: stretch;
+      padding: 0;
+      gap: 0;
+    }
+    .art-thumb-wrap {
+      width: 56px;
+      height: 56px;
+      border-radius: calc(var(--radius-btn) + 1px);
+      overflow: hidden;
+      border: var(--border-w) solid var(--border);
+      flex-shrink: 0;
+      position: relative;
+      background: var(--card-2);
+    }
+    html[data-art="poster"] .art-thumb-wrap {
+      width: 100%;
+      height: 112px;
+      border-radius: 0;
+      border: none;
+      border-bottom: var(--border-w) solid var(--border);
+    }
+    .art-thumb-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center 22%;
+      display: block;
+    }
+    .art-meta {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    html[data-art="poster"] .art-meta {
+      padding: 8px 12px;
+    }
+    .art-title {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.06em;
+    }
+    .art-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* ── Main Single-Card Stage ───────────────────────────────────────────── */
+    .stage-card {
+      background: var(--card);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      position: relative;
+    }
+    html[data-shape="chamfer"] .stage-card,
+    html[data-shape="chamfer"] .topbar,
+    html[data-shape="chamfer"] .art-card {
+      clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+    }
+    html[data-shape="chamfer"] .t-btn,
+    html[data-shape="chamfer"] .pill-btn {
+      clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+    }
+    html[data-shape="bezel"] .stage-card,
+    html[data-shape="bezel"] .t-btn,
+    html[data-shape="bezel"] .pill-btn,
+    html[data-shape="bezel"] .q-btn {
+      background-image: linear-gradient(180deg, rgba(255,255,255,0.11) 0%, rgba(255,255,255,0.01) 46%, rgba(0,0,0,0.16) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), var(--shadow-btn);
+    }
+    html[data-shape="comic"] .anime-title,
+    html[data-shape="comic"] .drawer-title {
+      font-weight: 900;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    html[data-shape="comic"] .t-btn:active,
+    html[data-shape="comic"] .pill-btn:active,
+    html[data-shape="comic"] .q-btn:active {
+      transform: translate(2px, 2px);
+      box-shadow: none;
+    }
+    html[data-shape="pixel"] .t-btn,
+    html[data-shape="pixel"] .pill-btn,
+    html[data-shape="pixel"] .q-btn,
+    html[data-shape="pixel"] .ep-btn {
+      border-radius: 0;
+      box-shadow: inset -3px -3px 0 rgba(0,0,0,0.34), inset 3px 3px 0 rgba(255,255,255,0.22);
+    }
+    html[data-shape="pixel"] .tele-fill {
+      background-image: repeating-linear-gradient(90deg, var(--accent) 0 8px, transparent 8px 10px);
+      background-color: transparent;
+    }
+    html[data-shape="zen"] .anime-title {
+      font-family: Georgia, "Hiragino Mincho ProN", "Songti SC", serif;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    html[data-shape="zen"] input[type="range"].solus-range::-webkit-slider-thumb {
+      border-radius: 99px;
+      width: 16px;
+      height: 16px;
+    }
+    html[data-shape="deck"] .t-btn {
+      box-shadow: inset 0 2px 0 rgba(255,255,255,0.12), inset 0 -3px 0 rgba(0,0,0,0.45);
+    }
+    html[data-shape="deck"] .tele-fill {
+      background-image: repeating-linear-gradient(90deg, var(--accent) 0 5px, rgba(0,0,0,0.28) 5px 7px);
+      background-color: transparent;
+    }
+
+    .media-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .poster-box {
+      width: 60px;
+      height: 84px;
+      border-radius: var(--radius-btn);
+      border: var(--border-w) solid var(--border);
+      background: var(--card-2);
+      overflow: hidden;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+    }
+    .poster-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .media-info {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .anime-title {
+      font-size: 17px;
+      font-weight: 700;
+      line-height: 1.25;
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .ep-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .badge-tag {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: var(--radius-btn);
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid var(--border);
+    }
+
+    /* Live Buffer Telemetry Strip */
+    .telemetry-strip {
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .telemetry-strip.buffering {
+      border-color: var(--warn);
+    }
+    .tele-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      flex-wrap: wrap;
+    }
+    .tele-state {
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .telemetry-strip.buffering .tele-state {
+      color: var(--warn);
+    }
+    .tele-metrics {
+      color: var(--text-muted);
+      font-size: 10.5px;
+    }
+    .tele-bar {
+      width: 100%;
+      height: 5px;
+      background: var(--bg);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .tele-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.35s ease;
+    }
+    .telemetry-strip.buffering .tele-fill {
+      background: var(--warn);
+    }
+
+    /* Scrubber */
+    .scrubber-block {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    input[type="range"].solus-range {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 8px;
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      outline: none;
+    }
+    input[type="range"].solus-range::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: var(--radius-btn);
+      background: var(--accent);
+      border: 2px solid var(--accent-fg);
+      cursor: pointer;
+    }
+    .time-row {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* 5-Button Transport Cluster */
+    .transport-row {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      align-items: center;
+    }
+    .t-btn {
+      height: 50px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      background: var(--card-2);
+      color: var(--text);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      box-shadow: var(--shadow-btn);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      transition: transform 0.08s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+    .t-btn:active { transform: translateY(1px) scale(0.96); }
+    .t-btn svg { width: 20px; height: 20px; }
+    .t-btn.primary {
+      height: 58px;
+      background: var(--accent);
+      color: var(--accent-fg);
+      border-color: var(--border-hi);
+    }
+    .t-btn.primary svg { width: 26px; height: 26px; }
+
+    /* Volume & Quick Actions */
+    .vol-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .vol-val {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      width: 36px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .quick-pills {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .q-btn {
+      padding: 8px 4px;
+      background: var(--card-2);
+      color: var(--text);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      box-shadow: var(--shadow-btn);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .q-btn.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
+    /* ── Fixed Bottom 4-Tab Dock ───────────────────────────────────────────── */
+    .bottom-nav {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      background: var(--card);
+      border-top: var(--border-w) solid var(--border);
+      padding: 6px 10px calc(8px + var(--safe-b));
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      max-width: 520px;
+      margin: 0 auto;
+    }
+    .nav-btn {
+      background: transparent;
+      color: var(--text-muted);
+      border: var(--border-w) solid transparent;
+      border-radius: var(--radius-btn);
+      padding: 6px 4px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .nav-btn svg { width: 18px; height: 18px; }
+    .nav-btn.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-color: var(--border);
+    }
+
+    /* ── Slide-Up Drawer Sheets ───────────────────────────────────────────── */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.56);
+      z-index: 50;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease;
+    }
+    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+
+    .drawer-sheet {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      max-width: 520px;
+      margin: 0 auto;
+      max-height: 80dvh;
+      z-index: 60;
+      background: var(--card);
+      border-top: var(--border-w) solid var(--border-hi);
+      border-left: var(--border-w) solid var(--border);
+      border-right: var(--border-w) solid var(--border);
+      border-radius: var(--radius-card) var(--radius-card) 0 0;
+      padding: 12px 14px calc(20px + var(--safe-b));
+      transform: translateY(104%);
+      transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+    }
+    .drawer-sheet.open { transform: translateY(0); }
+    .drawer-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    .drawer-title {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .item-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .list-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: left;
+    }
+    .list-row.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .ep-btn {
+      padding: 9px 6px;
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .ep-btn.watched { color: var(--text-muted); }
+    .ep-btn.current {
+      background: var(--accent);
+      color: var(--accent-fg);
+      border-color: var(--border-hi);
+      font-weight: 800;
+    }
+    .genre-tabs {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .theme-card {
+      padding: 9px 10px;
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      text-align: left;
+      color: var(--text);
+    }
+    .theme-card.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .swatch-pair {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .swatch-dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.28);
+    }
+    .art-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 7px;
+    }
+    .art-slot {
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      overflow: hidden;
+      background: var(--card-2);
+      cursor: pointer;
+      padding: 0;
+      color: var(--text);
+      text-align: center;
+    }
+    .art-slot.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .art-slot img {
+      width: 100%;
+      height: 54px;
+      object-fit: cover;
+      object-position: center 20%;
+      display: block;
+    }
+    .art-slot span {
+      display: block;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      padding: 3px 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .net-card {
+      padding: 10px 8px;
+      background: var(--card-2);
+      border: var(--border-w) solid var(--border);
+      border-radius: var(--radius-btn);
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .net-card.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .net-card strong { font-family: var(--font-mono); font-size: 11px; color: var(--accent); }
+    .net-card span { font-size: 10px; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div id="art-backdrop"></div>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-col">
+        <div class="ws-dot" id="ws-dot"></div>
+        <div class="brand-text">
+          <div class="brand-kicker" id="brand-kicker">SOLUS COMPANION</div>
+          <div class="brand-sub" id="brand-sub">Connecting LAN WebSocket...</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="pill-btn" id="net-chip-btn" onclick="sendAction('cycle_network_mode', {})">
+          <span class="icon-box" data-icon="signal"></span>
+          <span id="net-tag">NET:FULL</span>
+        </button>
+        <button class="pill-btn" id="theme-chip-btn" onclick="openDrawer('theme')">
+          <span class="icon-box" data-icon="theme"></span>
+          <span id="theme-label">Wired CRT</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="art-card" id="companion-slot">
+      <div class="art-thumb-wrap">
+        <img id="companion-img" src="/assets/art/0.jpg" alt="Character Showcase">
+      </div>
+      <div class="art-meta">
+        <div>
+          <div class="art-title" id="art-tag">CRT PHOSPHOR</div>
+          <div class="art-sub" id="art-mode-sub">Companion Showcase</div>
+        </div>
+        <button class="pill-btn" onclick="cycleArtPortrait()">
+          <span class="icon-box" data-icon="artNext"></span>
+          <span>Art</span>
+        </button>
+      </div>
+    </section>
+
+    <main class="stage-card">
+      <div class="media-row">
+        <div class="poster-box">
+          <img id="anime-poster" src="" alt="" style="display:none" onerror="this.style.display='none'">
+          <span class="icon-box" id="poster-fallback" data-icon="play"></span>
+        </div>
+        <div class="media-info">
+          <div class="anime-title" id="anime-title">Ready for Playback</div>
+          <div class="ep-row">
+            <span class="badge-tag" id="ep-badge">EP --</span>
+            <span class="badge-tag" id="quality-badge">STREAM</span>
+            <span id="ep-sub-title">Launch an episode in Solus</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="telemetry-strip" id="telemetry-strip">
+        <div class="tele-top">
+          <span class="tele-state" id="tele-state">BUFFER READY</span>
+          <span class="tele-metrics" id="tele-metrics">Buf: 0.0s • 0.0 MB • 0 kbps • Stl: 0</span>
+        </div>
+        <div class="tele-bar"><div class="tele-fill" id="tele-fill"></div></div>
+      </div>
+
+      <div class="scrubber-block">
+        <input type="range" class="solus-range" id="seek-bar" min="0" max="100" value="0">
+        <div class="time-row">
+          <span id="time-cur">00:00</span>
+          <span id="time-dur">00:00</span>
+        </div>
+      </div>
+
+      <div class="transport-row">
+        <button class="t-btn" onclick="sendAction('seek', { delta: -85 })">
+          <span class="icon-box" data-icon="fastBack"></span>
+          <span>-85s</span>
+        </button>
+        <button class="t-btn" onclick="sendAction('seek', { delta: -10 })">
+          <span class="icon-box" data-icon="skipBack"></span>
+          <span>-10s</span>
+        </button>
+        <button class="t-btn primary" id="btn-play-pause" onclick="sendAction('play_pause', {})">
+          <span class="icon-box" id="play-icon-slot" data-icon="play"></span>
+        </button>
+        <button class="t-btn" onclick="sendAction('seek', { delta: 10 })">
+          <span class="icon-box" data-icon="skipFwd"></span>
+          <span>+10s</span>
+        </button>
+        <button class="t-btn" onclick="sendAction('skip_intro', {})">
+          <span class="icon-box" data-icon="fastFwd"></span>
+          <span>+85s</span>
+        </button>
+      </div>
+
+      <div class="vol-row">
+        <button class="pill-btn" onclick="sendAction('volume', { delta: -5 })">
+          <span class="icon-box" data-icon="volLow"></span>
+        </button>
+        <input type="range" class="solus-range" id="vol-slider" min="0" max="100" value="100">
+        <button class="pill-btn" onclick="sendAction('volume', { delta: 5 })">
+          <span class="icon-box" data-icon="volHigh"></span>
+        </button>
+        <span class="vol-val" id="vol-val">100%</span>
+      </div>
+
+      <div class="quick-pills">
+        <button class="q-btn" id="btn-speed" onclick="cycleSpeed()">1.0x</button>
+        <button class="q-btn" id="btn-audio" onclick="sendAction('toggle_audio', {})">SUB</button>
+        <button class="q-btn" id="btn-shader" onclick="cycleShader()">4K:OFF</button>
+        <button class="q-btn" onclick="sendAction('toggle_fullscreen', {})">
+          <span class="icon-box" data-icon="expand"></span>
+          <span>FS</span>
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <!-- Fixed 4-Tab Bottom Navigation -->
+  <nav class="bottom-nav">
+    <button class="nav-btn" data-tab="tracks" onclick="toggleDrawer('tracks')">
+      <span class="icon-box" data-icon="tracks"></span>
+      <span>Tracks</span>
+    </button>
+    <button class="nav-btn" data-tab="episodes" onclick="toggleDrawer('episodes')">
+      <span class="icon-box" data-icon="episodes"></span>
+      <span>Episodes</span>
+    </button>
+    <button class="nav-btn" data-tab="video" onclick="toggleDrawer('video')">
+      <span class="icon-box" data-icon="videoNet"></span>
+      <span>Video &amp; Net</span>
+    </button>
+    <button class="nav-btn" data-tab="queue" onclick="toggleDrawer('queue')">
+      <span class="icon-box" data-icon="queue"></span>
+      <span>Queue</span>
+    </button>
+  </nav>
+
+  <div class="drawer-backdrop" id="drawer-backdrop" onclick="closeDrawer()"></div>
+
+  <!-- Drawer 1: Audio & Subtitles -->
+  <section class="drawer-sheet" id="drawer-tracks">
+    <div class="drawer-head">
+      <span class="drawer-title">Audio &amp; Subtitles</span>
+      <button class="pill-btn" onclick="closeDrawer()"><span class="icon-box" data-icon="close"></span></button>
+    </div>
+    <div>
+      <div class="section-label">Audio Tracks</div>
+      <div class="item-list" id="audio-list"></div>
+    </div>
+    <div>
+      <div class="section-label">Subtitle Sync &amp; Visibility</div>
+      <div class="grid-4">
+        <button class="ep-btn" onclick="sendAction('set_sub_delay', { delta: -0.25 })">-0.25s</button>
+        <button class="ep-btn" id="sub-delay-val" onclick="sendAction('reset_sub_delay', {})">0.00s</button>
+        <button class="ep-btn" onclick="sendAction('set_sub_delay', { delta: 0.25 })">+0.25s</button>
+        <button class="ep-btn" id="sub-vis-btn" onclick="sendAction('toggle_sub_visibility', {})">Toggle</button>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Subtitle Typography Presets</div>
+      <div class="grid-2">
+        <button class="q-btn" data-preset="studio" onclick="sendAction('set_sub_preset', { preset: 'studio' })">Studio Minimal</button>
+        <button class="q-btn" data-preset="netflix" onclick="sendAction('set_sub_preset', { preset: 'netflix' })">Netflix Clean</button>
+        <button class="q-btn" data-preset="fansub" onclick="sendAction('set_sub_preset', { preset: 'fansub' })">Anime Fansub</button>
+        <button class="q-btn" data-preset="oled" onclick="sendAction('set_sub_preset', { preset: 'oled' })">OLED Plate</button>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Subtitle Tracks</div>
+      <div class="item-list" id="sub-list"></div>
+    </div>
+  </section>
+
+  <!-- Drawer 2: Episodes -->
+  <section class="drawer-sheet" id="drawer-episodes">
+    <div class="drawer-head">
+      <span class="drawer-title">Episodes</span>
+      <button class="pill-btn" onclick="closeDrawer()"><span class="icon-box" data-icon="close"></span></button>
+    </div>
+    <div class="grid-2">
+      <button class="list-row" id="ep-prev-btn" onclick="stepEpisode(-1)">Previous Episode</button>
+      <button class="list-row" id="ep-next-btn" onclick="stepEpisode(1)">Next Episode</button>
+    </div>
+    <div class="grid-4" id="episode-grid"></div>
+  </section>
+
+  <!-- Drawer 3: Video, Network & Shader -->
+  <section class="drawer-sheet" id="drawer-video">
+    <div class="drawer-head">
+      <span class="drawer-title">Video, Network &amp; Shaders</span>
+      <button class="pill-btn" onclick="closeDrawer()"><span class="icon-box" data-icon="close"></span></button>
+    </div>
+    <div>
+      <div class="section-label">Adaptive Network Profile</div>
+      <div class="grid-3">
+        <button class="net-card" data-net="normal" onclick="sendAction('set_network_mode', { mode: 'normal' })">
+          <strong>NET:FULL</strong>
+          <span>Uncapped • 45s</span>
+        </button>
+        <button class="net-card" data-net="congested_wifi" onclick="sendAction('set_network_mode', { mode: 'congested_wifi' })">
+          <strong>NET:WIFI</strong>
+          <span>720p30 • 120s Disk</span>
+        </button>
+        <button class="net-card" data-net="ultra_saver" onclick="sendAction('set_network_mode', { mode: 'ultra_saver' })">
+          <strong>NET:ECO</strong>
+          <span>480p30 • 180s Disk</span>
+        </button>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Auto-ABR Downshift &amp; Telemetry</div>
+      <div class="grid-2">
+        <button class="list-row" id="btn-auto-abr" onclick="sendAction('toggle_auto_abr', {})">
+          <span>Auto-ABR Downshift</span>
+          <strong id="auto-abr-val">ON</strong>
+        </button>
+        <div class="list-row" style="cursor:default">
+          <span>Quality</span>
+          <strong id="drawer-quality-val">--</strong>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Anime4K Real-Time Upscaler</div>
+      <div class="grid-3">
+        <button class="q-btn" data-shader="off" onclick="sendAction('set_anime4k', { mode: 'off' })">Off</button>
+        <button class="q-btn" data-shader="balanced" onclick="sendAction('set_anime4k', { mode: 'balanced' })">Balanced</button>
+        <button class="q-btn" data-shader="ultra" onclick="sendAction('set_anime4k', { mode: 'ultra' })">Ultra</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Drawer 4: Queue -->
+  <section class="drawer-sheet" id="drawer-queue">
+    <div class="drawer-head">
+      <span class="drawer-title">Playback Queue</span>
+      <button class="pill-btn" onclick="closeDrawer()"><span class="icon-box" data-icon="close"></span></button>
+    </div>
+    <div class="grid-2">
+      <button class="list-row active" id="queue-auto-btn" onclick="sendAction('queue_toggle_auto', {})">Auto-Next: ON</button>
+      <button class="list-row" onclick="sendAction('queue_skip', {})">Skip to Next</button>
+    </div>
+    <div>
+      <div class="section-label">Up Next in Session</div>
+      <div class="item-list" id="queue-list"></div>
+    </div>
+  </section>
+
+  <!-- Slide-Up Theme Studio Sheet -->
+  <section class="drawer-sheet" id="drawer-theme">
+    <div class="drawer-head">
+      <span class="drawer-title">Theme Studio &amp; Character Art</span>
+      <button class="pill-btn" onclick="closeDrawer()"><span class="icon-box" data-icon="close"></span></button>
+    </div>
+    <div class="genre-tabs" id="genre-tabs"></div>
+    <div class="grid-2" id="theme-grid"></div>
+    <div>
+      <div class="section-label">Character Art Mode</div>
+      <div class="grid-4" id="art-mode-bar">
+        <button class="ep-btn" data-artmode="companion" onclick="setArtMode('companion')">Companion</button>
+        <button class="ep-btn" data-artmode="blend" onclick="setArtMode('blend')">Blend</button>
+        <button class="ep-btn" data-artmode="poster" onclick="setArtMode('poster')">Poster</button>
+        <button class="ep-btn" data-artmode="off" onclick="setArtMode('off')">Minimal</button>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Bundled Character Portraits</div>
+      <div class="art-grid" id="art-gallery"></div>
+    </div>
+  </section>
+
+  <script>
+    const THEMES = [
+      { id: 'lain-wired',    name: 'Wired CRT',      genre: 'Y2K',    pack: 'wired',  shape: 'chamfer', art: 0,  bg: '#050a07', acc: '#6ee787' },
+      { id: 'chrome-y2k',    name: 'Chrome 2000',    genre: 'Y2K',    pack: 'chrome', shape: 'bezel',   art: 4,  bg: '#0b101b', acc: '#7dd3fc' },
+      { id: 'neon-cat',      name: 'Shinjuku Synth', genre: 'Y2K',    pack: 'wired',  shape: 'bezel',   art: 5,  bg: '#0d0719', acc: '#f472b6' },
+      { id: 'shibuya-punk',  name: 'Shibuya Punk',   genre: 'Anime',  pack: 'comic',  shape: 'comic',   art: 6,  bg: '#f4efe4', acc: '#ef233c' },
+      { id: 'manga-ink',     name: 'Manga Ink',      genre: 'Anime',  pack: 'comic',  shape: 'comic',   art: 2,  bg: '#f7f6f2', acc: '#18181b' },
+      { id: 'akira-tokyo',   name: 'Neo-Tokyo 88',   genre: 'Anime',  pack: 'mecha',  shape: 'chamfer', art: 3,  bg: '#110709', acc: '#f43f5e' },
+      { id: 'nerv-hud',      name: 'Tactical HUD',   genre: 'Gaming', pack: 'mecha',  shape: 'chamfer', art: 7,  bg: '#0b0905', acc: '#fb923c' },
+      { id: 'arcade-16bit',  name: 'Arcade 16-Bit',  genre: 'Gaming', pack: 'pixel',  shape: 'pixel',   art: 8,  bg: '#120c2e', acc: '#facc15' },
+      { id: 'pocket-dmg',    name: 'Pocket DMG',     genre: 'Gaming', pack: 'pixel',  shape: 'pixel',   art: 9,  bg: '#c4d69c', acc: '#274f27' },
+      { id: 'kyoto-sumi',    name: 'Kyoto Sumi',     genre: 'Zen',    pack: 'zen',    shape: 'zen',     art: 10, bg: '#111615', acc: '#86bda2' },
+      { id: 'washi-zen',     name: 'Washi Paper',    genre: 'Zen',    pack: 'zen',    shape: 'zen',     art: 4,  bg: '#f3ede2', acc: '#a64b34' },
+      { id: 'cassette-hifi', name: 'Hi-Fi Deck',     genre: 'Hi-Fi',  pack: 'deck',   shape: 'deck',    art: 1,  bg: '#151311', acc: '#f59e0b' }
+    ];
+
+    const ART_TAGS = [
+      'CRT Phosphor', 'Cyber Audio', 'Ink Sketch', 'Midnight Deck',
+      'Mint Star', 'Neon Cat', 'Halftone Star', 'Cyber Violet',
+      'Cyan Halo', 'Ice Matrix', 'Teal Signal'
+    ];
+
+    // 7 distinct inline SVG icon packs (zero emojis / zero Nerd Font PUA glyphs)
+    function iconSvg(name, pack) {
+      const crisp = pack === 'pixel' ? 'shape-rendering="crispEdges"' : '';
+      const sw = pack === 'wired' ? '1.3' : pack === 'comic' ? '2.6' : pack === 'zen' ? '1.45' : pack === 'chrome' ? '2.1' : '1.9';
+      const cap = (pack === 'pixel' || pack === 'mecha' || pack === 'deck') ? 'square' : 'round';
+      const join = (pack === 'pixel' || pack === 'mecha') ? 'miter' : 'round';
+      const attrs = `viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="${cap}" stroke-linejoin="${join}" ${crisp}`;
+
+      const byPack = {
+        wired: {
+          play: '<polygon points="7,5 19,12 7,19"/><circle cx="7" cy="5" r="1.1" fill="currentColor"/><circle cx="19" cy="12" r="1.1" fill="currentColor"/><circle cx="7" cy="19" r="1.1" fill="currentColor"/>',
+          pause: '<path d="M8 5v14M16 5v14"/><circle cx="8" cy="5" r="1"/><circle cx="16" cy="19" r="1"/>',
+          skipBack: '<path d="M12 6L5 12l7 6M19 6l-7 6 7 6"/><circle cx="5" cy="12" r="1" fill="currentColor"/>',
+          skipFwd: '<path d="M5 6l7 6-7 6M12 6l7 6-7 6"/><circle cx="19" cy="12" r="1" fill="currentColor"/>',
+          fastBack: '<path d="M19 6l-6 6 6 6M12 6l-6 6 6 6M5 5v14"/>',
+          fastFwd: '<path d="M5 6l6 6-6 6M12 6l6 6-6 6M19 5v14"/>',
+          volLow: '<path d="M5 10h3l5-4v12l-5-4H5zM17 10a3.5 3.5 0 010 4"/>',
+          volHigh: '<path d="M4 10h3l5-4v12l-5-4H4zM16 9a5 5 0 010 6M19 6.5a8.5 8.5 0 010 11"/>',
+          tracks: '<path d="M3 7h11M3 12h8M3 17h6M16 17V6l5 2"/>',
+          episodes: '<path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM16.5 13v7M13 16.5h7"/>',
+          videoNet: '<path d="M3 12h4l3-6 4 12 3-6h4"/>',
+          queue: '<path d="M4 6h14M4 11h12M4 16h8M16 15l5 3-5 3z"/>',
+          theme: '<rect x="4" y="4" width="16" height="16"/><path d="M4 12h16M12 4v16"/>',
+          signal: '<path d="M4 18a11 11 0 0116 0M7.5 15a6 6 0 019 0"/><circle cx="12" cy="18.5" r="1.2" fill="currentColor"/>',
+          artNext: '<path d="M3 5h12v14H3zM18 8l4 4-4 4"/>',
+          expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+          close: '<path d="M5 5l14 14M19 5L5 19"/>'
+        },
+        chrome: {
+          play: '<path fill="currentColor" stroke="none" d="M7 5.5a1 1 0 011.5-.86l11 6.5a1 1 0 010 1.72l-11 6.5A1 1 0 017 18.5v-13z"/>',
+          pause: '<rect x="6" y="5" width="4.2" height="14" rx="2"/><rect x="13.8" y="5" width="4.2" height="14" rx="2"/>',
+          skipBack: '<path d="M12 7c-3 2-5 3.6-7 5 2 1.4 4 3 7 5V7zm7 0c-3 2-5 3.6-7 5 2 1.4 4 3 7 5V7z"/>',
+          skipFwd: '<path d="M5 7c3 2 5 3.6 7 5-2 1.4-4 3-7 5V7zm7 0c3 2 5 3.6 7 5-2 1.4-4 3-7 5V7z"/>',
+          fastBack: '<path d="M18 6l-6 6 6 6M12 6l-6 6 6 6"/><circle cx="5" cy="12" r="1.5" fill="currentColor"/>',
+          fastFwd: '<path d="M6 6l6 6-6 6M12 6l6 6-6 6"/><circle cx="19" cy="12" r="1.5" fill="currentColor"/>',
+          volLow: '<path d="M4 9.5a1 1 0 011-1h3l5-4v15l-5-4H5a1 1 0 01-1-1v-5zm13.5 0a4 4 0 010 5"/>',
+          volHigh: '<path d="M4 9.5a1 1 0 011-1h3l5-4v15l-5-4H5a1 1 0 01-1-1v-5zm12.5-1a5 5 0 010 7m3-9.5a8.5 8.5 0 010 12"/>',
+          tracks: '<circle cx="17" cy="16" r="3"/><path d="M17 13V5l4 1.5M4 7h9M4 12h7M4 17h5"/>',
+          episodes: '<rect x="4" y="4" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="2"/>',
+          videoNet: '<circle cx="12" cy="12" r="9"/><path d="M8 15l3-6 2 4 3-5"/>',
+          queue: '<rect x="4" y="5" width="16" height="3" rx="1.5"/><rect x="4" y="10.5" width="12" height="3" rx="1.5"/><rect x="4" y="16" width="8" height="3" rx="1.5"/><polygon fill="currentColor" points="16,14 21,17 16,20"/>',
+          theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 018 8h-8V4z" fill="currentColor" stroke="none"/>',
+          signal: '<path d="M4 15a10 10 0 0116 0M7.5 18a5.5 5.5 0 019 0"/><circle cx="12" cy="19" r="1.4" fill="currentColor"/>',
+          artNext: '<rect x="3" y="4" width="12" height="16" rx="3"/><path d="M18 9l3 3-3 3"/>',
+          expand: '<path d="M4 9V5a1 1 0 011-1h4M20 9V5a1 1 0 00-1-1h-4M4 15v4a1 1 0 001 1h4M20 15v4a1 1 0 01-1 1h-4"/>',
+          close: '<path d="M6 6l12 12M18 6L6 18"/>'
+        },
+        comic: {
+          play: '<polygon fill="currentColor" points="6,4 20,12 6,20"/>',
+          pause: '<path fill="currentColor" d="M5 4h5v16H5zm9 0h5v16h-5z"/>',
+          skipBack: '<polygon fill="currentColor" points="13,6 5,12 13,18"/><polygon fill="currentColor" points="20,6 12,12 20,18"/>',
+          skipFwd: '<polygon fill="currentColor" points="4,6 12,12 4,18"/><polygon fill="currentColor" points="11,6 19,12 11,18"/>',
+          fastBack: '<path d="M19 5l-7 7 7 7M12 5l-7 7 7 7M4 5v14"/>',
+          fastFwd: '<path d="M5 5l7 7-7 7M12 5l7 7-7 7M20 5v14"/>',
+          volLow: '<path fill="currentColor" d="M4 9h4l6-5v16l-6-5H4z"/><path d="M18 9.5a4 4 0 010 5"/>',
+          volHigh: '<path fill="currentColor" d="M4 9h4l6-5v16l-6-5H4z"/><path d="M17 8.5a5 5 0 010 7M19.5 6a8.5 8.5 0 010 12"/>',
+          tracks: '<path d="M3 6h14M3 12h11M3 18h8M17 18V5l5 2"/>',
+          episodes: '<path d="M3 4h8v7H3zM13 4h8v7h-8zM3 13h8v7H3zM13 13h8v7h-8z"/>',
+          videoNet: '<polygon points="12,3 14.5,9 21,9.5 16,13.5 17.5,20 12,16.5 6.5,20 8,13.5 3,9.5 9.5,9"/>',
+          queue: '<path d="M4 5h16v4H4zM4 11h12v4H4zM4 17h9"/>',
+          theme: '<polygon fill="currentColor" points="12,3 15,9 21,12 15,15 12,21 9,15 3,12 9,9"/>',
+          signal: '<path d="M4 19l4-10 4 6 4-10 4 14"/>',
+          artNext: '<rect x="3" y="4" width="12" height="16"/><path d="M18 8l4 4-4 4"/>',
+          expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+          close: '<path d="M5 5l14 14M19 5L5 19"/>'
+        },
+        mecha: {
+          play: '<polygon fill="currentColor" stroke="none" points="6,4 19,12 6,20"/>',
+          pause: '<path fill="currentColor" stroke="none" d="M6 4h4v16H6zm8 0h4v16h-4z"/>',
+          skipBack: '<path d="M12 6l-6 6 6 6M19 6l-6 6 6 6"/>',
+          skipFwd: '<path d="M5 6l6 6-6 6M12 6l6 6-6 6"/>',
+          fastBack: '<polygon points="12,6 6,12 12,18"/><path d="M19 6l-6 6 6 6M4 5v14"/>',
+          fastFwd: '<polygon points="12,6 18,12 12,18"/><path d="M5 6l6 6-6 6M20 5v14"/>',
+          volLow: '<path d="M4 9h4l5-4v14l-5-4H4zM17 10l2 2-2 2"/>',
+          volHigh: '<path d="M4 9h4l5-4v14l-5-4H4zM16 8l3 4-3 4M19 5l3 7-3 7"/>',
+          tracks: '<path d="M3 6h14l3 3M3 12h12M3 18h10M18 13v7"/>',
+          episodes: '<polygon points="12,3 20,7.5 20,16.5 12,21 4,16.5 4,7.5"/>',
+          videoNet: '<path d="M4 20V14h3v6M10 20V9h3v11M16 20V4h3v16"/>',
+          queue: '<path d="M4 6h16M4 12h13M4 18h9M16 15l5 3-5 3"/>',
+          theme: '<polygon points="12,3 20,8 20,16 12,21 4,16 4,8"/><circle cx="12" cy="12" r="3"/>',
+          signal: '<path d="M4 19v-4M9 19v-7M14 19V9M19 19V5"/>',
+          artNext: '<polygon points="3,5 15,5 15,16 12,19 3,19"/><path d="M18 9l3 3-3 3"/>',
+          expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+          close: '<path d="M6 6l12 12M18 6L6 18"/>'
+        },
+        pixel: {
+          play: '<path fill="currentColor" stroke="none" d="M7 4h3v2h3v2h3v3h2v2h-2v3h-3v2h-3v2H7V4z"/>',
+          pause: '<path fill="currentColor" stroke="none" d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"/>',
+          skipBack: '<path fill="currentColor" stroke="none" d="M12 6v4l6-4v12l-6-4v4l-7-6 7-6z"/>',
+          skipFwd: '<path fill="currentColor" stroke="none" d="M6 6l7 6-7 6V6zm7 4l6-4v12l-6-4V10z"/>',
+          fastBack: '<path d="M11 6L5 12l6 6M19 6l-6 6 6 6"/>',
+          fastFwd: '<path d="M5 6l6 6-6 6M13 6l6 6-6 6"/>',
+          volLow: '<path d="M4 9h4l5-4v14l-5-4H4V9zm12 3h4"/>',
+          volHigh: '<path d="M4 9h4l5-4v14l-5-4H4V9zm13-2v10m-3-7v4"/>',
+          tracks: '<path d="M4 6h16M4 12h12M4 18h8M17 14v5h4"/>',
+          episodes: '<path d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 0h6v6h-6v-6z"/>',
+          videoNet: '<path d="M3 18h3v-4H3v4zm5 0h3V10H8v8zm5 0h3V6h-3v12zm5 0h3V3h-3v15z"/>',
+          queue: '<path d="M4 6h16M4 11h16M4 16h10M17 15v5l4-2.5-4-2.5z"/>',
+          theme: '<path d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm12 2h4v4h-4v-4z"/>',
+          signal: '<path d="M4 19h3v-4H4v4zm5 0h3v-8H9v8zm5 0h3V7h-3v12zm5 0h3V3h-3v16z"/>',
+          artNext: '<path d="M4 6h10v12H4V6zm13 3l4 3-4 3V9z"/>',
+          expand: '<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>',
+          close: '<path d="M6 6h2v2H6zm10 0h2v2h-2zm-8 2h2v2H8zm6 0h2v2h-2zm-4 2h4v4h-4zm-2 4h2v2H8zm6 0h2v2h-2zm-8 2h2v2H6zm10 0h2v2h-2z"/>'
+        },
+        zen: {
+          play: '<path d="M8 5.5c4 2 8 4.2 11 6.5-3 2.3-7 4.5-11 6.5V5.5z"/>',
+          pause: '<path d="M9 6v12M15 6v12"/>',
+          skipBack: '<path d="M12 7a5 5 0 105 5M12 7l-3-2m3 2l-3 2"/>',
+          skipFwd: '<path d="M12 7a5 5 0 11-5 5M12 7l3-2m-3 2l3 2"/>',
+          fastBack: '<path d="M18 7l-5 5 5 5M11 7l-5 5 5 5"/>',
+          fastFwd: '<path d="M6 7l5 5-5 5M13 7l5 5-5 5"/>',
+          volLow: '<path d="M5 10h3l4-3.5v11L8 14H5zM16 10.5a2.5 2.5 0 010 3"/>',
+          volHigh: '<path d="M5 10h3l4-3.5v11L8 14H5zM16 9.5a4 4 0 010 5M19 7a7 7 0 010 10"/>',
+          tracks: '<path d="M5 8h10M5 13h7M5 18h5M17 16V7l3 1"/>',
+          episodes: '<circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/><circle cx="8" cy="16" r="3"/><circle cx="16" cy="16" r="3"/>',
+          videoNet: '<circle cx="12" cy="12" r="8"/><path d="M8.5 14.5c2-4 5-4 7 0"/>',
+          queue: '<path d="M5 7h14M5 12h11M5 17h8"/>',
+          theme: '<circle cx="12" cy="12" r="8"/><path d="M9 12a3 3 0 006 0"/>',
+          signal: '<path d="M6 16a8.5 8.5 0 0112 0M9 18a4 4 0 016 0"/>',
+          artNext: '<circle cx="9.5" cy="12" r="6"/><path d="M18 9l3 3-3 3"/>',
+          expand: '<path d="M5 9V5h4M19 9V5h-4M5 15v4h4M19 15v4h-4"/>',
+          close: '<path d="M7 7l10 10M17 7L7 17"/>'
+        },
+        deck: {
+          play: '<polygon fill="currentColor" stroke="none" points="7,5 19,12 7,19"/>',
+          pause: '<rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/>',
+          skipBack: '<polygon fill="currentColor" stroke="none" points="12,7 5,12 12,17"/><polygon fill="currentColor" stroke="none" points="19,7 12,12 19,17"/>',
+          skipFwd: '<polygon fill="currentColor" stroke="none" points="5,7 12,12 5,17"/><polygon fill="currentColor" stroke="none" points="12,7 19,12 12,17"/>',
+          fastBack: '<rect x="4" y="6" width="2.5" height="12" fill="currentColor"/><polygon fill="currentColor" stroke="none" points="13,6 7,12 13,18"/><polygon fill="currentColor" stroke="none" points="20,6 14,12 20,18"/>',
+          fastFwd: '<polygon fill="currentColor" stroke="none" points="4,6 10,12 4,18"/><polygon fill="currentColor" stroke="none" points="11,6 17,12 11,18"/><rect x="17.5" y="6" width="2.5" height="12" fill="currentColor"/>',
+          volLow: '<rect x="4" y="9" width="4" height="6" fill="currentColor"/><polygon points="8,9 14,5 14,19 8,15"/><path d="M17 10v4"/>',
+          volHigh: '<rect x="4" y="9" width="4" height="6" fill="currentColor"/><polygon points="8,9 14,5 14,19 8,15"/><path d="M17 8v8M20 6v12"/>',
+          tracks: '<rect x="3" y="6" width="14" height="2.5" fill="currentColor"/><rect x="3" y="11" width="10" height="2.5" fill="currentColor"/><rect x="3" y="16" width="8" height="2.5" fill="currentColor"/><circle cx="18.5" cy="15.5" r="2.5"/>',
+          episodes: '<rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="12" r="2"/>',
+          videoNet: '<rect x="4" y="14" width="3" height="6" fill="currentColor"/><rect x="9" y="10" width="3" height="10" fill="currentColor"/><rect x="14" y="6" width="3" height="14" fill="currentColor"/><rect x="19" y="3" width="2" height="17" fill="currentColor"/>',
+          queue: '<rect x="4" y="5" width="16" height="3" fill="currentColor"/><rect x="4" y="10.5" width="12" height="3" fill="currentColor"/><rect x="4" y="16" width="9" height="3" fill="currentColor"/>',
+          theme: '<rect x="4" y="6" width="16" height="12" rx="2"/><circle cx="9" cy="12" r="2.2"/><circle cx="15" cy="12" r="2.2"/>',
+          signal: '<path d="M4 18h2M8 15v3M12 12v6M16 8v10M20 5v13"/>',
+          artNext: '<rect x="3" y="5" width="12" height="14"/><path d="M18 9l3 3-3 3"/>',
+          expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+          close: '<path d="M6 6l12 12M18 6L6 18"/>'
+        }
+      };
+      const table = byPack[pack] || byPack.wired;
+      return `<svg ${attrs}>${table[name] || table.play}</svg>`;
+    }
+
+    let ws = null;
+    let currentState = null;
+    let activeDrawer = null;
+    let activeGenre = 'All';
+    let dragSeek = false;
+    let dragVol = false;
+    let cachedPack = '';
+
+    function fmtTime(sec) {
+      sec = Math.max(0, Math.floor(sec || 0));
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      const p = n => String(n).padStart(2, '0');
+      return h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
+    }
+
+    function sendAction(action, payload) {
+      const msg = Object.assign({ action }, payload || {});
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(msg));
+      } else {
+        fetch('/api/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(msg)
+        }).then(() => fetch('/api/status').then(r => r.json()).then(renderState)).catch(() => {});
+      }
+    }
+
+    function applyThemeVisuals(themeId, artMode, artIdx) {
+      const theme = THEMES.find(t => t.id === themeId) || THEMES[0];
+      const root = document.documentElement;
+      root.setAttribute('data-theme', theme.id);
+      root.setAttribute('data-shape', theme.shape);
+      root.setAttribute('data-art', artMode || 'companion');
+      document.getElementById('theme-label').textContent = theme.name;
+      const idx = Math.abs(Number(artIdx ?? theme.art)) % ART_TAGS.length;
+      const artUrl = `/assets/art/${idx}.jpg`;
+      document.getElementById('companion-img').src = artUrl;
+      document.getElementById('art-backdrop').style.backgroundImage = `url('${artUrl}')`;
+      document.getElementById('art-tag').textContent = ART_TAGS[idx].toUpperCase();
+      document.getElementById('art-mode-sub').textContent = `${theme.name} • ${(artMode || 'companion').toUpperCase()}`;
+
+      if (cachedPack !== theme.pack) {
+        cachedPack = theme.pack;
+        refreshAllIcons(theme.pack);
+      }
+      renderThemeStudio();
+    }
+
+    function refreshAllIcons(pack) {
+      document.querySelectorAll('.icon-box[data-icon]').forEach(el => {
+        el.innerHTML = iconSvg(el.getAttribute('data-icon'), pack);
+      });
+    }
+
+    function toggleDrawer(name) {
+      if (activeDrawer === name) {
+        closeDrawer();
+      } else {
+        openDrawer(name);
+      }
+    }
+
+    function openDrawer(name) {
+      closeDrawer(true);
+      activeDrawer = name;
+      const sheet = document.getElementById(`drawer-${name}`);
+      if (sheet) sheet.classList.add('open');
+      document.getElementById('drawer-backdrop').classList.add('open');
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-tab') === name);
+      });
+      if (name === 'theme') renderThemeStudio();
+    }
+
+    function closeDrawer(keepBackdrop) {
+      document.querySelectorAll('.drawer-sheet').forEach(s => s.classList.remove('open'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      if (!keepBackdrop) {
+        document.getElementById('drawer-backdrop').classList.remove('open');
+        activeDrawer = null;
+      }
+    }
+
+    function setGenreFilter(g) {
+      activeGenre = g;
+      renderThemeStudio();
+    }
+
+    function selectTheme(id, defaultArt) {
+      const curArtMode = document.documentElement.getAttribute('data-art') || 'companion';
+      applyThemeVisuals(id, curArtMode, defaultArt);
+      sendAction('set_remote_theme', { theme_id: id, art_index: defaultArt });
+    }
+
+    function setArtMode(mode) {
+      const themeId = document.documentElement.getAttribute('data-theme') || 'lain-wired';
+      const idx = currentState ? currentState.remote_art_index : 0;
+      applyThemeVisuals(themeId, mode, idx);
+      sendAction('set_remote_art', { art_mode: mode });
+    }
+
+    function selectArtPortrait(idx) {
+      const themeId = document.documentElement.getAttribute('data-theme') || 'lain-wired';
+      const mode = document.documentElement.getAttribute('data-art') || 'companion';
+      applyThemeVisuals(themeId, mode, idx);
+      sendAction('set_remote_art', { art_index: idx });
+    }
+
+    function cycleArtPortrait() {
+      const cur = currentState ? (currentState.remote_art_index || 0) : 0;
+      selectArtPortrait((cur + 1) % ART_TAGS.length);
+    }
+
+    function cycleSpeed() {
+      const steps = [1.0, 1.25, 1.5, 2.0];
+      const cur = currentState ? Number(currentState.speed || 1.0) : 1.0;
+      const idx = steps.findIndex(s => Math.abs(s - cur) < 0.08);
+      const next = steps[(idx + 1) % steps.length];
+      sendAction('set_speed', { speed: next });
+    }
+
+    function cycleShader() {
+      const order = ['off', 'balanced', 'ultra'];
+      const cur = currentState ? String(currentState.anime4k || 'off').toLowerCase() : 'off';
+      const idx = order.findIndex(x => cur.includes(x));
+      const next = order[(Math.max(idx, 0) + 1) % order.length];
+      sendAction('set_anime4k', { mode: next });
+    }
+
+    function stepEpisode(delta) {
+      if (!currentState || !Array.isArray(currentState.episodes)) return;
+      const idx = currentState.episodes.findIndex(e => e.is_current);
+      const targetIdx = idx >= 0 ? idx + delta : 0;
+      const item = currentState.episodes[targetIdx];
+      if (item) sendAction('select_episode', { episode: item.ep });
+    }
+
+    function renderThemeStudio() {
+      const activeTheme = document.documentElement.getAttribute('data-theme') || 'lain-wired';
+      const activeMode = document.documentElement.getAttribute('data-art') || 'companion';
+      const activeArtIdx = currentState ? (currentState.remote_art_index || 0) % ART_TAGS.length : 0;
+
+      const genres = ['All', 'Y2K', 'Anime', 'Gaming', 'Zen', 'Hi-Fi'];
+      document.getElementById('genre-tabs').innerHTML = genres.map(g =>
+        `<button class="pill-btn ${g === activeGenre ? 'active' : ''}" onclick="setGenreFilter('${g}')" style="${g === activeGenre ? 'border-color:var(--accent);color:var(--accent)' : ''}">${g}</button>`
+      ).join('');
+
+      const list = activeGenre === 'All' ? THEMES : THEMES.filter(t => t.genre === activeGenre);
+      document.getElementById('theme-grid').innerHTML = list.map(t => `
+        <button class="theme-card ${t.id === activeTheme ? 'active' : ''}" onclick="selectTheme('${t.id}', ${t.art})">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+            <strong style="font-size:12px">${t.name}</strong>
+            <div class="swatch-pair">
+              <span class="swatch-dot" style="background:${t.bg}"></span>
+              <span class="swatch-dot" style="background:${t.acc}"></span>
+            </div>
+          </div>
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">${t.genre} • ${t.shape.toUpperCase()}</span>
+        </button>
+      `).join('');
+
+      document.querySelectorAll('#art-mode-bar [data-artmode]').forEach(btn => {
+        const active = btn.getAttribute('data-artmode') === activeMode;
+        btn.classList.toggle('current', active);
+      });
+
+      document.getElementById('art-gallery').innerHTML = ART_TAGS.map((tag, i) => `
+        <button class="art-slot ${i === activeArtIdx ? 'active' : ''}" onclick="selectArtPortrait(${i})">
+          <img src="/assets/art/${i}.jpg" alt="${tag}">
+          <span>${tag}</span>
+        </button>
+      `).join('');
+    }
+
+    function renderState(st) {
+      if (!st) return;
+      currentState = st;
+
+      applyThemeVisuals(st.remote_theme || 'lain-wired', st.remote_art_mode || 'companion', st.remote_art_index || 0);
+
+      document.getElementById('brand-kicker').textContent = `${st.profile_icon || '◈'} ${(st.active_profile || 'SOLUS').toUpperCase()}`;
+      document.getElementById('brand-sub').textContent = `${st.era_badge || 'SOLUS LAN'} • ${st.audio_mode === 'dub' ? 'DUB' : 'SUB'}`;
+
+      // Network Badge
+      const netTag = st.network_tag || 'NET:FULL';
+      const netBtn = document.getElementById('net-chip-btn');
+      document.getElementById('net-tag').textContent = netTag;
+      netBtn.classList.remove('net-wifi', 'net-eco');
+      if (st.network_mode === 'congested_wifi') netBtn.classList.add('net-wifi');
+      if (st.network_mode === 'ultra_saver') netBtn.classList.add('net-eco');
+
+      // Title / Poster / Quality
+      document.getElementById('anime-title').textContent = st.title || 'Ready for Playback';
+      document.getElementById('ep-badge').textContent = st.episode > 0 ? `EP ${st.episode}` : 'EP --';
+      document.getElementById('ep-sub-title').textContent = st.episode_title || 'Touch Companion Active';
+      document.getElementById('quality-badge').textContent = st.current_quality || (st.anime4k ? `4K:${st.anime4k.toUpperCase()}` : 'STREAM');
+
+      const posterEl = document.getElementById('anime-poster');
+      const posterFallback = document.getElementById('poster-fallback');
+      if (st.poster_url) {
+        if (posterEl.getAttribute('src') !== st.poster_url) posterEl.src = st.poster_url;
+        posterEl.style.display = 'block';
+        posterFallback.style.display = 'none';
+      } else {
+        posterEl.style.display = 'none';
+        posterFallback.style.display = 'block';
+      }
+
+      // Buffer Telemetry
+      const strip = document.getElementById('telemetry-strip');
+      const teleState = document.getElementById('tele-state');
+      const teleMetrics = document.getElementById('tele-metrics');
+      const teleFill = document.getElementById('tele-fill');
+      const bufS = Number(st.buffer_secs || 0);
+      const cacheMb = Number(st.cache_mb || 0);
+      const speedKbps = Number(st.cache_speed_kbps || 0);
+      const stalls = Number(st.stall_count || 0);
+      const pct = Number(st.buffering_pct || 0);
+
+      strip.classList.toggle('buffering', Boolean(st.paused_for_cache));
+      teleState.textContent = st.paused_for_cache ? `BUFFERING ${pct > 0 ? pct + '%' : ''}` : (st.is_playing ? 'STREAM LIVE' : 'PAUSED');
+      const speedStr = speedKbps >= 1000 ? `${(speedKbps / 1000).toFixed(1)} Mbps` : `${Math.round(speedKbps)} kbps`;
+      teleMetrics.textContent = `Buf: ${bufS.toFixed(1)}s • ${cacheMb.toFixed(1)} MB • ${speedStr} • Stl: ${stalls}`;
+      teleFill.style.width = `${Math.min(100, (bufS / 45) * 100).toFixed(1)}%`;
+
+      // Scrubber + Play Icon
+      const dur = Math.max(0, Number(st.duration || 0));
+      const pos = Math.max(0, Number(st.time_pos || 0));
+      if (!dragSeek) {
+        const sb = document.getElementById('seek-bar');
+        sb.max = dur > 0 ? Math.floor(dur) : 100;
+        sb.value = dur > 0 ? Math.min(dur, Math.floor(pos)) : 0;
+      }
+      document.getElementById('time-cur').textContent = fmtTime(pos);
+      document.getElementById('time-dur').textContent = fmtTime(dur);
+
+      const theme = THEMES.find(t => t.id === (st.remote_theme || 'lain-wired')) || THEMES[0];
+      const playIconSlot = document.getElementById('play-icon-slot');
+      playIconSlot.setAttribute('data-icon', st.is_playing ? 'pause' : 'play');
+      playIconSlot.innerHTML = iconSvg(st.is_playing ? 'pause' : 'play', theme.pack);
+
+      // Volume + Quick pills
+      if (!dragVol) {
+        document.getElementById('vol-slider').value = st.volume ?? 100;
+      }
+      document.getElementById('vol-val').textContent = `${st.volume ?? 100}%`;
+      document.getElementById('btn-speed').textContent = `${Number(st.speed || 1.0).toFixed(2).replace(/\.00$/, '.0')}x`;
+      const audBtn = document.getElementById('btn-audio');
+      audBtn.textContent = (st.audio_mode || 'sub').toUpperCase();
+      audBtn.classList.toggle('active', (st.audio_mode || '').toLowerCase() === 'dub');
+
+      const sh = String(st.anime4k || 'Off');
+      const shBtn = document.getElementById('btn-shader');
+      shBtn.textContent = `4K:${sh.toUpperCase()}`;
+      shBtn.classList.toggle('active', !sh.toLowerCase().includes('off'));
+
+      // Tracks Drawer
+      document.getElementById('audio-list').innerHTML = (st.audio_tracks || []).map(a => `
+        <button class="list-row ${a.is_active ? 'active' : ''}" onclick="sendAction('set_audio', { audio_id: ${a.id} })">
+          <span>${a.label}</span>
+          <span>${a.is_dub ? 'DUB' : 'ORIG'}</span>
+        </button>
+      `).join('') || '<div class="list-row" style="opacity:0.6">No selectable audio tracks</div>';
+
+      document.getElementById('sub-delay-val').textContent = `${Number(st.sub_delay || 0).toFixed(2)}s`;
+      document.getElementById('sub-vis-btn').textContent = st.sub_active ? 'Visible' : 'Hidden';
+
+      document.querySelectorAll('[data-preset]').forEach(b => {
+        const active = (st.sub_preset || '').toLowerCase().includes(b.getAttribute('data-preset'));
+        b.classList.toggle('active', active);
+      });
+
+      document.getElementById('sub-list').innerHTML = (st.subtitles || []).map(s => `
+        <button class="list-row ${s.is_active ? 'active' : ''}" onclick="sendAction('set_sub', { sub_id: ${s.id} })">
+          <span>${s.label}</span>
+          <span>${s.is_active ? 'ACTIVE' : (s.code || '').toUpperCase()}</span>
+        </button>
+      `).join('') || '<div class="list-row" style="opacity:0.6">No subtitles detected</div>';
+
+      // Episodes Drawer
+      document.getElementById('episode-grid').innerHTML = (st.episodes || []).map(e => `
+        <button class="ep-btn ${e.is_current ? 'current' : (e.is_watched ? 'watched' : '')}" onclick="sendAction('select_episode', { episode: ${e.ep} })">
+          EP ${e.ep}
+        </button>
+      `).join('') || '<div style="grid-column:span 4;color:var(--text-muted);font-size:12px">No episode list</div>';
+
+      // Video & Net Drawer
+      document.querySelectorAll('[data-net]').forEach(c => {
+        c.classList.toggle('active', c.getAttribute('data-net') === (st.network_mode || 'normal'));
+      });
+      document.getElementById('auto-abr-val').textContent = st.auto_abr ? 'ON' : 'OFF';
+      document.getElementById('btn-auto-abr').classList.toggle('active', Boolean(st.auto_abr));
+      document.getElementById('drawer-quality-val').textContent = st.current_quality || 'AUTO';
+      document.querySelectorAll('[data-shader]').forEach(b => {
+        b.classList.toggle('active', sh.toLowerCase().includes(b.getAttribute('data-shader')));
+      });
+
+      // Queue Drawer
+      const qBtn = document.getElementById('queue-auto-btn');
+      qBtn.textContent = `Auto-Next: ${st.queue_auto_advance !== false ? 'ON' : 'OFF'}`;
+      qBtn.classList.toggle('active', st.queue_auto_advance !== false);
+
+      document.getElementById('queue-list').innerHTML = (st.queue || []).map(q => `
+        <button class="list-row ${q.status === 'Playing' ? 'active' : ''}" onclick="sendAction('queue_play', { queue_index: ${q.index} })">
+          <span>${q.title} • Ep ${q.episode}</span>
+          <span>${q.status}</span>
+        </button>
+      `).join('') || '<div class="list-row" style="opacity:0.6">Queue is empty</div>';
+    }
+
+    function connectWs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onopen = () => {
+        document.getElementById('ws-dot').classList.add('ok');
+      };
+      ws.onclose = () => {
+        document.getElementById('ws-dot').classList.remove('ok');
+        setTimeout(connectWs, 1800);
+      };
+      ws.onmessage = (ev) => {
+        try {
+          renderState(JSON.parse(ev.data));
+        } catch (_) {}
+      };
+    }
+
+    // Touch scrubber & volume handlers
+    const seekBar = document.getElementById('seek-bar');
+    seekBar.addEventListener('pointerdown', () => { dragSeek = true; });
+    seekBar.addEventListener('pointerup', () => { dragSeek = false; });
+    seekBar.addEventListener('change', (e) => {
+      dragSeek = false;
+      sendAction('set_pos', { pos: Number(e.target.value) });
+    });
+
+    const volSlider = document.getElementById('vol-slider');
+    volSlider.addEventListener('pointerdown', () => { dragVol = true; });
+    volSlider.addEventListener('pointerup', () => { dragVol = false; });
+    volSlider.addEventListener('change', (e) => {
+      dragVol = false;
+      sendAction('set_volume', { value: Number(e.target.value) });
+    });
+
+    refreshAllIcons('wired');
+    renderThemeStudio();
+    connectWs();
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        fetch('/api/status').then(r => r.json()).then(renderState).catch(() => {});
+      }
+    }, 2500);
+  </script>
+</body>
+</html>

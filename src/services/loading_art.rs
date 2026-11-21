@@ -66,6 +66,15 @@ const Y2K_ASSETS: [(&[u8], [u8; 3], &str); 11] = [
 
 static LOADING_VARIANT_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// Total number of bundled Y2K/anime showcase portraits.
+pub const Y2K_ART_COUNT: usize = Y2K_ASSETS.len();
+
+/// Return the raw embedded JPEG bytes and showcase tag for a curated character portrait slot.
+pub fn raw_y2k_art(idx: usize) -> (&'static [u8], &'static str) {
+    let entry = Y2K_ASSETS[idx % Y2K_ASSETS.len()];
+    (entry.0, entry.2)
+}
+
 /// Returns the next Y2K loading screen variant index (`0..4`), rotating on every episode launch.
 pub fn next_loading_variant_index() -> usize {
     let cur = LOADING_VARIANT_SEQ.load(Ordering::Relaxed);

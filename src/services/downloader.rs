@@ -18,6 +18,7 @@ pub struct DownloadTask {
     pub episode:     u32,
     pub stream_url:  String,
     pub sub_url:     Option<String>,
+    pub force_ipv4:  bool,
 }
 
 /// Parse yt-dlp progress output into percentage (0.0..100.0) and download speed string.
@@ -143,7 +144,8 @@ async fn download_single_episode(
         if !sub_url.is_empty() {
             let sub_ext = if sub_url.ends_with(".srt") { "srt" } else { "vtt" };
             let sub_file = vault.join(format!("Episode_{:02}.{}", task.episode, sub_ext));
-            if let Ok(resp) = reqwest::get(sub_url).await {
+            let client = crate::api::subtitles::build_http_client(task.force_ipv4, 10);
+            if let Ok(resp) = client.get(sub_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(bytes) = resp.bytes().await {
                         let _ = tokio::fs::write(&sub_file, bytes).await;
@@ -170,13 +172,17 @@ async fn download_single_episode(
         .as_secs() as i64;
 
     let success = if has_ytdlp {
-        let mut child = match Command::new(yt_cmd)
-            .arg("--hls-prefer-native")
+        let mut yt = Command::new(yt_cmd);
+        yt.arg("--hls-prefer-native")
             .arg("--no-part")
             .arg("--newline")
             .arg("--progress")
             .arg("--referer")
-            .arg("https://zokoanime.video/")
+            .arg("https://zokoanime.video/");
+        if task.force_ipv4 {
+            yt.arg("--force-ipv4");
+        }
+        let mut child = match yt
             .arg("-o")
             .arg(&output_mkv_str)
             .arg(&task.stream_url)

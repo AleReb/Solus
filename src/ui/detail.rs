@@ -87,9 +87,10 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anime
     } else {
         format!("◆ Queue: {}  ·  ", state.queue.len())
     };
+    let net_badge = format!("[ {} ]", state.network_mode.short_tag());
     let profile_text = format!("{} {} [P]", state.active_profile_icon, state.active_profile_name);
     let theme_text = format!("◈ {} [T] ", theme.name);
-    let right_total = format!("{}{}  ·  {}", right_queue, profile_text, theme_text);
+    let right_total = format!("{}{}  ·  {}  ·  {}", right_queue, net_badge, profile_text, theme_text);
     let right_w = right_total.chars().count() as u16 + 1;
 
     let back_badge = " ← Esc Back ";
@@ -137,6 +138,16 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anime
             ));
             spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
         }
+        let net_fg = match state.network_mode {
+            crate::config::NetworkMode::Normal => theme.text_dim,
+            crate::config::NetworkMode::CongestedWifi => Color::Rgb(245, 185, 66),
+            crate::config::NetworkMode::UltraSaver => Color::Rgb(80, 220, 145),
+        };
+        spans.push(Span::styled(
+            net_badge,
+            Style::default().fg(net_fg).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
         spans.push(Span::styled(
             profile_text,
             Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -579,6 +590,11 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
     ];
 
     if let Some(status_line) = playback_status {
+        let full_status = if state.live_playback.started_at.is_some() {
+            format!("{} · {}", status_line, state.live_playback.compact_status_text())
+        } else {
+            status_line.to_string()
+        };
         btn_spans.extend([
             Span::raw("    "),
             Span::styled(
@@ -589,7 +605,23 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(status_line, Style::default().fg(Color::Rgb(210, 210, 210))),
+            Span::styled(full_status, Style::default().fg(Color::Rgb(210, 210, 210))),
+        ]);
+    } else if state.live_playback.started_at.is_some() {
+        btn_spans.extend([
+            Span::raw("    "),
+            Span::styled(
+                " Telemetry ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                state.live_playback.compact_status_text(),
+                Style::default().fg(Color::Rgb(210, 210, 210)),
+            ),
         ]);
     }
 

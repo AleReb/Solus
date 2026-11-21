@@ -678,6 +678,146 @@ pub struct AppState {
     pub episode_raw_thumbnails:      HashMap<u32, image::DynamicImage>,
     pub episode_thumbnail_states:    HashMap<u32, EpisodeThumbnailState>,
     pub thumbnail_geometry_key:      Option<(u16, u16, u16, u16)>,
+    /// Adaptive Network & Stream Ladder / Auto-ABR state
+    pub network_mode:                crate::config::NetworkMode,
+    pub force_ipv4:                  bool,
+    pub auto_abr_downshift:          bool,
+    pub live_playback:               LivePlaybackTelemetry,
+    pub stream_ladder_cache:         HashMap<(i64, u32, bool), crate::api::subtitles::ResolvedStreamLadder>,
+    /// Settings Control Hub v2 navigation + Remote live state
+    pub settings_category:           usize,
+    pub settings_scroll_offset:      usize,
+    pub remote_ws_clients:           usize,
+}
+
+/// Real-time playback buffer telemetry and Auto-ABR downshift tracking.
+#[derive(Debug, Clone, Default)]
+pub struct LivePlaybackTelemetry {
+    pub anime_id:                Option<i64>,
+    pub episode:                 u32,
+    pub is_dub:                  bool,
+    pub is_offline_local:        bool,
+    pub player:                  String,
+    pub started_at:              Option<std::time::Instant>,
+    pub current_height:          u32,
+    pub current_fps_x10:         u32,
+    pub current_tbr_kbps:        u32,
+    pub current_url:             String,
+    pub paused_for_cache:        bool,
+    pub buffering_pct:           u8,
+    pub cache_duration_secs:     f64,
+    pub cache_fw_bytes:          u64,
+    pub cache_speed_bps:         f64,
+    pub stall_count:             u32,
+    pub recent_stall_times:      std::collections::VecDeque<std::time::Instant>,
+    pub last_abr_switch_at:      Option<std::time::Instant>,
+    pub abr_downshift_count:     u32,
+    pub last_abr_note:           Option<String>,
+    pub prompted_congested_mode: bool,
+    pub abr_refresh_in_flight:   bool,
+    pub last_time_pos:           f64,
+}
+
+impl LivePlaybackTelemetry {
+    /// Reset all counters and telemetry for a newly started playback session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reset_for_session(
+        &mut self,
+        anime_id: i64,
+        episode: u32,
+        is_dub: bool,
+        is_offline_local: bool,
+        player: impl Into<String>,
+        height: u32,
+        fps_x10: u32,
+        tbr_kbps: u32,
+        url: impl Into<String>,
+    ) {
+        *self = Self {
+            anime_id: Some(anime_id),
+            episode,
+            is_dub,
+            is_offline_local,
+            player: player.into(),
+            started_at: Some(std::time::Instant::now()),
+            current_height: height,
+            current_fps_x10: fps_x10,
+            current_tbr_kbps: tbr_kbps,
+            current_url: url.into(),
+            ..Self::default()
+        };
+    }
+
+    /// Clear active session telemetry once playback stops.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record a cache stall and prune stall timestamps outside the 60-second window.
+    pub fn record_stall(&mut self, now: std::time::Instant) {
+        self.stall_count = self.stall_count.saturating_add(1);
+        self.recent_stall_times.push_back(now);
+        while self
+            .recent_stall_times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t).as_secs() > 60)
+        {
+            self.recent_stall_times.pop_front();
+        }
+    }
+
+    /// Return whether an automatic ABR downshift is permitted right now.
+    pub fn can_abr_downshift(&self, now: std::time::Instant) -> bool {
+        if self.is_offline_local {
+            return false;
+        }
+        let past_warmup = self
+            .started_at
+            .is_some_and(|started| now.saturating_duration_since(started).as_secs() >= 6);
+        let past_start_pos = self.last_time_pos > 2.0;
+        let past_cooldown = self
+            .last_abr_switch_at
+            .is_none_or(|last| now.saturating_duration_since(last).as_secs() >= 25);
+        past_warmup && past_start_pos && past_cooldown
+    }
+
+    /// Convert measured cache byte throughput to kilobits per second.
+    pub fn cache_speed_kbps(&self) -> f64 {
+        (self.cache_speed_bps * 8.0) / 1000.0
+    }
+
+    /// Convert forward demuxer cache bytes to megabytes.
+    pub fn cache_mb(&self) -> f64 {
+        self.cache_fw_bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Concise, properly spaced status string for HUD and metadata chips.
+    pub fn compact_status_text(&self) -> String {
+        if self.paused_for_cache {
+            if self.buffering_pct > 0 {
+                return format!(
+                    "BUF {}% | {:.1}s | Stl:{}",
+                    self.buffering_pct, self.cache_duration_secs, self.stall_count
+                );
+            }
+            return format!(
+                "BUFFERING | {:.1}s | Stl:{}",
+                self.cache_duration_secs, self.stall_count
+            );
+        }
+        let q = if self.current_height > 0 {
+            format!("{}p ", self.current_height)
+        } else {
+            String::new()
+        };
+        format!(
+            "{q}Buf:{:.0}s | {:.1}MB | {:.0}kbps | Stl:{}",
+            self.cache_duration_secs,
+            self.cache_mb(),
+            self.cache_speed_kbps(),
+            self.stall_count
+        )
+    }
 }
 
 impl AppState {
@@ -879,6 +1019,14 @@ impl AppState {
             episode_raw_thumbnails: HashMap::new(),
             episode_thumbnail_states: HashMap::new(),
             thumbnail_geometry_key: None,
+            network_mode: crate::config::NetworkMode::Normal,
+            force_ipv4: false,
+            auto_abr_downshift: true,
+            live_playback: LivePlaybackTelemetry::default(),
+            stream_ladder_cache: HashMap::new(),
+            settings_category: 0,
+            settings_scroll_offset: 0,
+            remote_ws_clients: 0,
         }
     }
 
@@ -1144,6 +1292,8 @@ impl AppState {
     pub fn open_settings(&mut self) {
         self.overlay_base = self.current_base_screen();
         self.settings_cursor = 0;
+        self.settings_scroll_offset = 0;
+        self.settings_category = 0;
         self.settings_query.clear();
         self.screen = Screen::Settings;
     }

@@ -94,6 +94,210 @@ fn default_remote_true() -> bool {
 }
 
 /// Shared live playback state visible to the mobile companion.
+/// Connected mobile WebSocket client count for TUI Settings & Telemetry display.
+static CONNECTED_WS_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Return the number of currently connected mobile companion WebSocket clients.
+pub fn connected_client_count() -> usize {
+    CONNECTED_WS_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Curated mobile remote visual theme metadata shared between Settings Control Hub and Web UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteThemeMeta {
+    pub id:              &'static str,
+    pub name:            &'static str,
+    pub genre:           &'static str,
+    pub icon_pack:       &'static str,
+    pub shape_style:     &'static str,
+    pub default_art_idx: usize,
+    pub swatch_bg:       (u8, u8, u8),
+    pub swatch_accent:   (u8, u8, u8),
+}
+
+/// Twelve distinct multi-genre themes spanning Y2K, Anime/Manga, Gaming, Zen, and Hi-Fi Deck.
+pub const REMOTE_THEMES: [RemoteThemeMeta; 12] = [
+    RemoteThemeMeta {
+        id: "lain-wired",
+        name: "Wired CRT",
+        genre: "Y2K",
+        icon_pack: "wired",
+        shape_style: "chamfer",
+        default_art_idx: 0,
+        swatch_bg: (6, 11, 8),
+        swatch_accent: (110, 231, 135),
+    },
+    RemoteThemeMeta {
+        id: "chrome-y2k",
+        name: "Chrome 2000",
+        genre: "Y2K",
+        icon_pack: "chrome",
+        shape_style: "bezel",
+        default_art_idx: 4,
+        swatch_bg: (15, 20, 32),
+        swatch_accent: (125, 211, 252),
+    },
+    RemoteThemeMeta {
+        id: "neon-cat",
+        name: "Shinjuku Synth",
+        genre: "Y2K",
+        icon_pack: "wired",
+        shape_style: "bezel",
+        default_art_idx: 5,
+        swatch_bg: (14, 8, 26),
+        swatch_accent: (244, 114, 182),
+    },
+    RemoteThemeMeta {
+        id: "shibuya-punk",
+        name: "Shibuya Punk",
+        genre: "Anime",
+        icon_pack: "comic",
+        shape_style: "comic",
+        default_art_idx: 6,
+        swatch_bg: (246, 241, 232),
+        swatch_accent: (239, 35, 60),
+    },
+    RemoteThemeMeta {
+        id: "manga-ink",
+        name: "Manga Ink",
+        genre: "Anime",
+        icon_pack: "comic",
+        shape_style: "comic",
+        default_art_idx: 2,
+        swatch_bg: (250, 249, 246),
+        swatch_accent: (24, 24, 27),
+    },
+    RemoteThemeMeta {
+        id: "akira-tokyo",
+        name: "Neo-Tokyo 88",
+        genre: "Anime",
+        icon_pack: "mecha",
+        shape_style: "chamfer",
+        default_art_idx: 3,
+        swatch_bg: (18, 8, 10),
+        swatch_accent: (244, 63, 94),
+    },
+    RemoteThemeMeta {
+        id: "nerv-hud",
+        name: "Tactical HUD",
+        genre: "Gaming",
+        icon_pack: "mecha",
+        shape_style: "chamfer",
+        default_art_idx: 7,
+        swatch_bg: (12, 9, 6),
+        swatch_accent: (251, 146, 60),
+    },
+    RemoteThemeMeta {
+        id: "arcade-16bit",
+        name: "Arcade 16-Bit",
+        genre: "Gaming",
+        icon_pack: "pixel",
+        shape_style: "pixel",
+        default_art_idx: 8,
+        swatch_bg: (19, 13, 46),
+        swatch_accent: (250, 204, 21),
+    },
+    RemoteThemeMeta {
+        id: "pocket-dmg",
+        name: "Pocket DMG",
+        genre: "Gaming",
+        icon_pack: "pixel",
+        shape_style: "pixel",
+        default_art_idx: 9,
+        swatch_bg: (202, 220, 159),
+        swatch_accent: (48, 98, 48),
+    },
+    RemoteThemeMeta {
+        id: "kyoto-sumi",
+        name: "Kyoto Sumi",
+        genre: "Zen",
+        icon_pack: "zen",
+        shape_style: "zen",
+        default_art_idx: 10,
+        swatch_bg: (17, 22, 21),
+        swatch_accent: (134, 189, 162),
+    },
+    RemoteThemeMeta {
+        id: "washi-zen",
+        name: "Washi Paper",
+        genre: "Zen",
+        icon_pack: "zen",
+        shape_style: "zen",
+        default_art_idx: 4,
+        swatch_bg: (244, 239, 230),
+        swatch_accent: (166, 75, 52),
+    },
+    RemoteThemeMeta {
+        id: "cassette-hifi",
+        name: "Hi-Fi Deck",
+        genre: "Hi-Fi",
+        icon_pack: "deck",
+        shape_style: "deck",
+        default_art_idx: 1,
+        swatch_bg: (20, 18, 16),
+        swatch_accent: (245, 158, 11),
+    },
+];
+
+/// Look up a theme by id (falling back to the default `lain-wired` theme if unknown).
+pub fn find_remote_theme(id: &str) -> &'static RemoteThemeMeta {
+    let trimmed = id.trim();
+    REMOTE_THEMES
+        .iter()
+        .find(|t| t.id.eq_ignore_ascii_case(trimmed))
+        .unwrap_or(&REMOTE_THEMES[0])
+}
+
+/// Advance to the next or previous theme id across the 12 curated remote themes.
+pub fn cycle_remote_theme_id(current_id: &str, forward: bool) -> &'static RemoteThemeMeta {
+    let idx = REMOTE_THEMES
+        .iter()
+        .position(|t| t.id.eq_ignore_ascii_case(current_id.trim()))
+        .unwrap_or(0);
+    let next_idx = if forward {
+        (idx + 1) % REMOTE_THEMES.len()
+    } else {
+        (idx + REMOTE_THEMES.len() - 1) % REMOTE_THEMES.len()
+    };
+    &REMOTE_THEMES[next_idx]
+}
+
+/// Normalize character art presentation mode for the mobile companion.
+pub fn normalize_art_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "blend" => "blend",
+        "poster" => "poster",
+        "off" | "none" => "off",
+        _ => "companion",
+    }
+}
+
+/// Cycle through character art presentation modes (`companion` -> `blend` -> `poster` -> `off`).
+pub fn cycle_remote_art_mode(current: &str) -> &'static str {
+    match normalize_art_mode(current) {
+        "companion" => "blend",
+        "blend" => "poster",
+        "poster" => "off",
+        _ => "companion",
+    }
+}
+
+fn default_network_mode_str() -> String {
+    "normal".to_string()
+}
+
+fn default_network_tag_str() -> String {
+    "NET:FULL".to_string()
+}
+
+fn default_remote_theme_id() -> String {
+    "lain-wired".to_string()
+}
+
+fn default_remote_art_mode() -> String {
+    "companion".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotePlaybackState {
     pub is_playing: bool,
@@ -133,6 +337,34 @@ pub struct RemotePlaybackState {
     pub queue_auto_advance: bool,
     #[serde(default)]
     pub queue_loop: bool,
+    #[serde(default = "default_network_mode_str")]
+    pub network_mode: String,
+    #[serde(default = "default_network_tag_str")]
+    pub network_tag: String,
+    #[serde(default = "default_remote_true")]
+    pub auto_abr: bool,
+    #[serde(default)]
+    pub force_ipv4: bool,
+    #[serde(default)]
+    pub current_quality: String,
+    #[serde(default)]
+    pub buffer_secs: f64,
+    #[serde(default)]
+    pub cache_mb: f64,
+    #[serde(default)]
+    pub cache_speed_kbps: f64,
+    #[serde(default)]
+    pub paused_for_cache: bool,
+    #[serde(default)]
+    pub buffering_pct: u8,
+    #[serde(default)]
+    pub stall_count: u32,
+    #[serde(default = "default_remote_theme_id")]
+    pub remote_theme: String,
+    #[serde(default = "default_remote_art_mode")]
+    pub remote_art_mode: String,
+    #[serde(default)]
+    pub remote_art_index: usize,
 }
 
 impl Default for RemotePlaybackState {
@@ -204,6 +436,20 @@ impl Default for RemotePlaybackState {
             queue: Vec::new(),
             queue_auto_advance: true,
             queue_loop: false,
+            network_mode: "normal".to_string(),
+            network_tag: "NET:FULL".to_string(),
+            auto_abr: true,
+            force_ipv4: false,
+            current_quality: String::new(),
+            buffer_secs: 0.0,
+            cache_mb: 0.0,
+            cache_speed_kbps: 0.0,
+            paused_for_cache: false,
+            buffering_pct: 0,
+            stall_count: 0,
+            remote_theme: "lain-wired".to_string(),
+            remote_art_mode: "companion".to_string(),
+            remote_art_index: 0,
         }
     }
 }
@@ -225,6 +471,12 @@ pub struct RemoteActionRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub queue_index: Option<usize>,
+    #[serde(default)]
+    pub theme_id: Option<String>,
+    #[serde(default)]
+    pub art_mode: Option<String>,
+    #[serde(default)]
+    pub art_index: Option<usize>,
 }
 
 /// Resolves the host machine's primary local LAN IP address.
@@ -536,6 +788,31 @@ pub fn spawn_remote_server(
     });
 }
 
+/// Parse `/assets/art/{index}.jpg` into a bounded curated portrait slot index.
+pub fn parse_art_index(path: &str) -> Option<usize> {
+    let tail = path.strip_prefix("/assets/art/")?;
+    let digits = tail.strip_suffix(".jpg").unwrap_or(tail);
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|&i| i < crate::services::loading_art::Y2K_ART_COUNT)
+}
+
+/// Decrements active WS client count when a mobile companion disconnects or errors out.
+struct WsClientGuard {
+    tx_app: Option<tokio::sync::mpsc::Sender<crate::AppMessage>>,
+}
+
+impl Drop for WsClientGuard {
+    fn drop(&mut self) {
+        let prev = CONNECTED_WS_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let remaining = prev.saturating_sub(1);
+        if let Some(ref tx) = self.tx_app {
+            let _ = tx.try_send(crate::AppMessage::RemoteClientsChanged(remaining));
+        }
+    }
+}
+
 /// Manages a live, persistent WebSocket client session.
 async fn handle_ws_client(
     ws: WebSocketStream<TcpStream>,
@@ -543,6 +820,16 @@ async fn handle_ws_client(
     sock_path: String,
     tx_app: Option<tokio::sync::mpsc::Sender<crate::AppMessage>>,
 ) {
+    let connected = CONNECTED_WS_CLIENTS
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .saturating_add(1);
+    if let Some(ref tx) = tx_app {
+        let _ = tx.send(crate::AppMessage::RemoteClientsChanged(connected)).await;
+    }
+    let _ws_guard = WsClientGuard {
+        tx_app: tx_app.clone(),
+    };
+
     let (mut ws_sender, mut ws_receiver) = ws.split();
     let mut broadcast_rx = get_broadcast_sender().subscribe();
 
@@ -624,6 +911,22 @@ async fn handle_http_client(
             body
         );
         let _ = socket.write_all(resp.as_bytes()).await;
+    } else if method == "GET" && path.starts_with("/assets/art/") {
+        if let Some(idx) = parse_art_index(path) {
+            let (bytes, _tag) = crate::services::loading_art::raw_y2k_art(idx);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nCache-Control: public, max-age=86400\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            let _ = socket.write_all(hdr.as_bytes()).await;
+            let _ = socket.write_all(bytes).await;
+        } else {
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
     } else if method == "GET" && path == "/api/status" {
         let st = state.read().await;
         let json_bytes = serde_json::to_vec(&*st).unwrap_or_default();
@@ -1106,1005 +1409,101 @@ async fn handle_remote_action(
                 let _ = tx.send(crate::AppMessage::RemoteQueueToggleAuto).await;
             }
         }
+        "set_network_mode" => {
+            if let Some(ref mode_raw) = req.mode {
+                let mode = crate::config::NetworkMode::from_str_lossy(mode_raw);
+                {
+                    let mut st = state.write().await;
+                    st.network_mode = mode.as_str().to_string();
+                    st.network_tag = mode.short_tag().to_string();
+                }
+                if let Some(tx) = tx_app {
+                    let _ = tx
+                        .send(crate::AppMessage::RemoteNetworkModeChanged(
+                            mode.as_str().to_string(),
+                        ))
+                        .await;
+                }
+            }
+        }
+        "cycle_network_mode" => {
+            let next_mode = {
+                let mut st = state.write().await;
+                let next = crate::config::NetworkMode::from_str_lossy(&st.network_mode).next();
+                st.network_mode = next.as_str().to_string();
+                st.network_tag = next.short_tag().to_string();
+                next
+            };
+            if let Some(tx) = tx_app {
+                let _ = tx
+                    .send(crate::AppMessage::RemoteNetworkModeChanged(
+                        next_mode.as_str().to_string(),
+                    ))
+                    .await;
+            }
+        }
+        "toggle_auto_abr" => {
+            let enabled = {
+                let mut st = state.write().await;
+                st.auto_abr = !st.auto_abr;
+                st.auto_abr
+            };
+            if let Some(tx) = tx_app {
+                let _ = tx.send(crate::AppMessage::RemoteAutoAbrToggled(enabled)).await;
+            }
+        }
+        "set_remote_theme" => {
+            if let Some(ref theme_raw) = req.theme_id {
+                let meta = find_remote_theme(theme_raw);
+                let art_idx = req.art_index.map(|i| i % crate::services::loading_art::Y2K_ART_COUNT);
+                {
+                    let mut st = state.write().await;
+                    st.remote_theme = meta.id.to_string();
+                    if let Some(idx) = art_idx {
+                        st.remote_art_index = idx;
+                    }
+                }
+                if let Some(tx) = tx_app {
+                    let _ = tx
+                        .send(crate::AppMessage::RemoteThemeChanged {
+                            theme_id: Some(meta.id.to_string()),
+                            art_mode: None,
+                            art_index: art_idx,
+                        })
+                        .await;
+                }
+            }
+        }
+        "set_remote_art" => {
+            let new_mode = req.art_mode.as_deref().map(|m| normalize_art_mode(m).to_string());
+            let new_idx = req
+                .art_index
+                .map(|i| i % crate::services::loading_art::Y2K_ART_COUNT);
+            {
+                let mut st = state.write().await;
+                if let Some(ref m) = new_mode {
+                    st.remote_art_mode = m.clone();
+                }
+                if let Some(idx) = new_idx {
+                    st.remote_art_index = idx;
+                }
+            }
+            if let Some(tx) = tx_app {
+                let _ = tx
+                    .send(crate::AppMessage::RemoteThemeChanged {
+                        theme_id: None,
+                        art_mode: new_mode,
+                        art_index: new_idx,
+                    })
+                    .await;
+            }
+        }
         _ => {}
     }
 }
 
 /// Single-file zero-dependency responsive OLED mobile touch client v2.0.
-const REMOTE_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Solus Companion</title>
-  <style>
-    :root {
-      --bg: #07080c;
-      --surface: #0f1118;
-      --surface-elevated: #161a25;
-      --border: #1a1e2c;
-      --border-focus: #2d344d;
-      --primary: #e63946;
-      --primary-glow: rgba(230, 57, 70, 0.4);
-      --accent: #50fa7b;
-      --accent-muted: #142a1e;
-      --text: #f0f3fc;
-      --text-muted: #7d849b;
-      --radius-sm: 10px;
-      --radius-md: 16px;
-      --radius-lg: 22px;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      min-height: 100vh;
-      min-height: 100dvh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 14px 16px 88px;
-      user-select: none;
-      overflow-x: hidden;
-    }
-    .header {
-      width: 100%;
-      max-width: 440px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--border);
-    }
-    .brand { font-size: 1.15rem; font-weight: 800; letter-spacing: 1px; color: var(--primary); }
-    .header-actions { display: flex; align-items: center; gap: 8px; }
-    .status-badge {
-      font-size: 0.72rem;
-      background: var(--accent-muted);
-      color: var(--accent);
-      padding: 4px 10px;
-      border-radius: 12px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-weight: 700;
-      transition: all 0.2s ease;
-    }
-    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-    .status-badge.standby { background: #2a1a14; color: #ffb86c; }
-    .status-badge.standby .status-dot { background: #ffb86c; }
-    .btn-fs {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      font-size: 0.75rem;
-      font-weight: 700;
-      padding: 4px 10px;
-      border-radius: 12px;
-      cursor: pointer;
-    }
-
-    /* Main Deck Card */
-    .card {
-      width: 100%;
-      max-width: 440px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      padding: 20px 18px;
-      margin-top: 16px;
-      box-shadow: 0 12px 36px rgba(0,0,0,0.55);
-    }
-    .hero-meta {
-      display: flex;
-      gap: 14px;
-      align-items: center;
-      margin-bottom: 16px;
-    }
-    .poster-box {
-      width: 58px;
-      height: 82px;
-      background: #141724;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      overflow: hidden;
-      flex-shrink: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 1.5rem;
-      color: var(--primary);
-    }
-    .poster-box img { width: 100%; height: 100%; object-fit: cover; }
-    .hero-details { flex: 1; overflow: hidden; }
-    .title { font-size: 1.22rem; font-weight: 800; color: #fff; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .subtitle { font-size: 0.88rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
-    .badges-row { display: flex; gap: 6px; font-size: 0.72rem; font-weight: 700; }
-    .tag-badge { background: #1a1f2e; color: #9aa2ba; padding: 2px 8px; border-radius: 6px; }
-
-    /* Scrubber */
-    .timeline { width: 100%; margin: 12px 0 6px; }
-    .slider {
-      width: 100%;
-      height: 8px;
-      border-radius: 4px;
-      background: #252a3a;
-      outline: none;
-      -webkit-appearance: none;
-      cursor: pointer;
-    }
-    .slider::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: var(--primary);
-      cursor: pointer;
-      box-shadow: 0 0 12px var(--primary-glow);
-    }
-    .time-labels {
-      display: flex;
-      justify-content: space-between;
-      font-size: 0.82rem;
-      color: #8b92a8;
-      margin-top: 8px;
-      font-variant-numeric: tabular-nums;
-      font-weight: 700;
-    }
-
-    /* Primary Transport Buttons */
-    .controls {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 16px;
-      margin: 20px 0 12px;
-    }
-    .btn {
-      background: var(--surface-elevated);
-      border: 1px solid var(--border);
-      color: var(--text);
-      border-radius: var(--radius-md);
-      cursor: pointer;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      font-weight: 700;
-      transition: background 0.12s, transform 0.08s;
-      outline: none;
-    }
-    .btn:active { transform: scale(0.92); background: #262c3f; }
-    .btn-seek { width: 68px; height: 54px; font-size: 1rem; }
-    .btn-play {
-      width: 88px;
-      height: 64px;
-      background: var(--primary);
-      border: none;
-      font-size: 1.5rem;
-      border-radius: var(--radius-md);
-      box-shadow: 0 6px 20px var(--primary-glow);
-    }
-    .btn-play:active { background: #c52b37; }
-
-    /* Quick Action Row */
-    .quick-actions {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-top: 14px;
-    }
-    .btn-action { height: 44px; font-size: 0.85rem; color: #cfd4e2; }
-
-    /* Volume Row */
-    .volume-box {
-      margin-top: 20px;
-      padding-top: 14px;
-      border-top: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .vol-icon { font-size: 1.25rem; color: var(--text-muted); cursor: pointer; padding: 4px; }
-    .vol-val { font-size: 0.82rem; font-weight: 700; color: #71778c; width: 42px; text-align: right; }
-
-    /* Fixed Bottom Navigation Deck */
-    .bottom-nav {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      background: rgba(11, 13, 20, 0.94);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-top: 1px solid var(--border);
-      padding: 10px 16px 14px;
-      display: flex;
-      justify-content: center;
-      gap: 10px;
-      z-index: 100;
-    }
-    .nav-btn {
-      flex: 1;
-      max-width: 140px;
-      height: 48px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      font-size: 0.82rem;
-      font-weight: 700;
-      border-radius: var(--radius-sm);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 3px;
-      cursor: pointer;
-    }
-    .nav-btn:active { background: var(--surface-elevated); transform: scale(0.95); }
-    .nav-icon { font-size: 0.95rem; color: var(--primary); }
-
-    /* Slide-Up Drawers (Modals) */
-    .drawer-backdrop {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background: rgba(0, 0, 0, 0.7);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-      z-index: 200;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.22s ease;
-    }
-    .drawer-backdrop.active { opacity: 1; pointer-events: auto; }
-    .drawer {
-      position: fixed;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      max-height: 84vh;
-      background: #0f121a;
-      border-top: 1px solid var(--border-focus);
-      border-top-left-radius: 24px;
-      border-top-right-radius: 24px;
-      padding: 16px 18px 30px;
-      z-index: 210;
-      transform: translateY(100%);
-      transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
-      display: flex;
-      flex-direction: column;
-      box-shadow: 0 -12px 40px rgba(0,0,0,0.8);
-    }
-    .drawer.active { transform: translateY(0); }
-    .drawer-handle {
-      width: 44px;
-      height: 5px;
-      background: #2b3044;
-      border-radius: 3px;
-      margin: 0 auto 14px;
-    }
-    .drawer-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--border);
-    }
-    .drawer-title { font-size: 1.05rem; font-weight: 800; color: #fff; }
-    .drawer-close {
-      background: #1a1e2b;
-      border: none;
-      color: var(--text-muted);
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      font-size: 0.9rem;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 800;
-    }
-    .drawer-content { overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; }
-
-    /* Drawer Sections & List Items */
-    .section-label { font-size: 0.78rem; font-weight: 800; color: #8a92aa; letter-spacing: 0.5px; margin: 12px 0 8px; }
-    .item-list { display: flex; flex-direction: column; gap: 8px; }
-    .list-item {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 12px 14px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      cursor: pointer;
-      transition: background 0.1s, border-color 0.1s;
-    }
-    .list-item:active { background: #1c2130; }
-    .list-item.selected {
-      border-color: var(--primary);
-      background: #1f1b24;
-    }
-    .item-left { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 0.9rem; }
-    .check-mark { color: var(--primary); font-weight: 800; width: 16px; }
-    .lang-code { font-size: 0.72rem; background: #1f2434; color: #9aa2bc; padding: 2px 7px; border-radius: 6px; font-weight: 700; }
-
-    /* Button Groups & Sync Bars */
-    .btn-group { display: flex; gap: 8px; margin: 8px 0; }
-    .btn-pill {
-      flex: 1;
-      height: 40px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      color: var(--text);
-      font-size: 0.82rem;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .btn-pill.active { background: var(--primary); border-color: var(--primary); color: #fff; }
-    .btn-pill:active { transform: scale(0.95); }
-    .sync-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 8px 12px;
-      margin-top: 6px;
-    }
-    .sync-val { font-weight: 800; color: var(--accent); font-size: 0.95rem; font-variant-numeric: tabular-nums; }
-    .sync-btn {
-      background: #1d2232;
-      border: 1px solid var(--border);
-      color: #fff;
-      padding: 6px 14px;
-      border-radius: 8px;
-      font-size: 0.82rem;
-      font-weight: 700;
-      cursor: pointer;
-    }
-  </style>
-</head>
-<body>
-  <!-- Header -->
-  <div class="header">
-    <div class="brand">❖ SOLUS REMOTE</div>
-    <div class="header-actions">
-      <span class="tag-badge" id="profile-badge" style="border:1px solid var(--border-focus);color:var(--text);">◈ Default</span>
-      <button class="btn-fs" onclick="sendAction('toggle_fullscreen')">󰄬 Fullscreen</button>
-      <div class="status-badge" id="conn-badge">
-        <div class="status-dot"></div><span id="conn-text">LIVE</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Primary Playback Card -->
-  <div class="card">
-    <div class="hero-meta">
-      <div class="poster-box" id="poster-box">❖</div>
-      <div class="hero-details">
-        <div class="title" id="title">Solus Theatre</div>
-        <div class="subtitle" id="subtitle">Connecting to local stream...</div>
-        <div class="badges-row">
-          <span class="tag-badge" id="audio-badge">SUB</span>
-          <span class="tag-badge" id="sub-badge">English</span>
-          <span class="tag-badge" id="res-badge">1080p</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Scrubber -->
-    <div class="timeline">
-      <input type="range" min="0" max="100" value="0" class="slider" id="scrubber">
-      <div class="time-labels">
-        <span id="time-pos">00:00</span>
-        <span id="time-dur">00:00</span>
-      </div>
-    </div>
-
-    <!-- Transport Controls -->
-    <div class="controls">
-      <button class="btn btn-seek" onclick="sendAction('seek', { delta: -10 })">-10s</button>
-      <button class="btn btn-play" id="play-btn" onclick="togglePlay()">▶</button>
-      <button class="btn btn-seek" onclick="sendAction('seek', { delta: 10 })">+10s</button>
-    </div>
-
-    <!-- Quick Actions -->
-    <div class="quick-actions">
-      <button class="btn btn-action" onclick="sendAction('skip_intro')">◈ Skip Intro</button>
-      <button class="btn btn-action" onclick="sendAction('seek', { delta: 85 })">◈ Jump Recap</button>
-      <button class="btn btn-action" id="quick-audio-btn" onclick="handleQuickAudio()">✦ Audio: JPN</button>
-      <button class="btn btn-action" onclick="sendAction('toggle_sub_visibility')">Subtitles On/Off</button>
-    </div>
-
-    <!-- Volume Attenuator -->
-    <div class="volume-box">
-      <span class="vol-icon" onclick="sendAction('volume', { delta: -5 })">󰕿</span>
-      <input type="range" min="0" max="100" value="80" class="slider" id="volume-slider">
-      <span class="vol-icon" onclick="sendAction('volume', { delta: 5 })">󰕾</span>
-      <span class="vol-val" id="vol-val">80%</span>
-    </div>
-  </div>
-
-  <!-- Bottom Drawer Navigation Bar -->
-  <div class="bottom-nav">
-    <button class="nav-btn" onclick="openDrawer('subtitles')">
-      <span class="nav-icon">❖</span>Subtitles
-    </button>
-    <button class="nav-btn" onclick="openDrawer('episodes')">
-      <span class="nav-icon">◈</span>Episodes
-    </button>
-    <button class="nav-btn" onclick="openDrawer('audio')">
-      <span class="nav-icon">✦</span>Audio & Speed
-    </button>
-    <button class="nav-btn" onclick="openDrawer('queue')">
-      <span class="nav-icon">◆</span>Queue <span id="queue-count-badge"></span>
-    </button>
-  </div>
-
-  <!-- Backdrop for Drawers -->
-  <div class="drawer-backdrop" id="backdrop" onclick="closeAllDrawers()"></div>
-
-  <!-- 1. Subtitle & Sync Drawer -->
-  <div class="drawer" id="drawer-subtitles">
-    <div class="drawer-handle"></div>
-    <div class="drawer-header">
-      <div class="drawer-title">❖ Subtitle Manager & Sync</div>
-      <button class="drawer-close" onclick="closeAllDrawers()">✕</button>
-    </div>
-    <div class="drawer-content">
-      <div class="section-label">SELECT SUBTITLE LANGUAGE</div>
-      <div class="item-list" id="subtitles-list">
-        <!-- Rendered dynamically -->
-      </div>
-
-      <div class="section-label">SUBTITLE TIMING SYNC</div>
-      <div class="sync-bar">
-        <button class="sync-btn" onclick="sendAction('set_sub_delay', { delta: -0.25 })">-250ms</button>
-        <span class="sync-val" id="sub-delay-val">0.00s</span>
-        <button class="sync-btn" onclick="sendAction('set_sub_delay', { delta: 0.25 })">+250ms</button>
-      </div>
-
-      <div class="section-label">TYPOGRAPHY STYLE PRESET</div>
-      <div class="btn-group">
-        <button class="btn-pill" id="preset-studio" onclick="setPreset('Studio Minimal')">Studio</button>
-        <button class="btn-pill" id="preset-netflix" onclick="setPreset('Netflix Clean')">Netflix</button>
-        <button class="btn-pill" id="preset-fansub" onclick="setPreset('Anime Fansub')">Fansub</button>
-        <button class="btn-pill" id="preset-oled" onclick="setPreset('OLED Plate')">OLED</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- 2. Episode Switcher Drawer -->
-  <div class="drawer" id="drawer-episodes">
-    <div class="drawer-handle"></div>
-    <div class="drawer-header">
-      <div class="drawer-title">◈ Series Episodes</div>
-      <button class="drawer-close" onclick="closeAllDrawers()">✕</button>
-    </div>
-    <div class="drawer-content">
-      <div class="section-label">TAP TO SWITCH PLAYBACK</div>
-      <div class="item-list" id="episodes-list">
-        <!-- Rendered dynamically -->
-      </div>
-    </div>
-  </div>
-
-  <!-- 3. Audio & Speed Drawer -->
-  <div class="drawer" id="drawer-audio">
-    <div class="drawer-handle"></div>
-    <div class="drawer-header">
-      <div class="drawer-title">✦ Audio, Speed & Video</div>
-      <button class="drawer-close" onclick="closeAllDrawers()">✕</button>
-    </div>
-    <div class="drawer-content">
-      <div class="section-label">PLAYBACK SPEED RATE</div>
-      <div class="btn-group">
-        <button class="btn-pill" id="speed-075" onclick="setSpeed(0.75)">0.75x</button>
-        <button class="btn-pill" id="speed-100" onclick="setSpeed(1.0)">1.0x</button>
-        <button class="btn-pill" id="speed-125" onclick="setSpeed(1.25)">1.25x</button>
-        <button class="btn-pill" id="speed-150" onclick="setSpeed(1.5)">1.5x</button>
-      </div>
-
-      <div class="section-label">ERA-ADAPTIVE ANIME4K MASTERING <span class="lang-code" id="era-badge-pill" style="margin-left:6px;background:#1d2a22;color:#50fa7b;">MODERN HD</span></div>
-      <div class="btn-group">
-        <button class="btn-pill" id="a4k-off" onclick="setAnime4k('off')">Off</button>
-        <button class="btn-pill" id="a4k-balanced" onclick="setAnime4k('balanced')">Balanced 2x</button>
-        <button class="btn-pill" id="a4k-ultra" onclick="setAnime4k('ultra')">Ultra 4K</button>
-      </div>
-
-      <div class="section-label">SELECT AUDIO LANGUAGE <span class="lang-code" id="audio-count-pill" style="margin-left:6px;"></span></div>
-      <div class="item-list" id="audio-tracks-list">
-        <!-- Rendered dynamically -->
-      </div>
-    </div>
-  </div>
-
-  <!-- 4. Watch Queue Drawer -->
-  <div class="drawer" id="drawer-queue">
-    <div class="drawer-handle"></div>
-    <div class="drawer-header">
-      <div class="drawer-title">◆ Watch Session Queue</div>
-      <button class="drawer-close" onclick="closeAllDrawers()">✕</button>
-    </div>
-    <div class="drawer-content">
-      <div class="btn-group" style="margin-bottom:12px;">
-        <button class="btn-pill active" id="queue-auto-btn" onclick="sendAction('queue_toggle_auto', {})">Auto-Next: ON</button>
-        <button class="btn-pill" onclick="skipQueueNext()">Skip Next >></button>
-      </div>
-      <div class="section-label">UP NEXT IN SESSION</div>
-      <div class="item-list" id="queue-list">
-        <!-- Rendered dynamically -->
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let ws = null;
-    let isDragging = false;
-    let localIsPlaying = false;
-    let localTimePos = 0;
-    let localDuration = 0;
-    let currentState = null;
-    let lastPosterUrl = '';
-    let lastSubtitlesKey = '';
-    let lastAudioTracksKey = '';
-    let lastEpisodesKey = '';
-    let lastQueueKey = '';
-    let lastSeekSent = 0;
-    let lastVolSent = 0;
-    let wsGeneration = 0;
-    let reconnectTimer = null;
-
-    const scrubber = document.getElementById('scrubber');
-    const playBtn = document.getElementById('play-btn');
-    const volSlider = document.getElementById('volume-slider');
-    const volVal = document.getElementById('vol-val');
-
-    scrubber.addEventListener('input', () => {
-      isDragging = true;
-      const pos = parseFloat(scrubber.value);
-      document.getElementById('time-pos').innerText = formatTime(pos);
-      document.getElementById('time-dur').innerText = `-${formatTime(Math.max(0, localDuration - pos))}`;
-      const now = Date.now();
-      if (now - lastSeekSent > 60) {
-        lastSeekSent = now;
-        sendAction('set_pos', { pos: pos }, true);
-      }
-    });
-
-    scrubber.addEventListener('change', () => {
-      const pos = parseFloat(scrubber.value);
-      localTimePos = pos;
-      sendAction('set_pos', { pos: pos });
-      setTimeout(() => { isDragging = false; }, 150);
-    });
-
-    scrubber.addEventListener('touchend', () => {
-      setTimeout(() => { isDragging = false; }, 180);
-    });
-
-    volSlider.addEventListener('input', () => {
-      const val = parseInt(volSlider.value);
-      volVal.innerText = val + '%';
-      const now = Date.now();
-      if (now - lastVolSent > 45) {
-        lastVolSent = now;
-        sendAction('set_volume', { value: val }, true);
-      }
-    });
-
-    volSlider.addEventListener('change', () => {
-      const val = parseInt(volSlider.value);
-      sendAction('set_volume', { value: val });
-    });
-
-    function togglePlay() {
-      localIsPlaying = !localIsPlaying;
-      playBtn.innerText = localIsPlaying ? '❚❚' : '▶';
-      sendAction('play_pause');
-    }
-
-    function setSpeed(speed) {
-      sendAction('set_speed', { speed: speed });
-      updateSpeedPills(speed);
-    }
-
-    function setPreset(preset) {
-      sendAction('set_sub_preset', { preset: preset });
-      updatePresetPills(preset);
-    }
-
-    function formatTime(s) {
-      if (!s || isNaN(s) || s < 0) return '00:00';
-      const m = Math.floor(s / 60);
-      const sec = Math.floor(s % 60);
-      return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-    }
-
-    /* Drawer Controls */
-    function openDrawer(id) {
-      closeAllDrawers();
-      document.getElementById('backdrop').classList.add('active');
-      const drawer = document.getElementById(`drawer-${id}`);
-      if (drawer) drawer.classList.add('active');
-      if (navigator.vibrate) navigator.vibrate(15);
-    }
-
-    function closeAllDrawers() {
-      document.getElementById('backdrop').classList.remove('active');
-      document.querySelectorAll('.drawer').forEach(d => d.classList.remove('active'));
-    }
-
-    /* State Renderer with Dirty-Checked DOM Diffing */
-    function renderState(data) {
-      if (!data) return;
-      currentState = data;
-      localIsPlaying = data.is_playing;
-      localDuration = data.duration;
-      if (!isDragging) localTimePos = data.time_pos;
-
-      document.getElementById('title').innerText = data.title || 'Solus Anime Theatre';
-      document.getElementById('subtitle').innerText = data.is_playing 
-        ? `Episode ${data.episode} — ${data.episode_title}`
-        : 'Idle / Ready for playback';
-
-      const profileBadge = document.getElementById('profile-badge');
-      if (profileBadge) {
-        const pIcon = data.profile_icon || '◈';
-        const pName = data.active_profile || 'Default';
-        profileBadge.innerText = `${pIcon} ${pName}`;
-      }
-
-      const audioTracks = data.audio_tracks || [];
-      const activeAudio = audioTracks.find(a => a.is_active);
-      const activeAudioCode = (activeAudio ? activeAudio.code : (data.audio_mode === 'dub' ? 'ENG' : 'JPN')).toUpperCase();
-      document.getElementById('audio-badge').innerText = `${(data.audio_mode || 'sub').toUpperCase()} · ${activeAudioCode}`;
-      const quickAudioBtn = document.getElementById('quick-audio-btn');
-      if (quickAudioBtn) {
-        quickAudioBtn.innerText = `✦ Audio: ${activeAudioCode}`;
-      }
-      const audioCountPill = document.getElementById('audio-count-pill');
-      if (audioCountPill) {
-        audioCountPill.innerText = `${audioTracks.length} TRACK${audioTracks.length === 1 ? '' : 'S'}`;
-      }
-      document.getElementById('sub-badge').innerText = data.sub_lang || 'Subtitles';
-      const eraBadge = data.era_badge || 'MODERN HD';
-      document.getElementById('res-badge').innerText = eraBadge;
-      const eraPill = document.getElementById('era-badge-pill');
-      if (eraPill) {
-        eraPill.innerText = data.season_year ? `${eraBadge} (${data.season_year})` : eraBadge;
-        if (eraBadge.includes('RETRO')) {
-          eraPill.style.background = '#2b1d0e';
-          eraPill.style.color = '#ffb86c';
-        } else {
-          eraPill.style.background = '#142a1e';
-          eraPill.style.color = '#50fa7b';
-        }
-      }
-
-      // Only update poster DOM if URL actually changed
-      const posterUrl = (data.poster_url && data.poster_url.startsWith('http')) ? data.poster_url : '';
-      if (posterUrl !== lastPosterUrl) {
-        lastPosterUrl = posterUrl;
-        const pBox = document.getElementById('poster-box');
-        if (posterUrl) {
-          pBox.innerHTML = `<img src="${posterUrl}" alt="Poster" />`;
-        } else {
-          pBox.innerHTML = '❖';
-        }
-      }
-
-      playBtn.innerText = data.is_playing ? '❚❚' : '▶';
-
-      if (!isDragging && data.duration > 0) {
-        scrubber.max = data.duration;
-        scrubber.value = data.time_pos;
-        document.getElementById('time-pos').innerText = formatTime(data.time_pos);
-        document.getElementById('time-dur').innerText = `-${formatTime(Math.max(0, data.duration - data.time_pos))}`;
-      }
-
-      if (!volSlider.matches(':active')) {
-        volSlider.value = data.volume;
-        volVal.innerText = `${data.volume}%`;
-      }
-
-      // Subtitle Delay
-      const delay = data.sub_delay || 0.0;
-      document.getElementById('sub-delay-val').innerText = `${delay >= 0 ? '+' : ''}${delay.toFixed(2)}s`;
-
-      // Only rebuild Subtitles List if track data or active selection changed
-      const subKey = JSON.stringify(data.subtitles || []);
-      if (subKey !== lastSubtitlesKey) {
-        lastSubtitlesKey = subKey;
-        renderSubtitlesList(data.subtitles);
-      }
-
-      // Only rebuild Episodes List if episode catalog or current episode changed
-      const epKey = JSON.stringify([data.episode, data.episodes || []]);
-      if (epKey !== lastEpisodesKey) {
-        lastEpisodesKey = epKey;
-        renderEpisodesList(data.episodes, data.episode);
-      }
-
-      // Only rebuild Audio Tracks List if track list or active audio track changed
-      const audioKey = JSON.stringify(audioTracks);
-      if (audioKey !== lastAudioTracksKey) {
-        lastAudioTracksKey = audioKey;
-        renderAudioTracksList(audioTracks);
-      }
-
-      // Speed & Shader Pills
-      updateSpeedPills(data.speed || 1.0);
-      updatePresetPills(data.sub_preset || 'Studio Minimal');
-      updateA4kPills(data.anime4k || 'off');
-
-      // Watch Session Queue
-      const qItems = data.queue || [];
-      const qCountBadge = document.getElementById('queue-count-badge');
-      if (qCountBadge) qCountBadge.innerText = qItems.length > 0 ? `(${qItems.length})` : '';
-      const qAutoBtn = document.getElementById('queue-auto-btn');
-      if (qAutoBtn) {
-        const autoOn = data.queue_auto_advance !== false;
-        qAutoBtn.innerText = `Auto-Next: ${autoOn ? 'ON' : 'OFF'}`;
-        qAutoBtn.classList.toggle('active', autoOn);
-      }
-      const qKey = JSON.stringify([data.queue_auto_advance, qItems]);
-      if (qKey !== lastQueueKey) {
-        lastQueueKey = qKey;
-        renderQueueList(qItems);
-      }
-    }
-
-    function renderQueueList(items) {
-      const container = document.getElementById('queue-list');
-      if (!container) return;
-      if (!items || items.length === 0) {
-        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">Queue is empty. Add shows with [e] or [Q] in Solus.</div>';
-        return;
-      }
-      container.innerHTML = items.map(q => `
-        <div class="list-item" onclick="playQueueIndex(${q.index})">
-          <div class="item-left">
-            <span class="check-mark">${q.index + 1}.</span>
-            <span>${q.title} · Ep ${q.episode}</span>
-          </div>
-          <span class="lang-code">${q.status}</span>
-        </div>
-      `).join('');
-    }
-
-    function playQueueIndex(idx) {
-      sendAction('queue_play', { queue_index: idx });
-      closeAllDrawers();
-    }
-
-    function skipQueueNext() {
-      sendAction('queue_skip', {});
-      closeAllDrawers();
-    }
-
-    function renderSubtitlesList(subs) {
-      const container = document.getElementById('subtitles-list');
-      if (!subs || subs.length === 0) {
-        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">No alternate subtitle tracks available.</div>';
-        return;
-      }
-      container.innerHTML = subs.map(s => `
-        <div class="list-item ${s.is_active ? 'selected' : ''}" onclick="selectSubtitle(${s.id})">
-          <div class="item-left">
-            <span class="check-mark">${s.is_active ? '󰄬' : ''}</span>
-            <span>${s.label}</span>
-          </div>
-          <span class="lang-code">${s.code.toUpperCase()}</span>
-        </div>
-      `).join('');
-    }
-
-    function renderEpisodesList(episodes, currentEp) {
-      const container = document.getElementById('episodes-list');
-      if (!episodes || episodes.length === 0) {
-        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">Episode catalog ready on launch.</div>';
-        return;
-      }
-      container.innerHTML = episodes.map(e => `
-        <div class="list-item ${e.ep === currentEp ? 'selected' : ''}" onclick="selectEpisode(${e.ep})">
-          <div class="item-left">
-            <span class="check-mark">${e.ep === currentEp ? '▶' : (e.is_watched ? '󰄬' : '')}</span>
-            <span>Ep ${e.ep}. ${e.title}</span>
-          </div>
-          <span class="lang-code">${e.ep === currentEp ? 'PLAYING' : (e.is_watched ? 'WATCHED' : '')}</span>
-        </div>
-      `).join('');
-    }
-
-    function selectSubtitle(id) {
-      if (currentState && currentState.subtitles) {
-        for (let s of currentState.subtitles) {
-          s.is_active = (s.id === id);
-          if (s.is_active) {
-            document.getElementById('sub-badge').innerText = s.label;
-          }
-        }
-        renderSubtitlesList(currentState.subtitles);
-      }
-      sendAction('set_sub', { sub_id: id });
-      closeAllDrawers();
-    }
-
-    function selectEpisode(ep) {
-      sendAction('select_episode', { episode: ep });
-      closeAllDrawers();
-    }
-
-    function setAnime4k(mode) {
-      updateA4kPills(mode);
-      sendAction('set_anime4k', { mode: mode });
-    }
-
-    function updateA4kPills(mode) {
-      const activeMode = (mode || 'off').toLowerCase();
-      ['off', 'balanced', 'ultra'].forEach(m => {
-        const el = document.getElementById(`a4k-${m}`);
-        if (el) {
-          if (m === activeMode || (m === 'balanced' && activeMode.includes('balanced')) || (m === 'ultra' && activeMode.includes('ultra'))) {
-            el.classList.add('active');
-          } else {
-            el.classList.remove('active');
-          }
-        }
-      });
-    }
-
-    function updateSpeedPills(speed) {
-      ['075', '100', '125', '150'].forEach(s => {
-        const btn = document.getElementById(`speed-${s}`);
-        if (btn) btn.classList.remove('active');
-      });
-      const match = speed <= 0.8 ? '075' : speed <= 1.1 ? '100' : speed <= 1.35 ? '125' : '150';
-      const el = document.getElementById(`speed-${match}`);
-      if (el) el.classList.add('active');
-    }
-
-    function renderAudioTracksList(tracks) {
-      const container = document.getElementById('audio-tracks-list');
-      if (!container) return;
-      if (!tracks || tracks.length === 0) {
-        container.innerHTML = '<div style="color:#7d849b;padding:8px;font-size:0.85rem;">Japanese (Original) stream active.</div>';
-        return;
-      }
-      container.innerHTML = tracks.map(a => `
-        <div class="list-item ${a.is_active ? 'selected' : ''}" onclick="selectAudioTrack(${a.id})">
-          <div class="item-left">
-            <span class="check-mark">${a.is_active ? '󰄬' : ''}</span>
-            <span>${a.label}</span>
-          </div>
-          <span class="lang-code">${a.code.toUpperCase()}</span>
-        </div>
-      `).join('');
-    }
-
-    function selectAudioTrack(id) {
-      if (currentState && currentState.audio_tracks) {
-        for (let a of currentState.audio_tracks) {
-          a.is_active = (a.id === id);
-          if (a.is_active) {
-            const code = (a.code || (a.is_dub ? 'eng' : 'jpn')).toUpperCase();
-            const modeLabel = a.is_dub ? 'DUB' : 'SUB';
-            document.getElementById('audio-badge').innerText = `${modeLabel} · ${code}`;
-            const quickAudioBtn = document.getElementById('quick-audio-btn');
-            if (quickAudioBtn) quickAudioBtn.innerText = `✦ Audio: ${code}`;
-          }
-        }
-        renderAudioTracksList(currentState.audio_tracks);
-      }
-      sendAction('set_audio', { audio_id: id });
-      closeAllDrawers();
-    }
-
-    function handleQuickAudio() {
-      openDrawer('audio');
-    }
-
-    function updatePresetPills(preset) {
-      ['studio', 'netflix', 'fansub', 'oled'].forEach(p => {
-        const el = document.getElementById(`preset-${p}`);
-        if (el) el.classList.remove('active');
-      });
-      const p = preset.toLowerCase();
-      const target = p.includes('netflix') ? 'netflix' : p.includes('fansub') ? 'fansub' : p.includes('oled') ? 'oled' : 'studio';
-      const el = document.getElementById(`preset-${target}`);
-      if (el) el.classList.add('active');
-    }
-
-    /* Zero-Latency WebSocket Connection Engine */
-    function connectWs() {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${location.host}/ws`;
-      const generation = ++wsGeneration;
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-
-      try {
-        ws = new WebSocket(url);
-        ws.onopen = () => {
-          document.getElementById('conn-badge').className = 'status-badge';
-          document.getElementById('conn-text').innerText = 'LIVE';
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            renderState(data);
-          } catch (e) {}
-        };
-
-        ws.onclose = () => {
-          if (generation !== wsGeneration) return;
-          document.getElementById('conn-badge').className = 'status-badge standby';
-          document.getElementById('conn-text').innerText = 'RECONNECTING';
-          reconnectTimer = setTimeout(connectWs, 1200);
-        };
-
-        ws.onerror = () => {
-          if (generation === wsGeneration && ws) ws.close();
-        };
-      } catch (e) {
-        if (generation === wsGeneration) {
-          reconnectTimer = setTimeout(connectWs, 2000);
-        }
-      }
-    }
-
-    async function sendAction(action, payload = {}, silent = false) {
-      if (!silent && navigator.vibrate) {
-        try { navigator.vibrate(18); } catch (e) {}
-      }
-
-      const body = { action, ...payload };
-
-      // Sub-millisecond WebSocket frame if connected
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify(body));
-          return;
-        } catch (e) {
-          // The socket can close between readyState and send; use HTTP below.
-        }
-      }
-
-      // HTTP fallback
-      try {
-        await fetch('/api/action', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-      } catch (e) {}
-    }
-
-    // Initialize WebSocket on page load
-    connectWs();
-
-    // Fallback polling only if WebSocket fails completely
-    setInterval(() => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        fetch('/api/status').then(r => r.json()).then(renderState).catch(() => {});
-      }
-    }, 2500);
-  </script>
-</body>
-</html>
-"#;
+const REMOTE_HTML: &str = include_str!("remote_html.html");
 
 #[cfg(test)]
 mod tests {
@@ -2171,6 +1570,7 @@ mod tests {
             preset: None,
             mode: Some("balanced".to_string()),
             queue_index: None,
+            ..Default::default()
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2195,6 +1595,7 @@ mod tests {
             preset: None,
             mode: None,
             queue_index: None,
+            ..Default::default()
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2222,6 +1623,7 @@ mod tests {
             preset: Some("Netflix Clean".to_string()),
             mode: None,
             queue_index: None,
+            ..Default::default()
         };
 
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
@@ -2278,6 +1680,7 @@ mod tests {
             preset: None,
             mode: None,
             queue_index: None,
+            ..Default::default()
         };
 
         // Select English (aid 4), click English repeatedly, then switch back to Japanese (aid 1) and Spanish (aid 2)
@@ -2354,5 +1757,82 @@ mod tests {
         handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
         let st = state.read().await;
         assert!(!st.queue_auto_advance);
+    }
+
+    #[test]
+    fn test_remote_themes_and_art_route_helpers() {
+        assert_eq!(REMOTE_THEMES.len(), 12);
+        assert_eq!(find_remote_theme("shibuya-punk").genre, "Anime");
+        assert_eq!(find_remote_theme("unknown").id, "lain-wired");
+        assert_eq!(cycle_remote_theme_id("cassette-hifi", true).id, "lain-wired");
+        assert_eq!(cycle_remote_theme_id("lain-wired", false).id, "cassette-hifi");
+        assert_eq!(parse_art_index("/assets/art/0.jpg"), Some(0));
+        assert_eq!(parse_art_index("/assets/art/10.jpg"), Some(10));
+        assert_eq!(parse_art_index("/assets/art/99.jpg"), None);
+        assert_eq!(parse_art_index("/assets/art/bad"), None);
+        assert!(REMOTE_HTML.contains("data-theme=\"lain-wired\""));
+        assert!(REMOTE_HTML.contains("/assets/art/"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_network_and_theme_actions() {
+        let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        handle_remote_action(
+            &RemoteActionRequest {
+                action: "set_network_mode".to_string(),
+                mode: Some("congested_wifi".to_string()),
+                ..Default::default()
+            },
+            "/tmp/nonexistent-solus-test.sock",
+            &state,
+            Some(&tx),
+        )
+        .await;
+        assert_eq!(state.read().await.network_tag, "NET:WIFI");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::AppMessage::RemoteNetworkModeChanged(m)) if m == "congested_wifi"
+        ));
+
+        handle_remote_action(
+            &RemoteActionRequest {
+                action: "cycle_network_mode".to_string(),
+                ..Default::default()
+            },
+            "/tmp/nonexistent-solus-test.sock",
+            &state,
+            Some(&tx),
+        )
+        .await;
+        assert_eq!(state.read().await.network_tag, "NET:ECO");
+
+        handle_remote_action(
+            &RemoteActionRequest {
+                action: "toggle_auto_abr".to_string(),
+                ..Default::default()
+            },
+            "/tmp/nonexistent-solus-test.sock",
+            &state,
+            Some(&tx),
+        )
+        .await;
+        assert!(!state.read().await.auto_abr);
+
+        handle_remote_action(
+            &RemoteActionRequest {
+                action: "set_remote_theme".to_string(),
+                theme_id: Some("arcade-16bit".to_string()),
+                art_index: Some(8),
+                ..Default::default()
+            },
+            "/tmp/nonexistent-solus-test.sock",
+            &state,
+            Some(&tx),
+        )
+        .await;
+        assert_eq!(state.read().await.remote_theme, "arcade-16bit");
+        assert_eq!(state.read().await.remote_art_index, 8);
     }
 }

@@ -140,6 +140,16 @@ pub async fn fetch_kitsu_episodes(
     title_primary: &str,
     title_fallback: Option<&str>,
 ) -> Option<HashMap<u32, KitsuEpisodeInfo>> {
+    fetch_kitsu_episodes_with_mode(client, title_primary, title_fallback, false).await
+}
+
+/// Network-aware Kitsu episode fetcher that prefers compact `medium` thumbnails when `prefer_compact` is set.
+pub async fn fetch_kitsu_episodes_with_mode(
+    client: &reqwest::Client,
+    title_primary: &str,
+    title_fallback: Option<&str>,
+    prefer_compact: bool,
+) -> Option<HashMap<u32, KitsuEpisodeInfo>> {
     // 1. Search Kitsu for the anime ID (try primary, then fallback)
     let anime_id = match search_kitsu_id(client, title_primary).await {
         Some(id) => id,
@@ -187,7 +197,11 @@ pub async fn fetch_kitsu_episodes(
                 .unwrap_or_else(|| format!("Episode {}", ep_num));
 
             let thumb_url = ep_item.attributes.thumbnail.and_then(|t| {
-                t.original.or(t.large).or(t.medium)
+                if prefer_compact {
+                    t.medium.or(t.large).or(t.original)
+                } else {
+                    t.original.or(t.large).or(t.medium)
+                }
             });
 
             let synopsis = ep_item

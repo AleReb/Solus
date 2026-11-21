@@ -9,10 +9,340 @@ use std::time::Duration;
 const XOR_KEY: [u8; 14] = [111, 116, 97, 107, 117, 45, 101, 109, 98, 101, 100, 45, 118, 49]; // "otaku-embed-v1"
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct QualityOption {
     pub label: String,
     pub url: String,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub tbr_kbps: Option<u32>,
+    #[serde(default)]
+    pub fps_x10: Option<u32>,
+}
+
+impl QualityOption {
+    pub fn simple(label: impl Into<String>, url: impl Into<String>) -> Self {
+        let label = label.into();
+        let height = parse_height_from_label(&label);
+        Self {
+            label,
+            url: url.into(),
+            height,
+            tbr_kbps: None,
+            fps_x10: None,
+        }
+    }
+
+    pub fn display_with_bitrate(&self) -> String {
+        if let Some(tbr) = self.tbr_kbps.filter(|&k| k > 0) {
+            if tbr >= 1000 {
+                format!("{} · {:.1}M", self.label, tbr as f64 / 1000.0)
+            } else {
+                format!("{} · {}k", self.label, tbr)
+            }
+        } else {
+            self.label.clone()
+        }
+    }
+}
+
+/// Video variant parsed from an HLS `#EXT-X-STREAM-INF` master playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedVideoVariant {
+    pub label: String,
+    pub url: String,
+    pub height: u32,
+    pub fps_x10: u32,
+    pub tbr_kbps: u32,
+    pub vcodec: Option<String>,
+    pub audio_group: Option<String>,
+}
+
+/// Audio rendition parsed from an HLS `#EXT-X-MEDIA:TYPE=AUDIO` directive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAudioVariant {
+    pub group_id: String,
+    pub code: String,
+    pub name: String,
+    pub uri: Option<String>,
+    pub is_default: bool,
+}
+
+/// Pre-resolved HLS variant ladder cached per `(anime_id, episode, is_dub)` for instant Auto-ABR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ResolvedStreamLadder {
+    pub anime_id: i64,
+    pub episode: u32,
+    pub is_dub: bool,
+    pub master_url: Option<String>,
+    pub resolved_at_unix: i64,
+    pub video_variants: Vec<ResolvedVideoVariant>,
+    pub audio_variants: Vec<ResolvedAudioVariant>,
+}
+
+pub fn parse_height_from_label(label: &str) -> Option<u32> {
+    let digits: String = label.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+pub fn estimate_tbr_kbps_for_height(height: u32) -> u32 {
+    if height >= 1080 {
+        3200
+    } else if height >= 720 {
+        1600
+    } else if height >= 480 {
+        850
+    } else {
+        500
+    }
+}
+
+pub fn parse_url_expire_unix(url: &str) -> Option<i64> {
+    let query = url.split('?').nth(1)?;
+    let query = query.split('#').next().unwrap_or(query);
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next()?.trim().to_ascii_lowercase();
+        let val = parts.next().unwrap_or("").trim();
+        if matches!(key.as_str(), "exp" | "expire" | "expires" | "e") {
+            if let Ok(ts) = val.parse::<i64>() {
+                if ts > 1_600_000_000 {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn codec_efficiency_rank(vcodec: Option<&str>) -> u8 {
+    let c = vcodec.unwrap_or("").to_ascii_lowercase();
+    if c.contains("av01") || c.contains("av1") {
+        0
+    } else if c.contains("vp9") || c.contains("vp09") || c.contains("hev1") || c.contains("hvc1") {
+        1
+    } else if c.contains("avc1") || c.contains("h264") {
+        2
+    } else {
+        3
+    }
+}
+
+impl ResolvedStreamLadder {
+    pub fn is_fresh(&self, now_unix: i64) -> bool {
+        if self.video_variants.is_empty() {
+            return false;
+        }
+        if now_unix.saturating_sub(self.resolved_at_unix) >= 600 {
+            return false;
+        }
+        for v in &self.video_variants {
+            if let Some(exp) = parse_url_expire_unix(&v.url) {
+                if exp - now_unix <= 120 {
+                    return false;
+                }
+            }
+        }
+        if let Some(ref m) = self.master_url {
+            if let Some(exp) = parse_url_expire_unix(m) {
+                if exp - now_unix <= 120 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn audio_uri_for(&self, variant: &ResolvedVideoVariant, is_dub: bool) -> Option<String> {
+        if let Some(ref group) = variant.audio_group {
+            let group_matches: Vec<&ResolvedAudioVariant> = self
+                .audio_variants
+                .iter()
+                .filter(|a| a.group_id == *group && a.uri.is_some())
+                .collect();
+            let chosen = if is_dub {
+                group_matches
+                    .iter()
+                    .find(|a| a.code.starts_with("eng") || a.code == "en")
+                    .or_else(|| group_matches.iter().find(|a| a.is_default))
+                    .or_else(|| group_matches.first())
+            } else {
+                group_matches
+                    .iter()
+                    .find(|a| a.code.starts_with("jpn") || a.code == "ja")
+                    .or_else(|| group_matches.iter().find(|a| a.is_default))
+                    .or_else(|| group_matches.first())
+            };
+            if let Some(uri) = chosen.and_then(|a| a.uri.clone()) {
+                return Some(uri);
+            }
+        }
+        if let Some(pos) = variant.url.rfind("/index.m3u8") {
+            let prefix = &variant.url[..pos];
+            if let Some(parent_end) = prefix.rfind('/') {
+                return Some(format!("{}/master.m3u8", &prefix[..parent_end]));
+            }
+        }
+        None
+    }
+
+    pub fn select_best_variant(
+        &self,
+        preferred_height: Option<u32>,
+        mode: crate::config::NetworkMode,
+    ) -> Option<&ResolvedVideoVariant> {
+        if self.video_variants.is_empty() {
+            return None;
+        }
+        let effective_cap = match (preferred_height, mode.max_height_cap()) {
+            (Some(p), Some(m)) => Some(p.min(m)),
+            (Some(p), None) => Some(p),
+            (None, Some(m)) => Some(m),
+            (None, None) => None,
+        };
+        let fps_cap_x10 = mode.max_fps_cap().map(|f| f * 10 + 5);
+
+        let candidates: Vec<&ResolvedVideoVariant> = if let Some(cap) = effective_cap {
+            let under: Vec<&ResolvedVideoVariant> = self
+                .video_variants
+                .iter()
+                .filter(|v| v.height <= cap)
+                .collect();
+            if under.is_empty() {
+                // Fall back to the lowest available height if every stream exceeds cap.
+                let min_h = self.video_variants.iter().map(|v| v.height).min().unwrap_or(0);
+                self.video_variants
+                    .iter()
+                    .filter(|v| v.height == min_h)
+                    .collect()
+            } else {
+                under
+            }
+        } else {
+            self.video_variants.iter().collect()
+        };
+
+        let best_height = candidates.iter().map(|v| v.height).max()?;
+        let at_best: Vec<&ResolvedVideoVariant> = candidates
+            .into_iter()
+            .filter(|v| v.height == best_height)
+            .collect();
+
+        let fps_filtered: Vec<&ResolvedVideoVariant> = if let Some(max_fps) = fps_cap_x10 {
+            let under_fps: Vec<&ResolvedVideoVariant> = at_best
+                .iter()
+                .copied()
+                .filter(|v| v.fps_x10 <= max_fps)
+                .collect();
+            if under_fps.is_empty() {
+                at_best
+            } else {
+                under_fps
+            }
+        } else {
+            at_best
+        };
+
+        if mode.is_congested() {
+            fps_filtered.into_iter().min_by_key(|v| {
+                (
+                    codec_efficiency_rank(v.vcodec.as_deref()),
+                    v.tbr_kbps,
+                )
+            })
+        } else {
+            fps_filtered.into_iter().max_by_key(|v| v.tbr_kbps)
+        }
+    }
+
+    pub fn select_lower_tier(
+        &self,
+        current_height: u32,
+        current_fps_x10: u32,
+        current_tbr_kbps: u32,
+    ) -> Option<&ResolvedVideoVariant> {
+        if self.video_variants.is_empty() {
+            return None;
+        }
+        let eff_tbr = if current_tbr_kbps > 0 {
+            current_tbr_kbps
+        } else {
+            estimate_tbr_kbps_for_height(current_height)
+        };
+
+        // Step 1: Same resolution with lower FPS (<= 30.5fps) or noticeably lower bitrate.
+        if current_fps_x10 > 400 {
+            let max_tbr = (eff_tbr * 85) / 100;
+            let same_h_lower_fps: Vec<&ResolvedVideoVariant> = self
+                .video_variants
+                .iter()
+                .filter(|v| v.height == current_height && v.fps_x10 <= 305 && v.tbr_kbps <= max_tbr)
+                .collect();
+            if let Some(best) = same_h_lower_fps.into_iter().min_by_key(|v| {
+                (codec_efficiency_rank(v.vcodec.as_deref()), v.tbr_kbps)
+            }) {
+                return Some(best);
+            }
+        }
+        let same_h_lower_tbr: Vec<&ResolvedVideoVariant> = self
+            .video_variants
+            .iter()
+            .filter(|v| v.height == current_height && v.tbr_kbps > 0 && v.tbr_kbps <= (eff_tbr * 80) / 100)
+            .collect();
+        if let Some(best) = same_h_lower_tbr.into_iter().min_by_key(|v| {
+            (codec_efficiency_rank(v.vcodec.as_deref()), v.tbr_kbps)
+        }) {
+            return Some(best);
+        }
+
+        // Step 2: Highest resolution strictly below `current_height`, preferring <= 30.5fps & efficient codecs.
+        let lower_height = self
+            .video_variants
+            .iter()
+            .filter(|v| v.height < current_height)
+            .map(|v| v.height)
+            .max()?;
+        let at_lower: Vec<&ResolvedVideoVariant> = self
+            .video_variants
+            .iter()
+            .filter(|v| v.height == lower_height)
+            .collect();
+        let low_fps: Vec<&ResolvedVideoVariant> = at_lower
+            .iter()
+            .copied()
+            .filter(|v| v.fps_x10 <= 305)
+            .collect();
+        let pool = if low_fps.is_empty() { at_lower } else { low_fps };
+        pool.into_iter().min_by_key(|v| {
+            (codec_efficiency_rank(v.vcodec.as_deref()), v.tbr_kbps)
+        })
+    }
+
+    pub fn ladder_summary_rungs(&self, current_height: Option<u32>) -> Vec<(u32, bool)> {
+        let mut heights: Vec<u32> = self.video_variants.iter().map(|v| v.height).collect();
+        heights.sort_by(|a, b| b.cmp(a));
+        heights.dedup();
+        heights
+            .into_iter()
+            .map(|h| (h, current_height == Some(h)))
+            .collect()
+    }
+}
+
+pub fn build_http_client(force_ipv4: bool, timeout_secs: u64) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(timeout_secs.clamp(3, 6)))
+        .timeout(Duration::from_secs(timeout_secs.max(4)));
+    if force_ipv4 {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    builder.build().unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,10 +392,10 @@ pub fn default_providers() -> Vec<ProviderOption> {
             server_label: "ZokoAnime".to_string(),
             master_url: None,
             qualities: vec![
-                QualityOption { label: "1080p".to_string(), url: String::new() },
-                QualityOption { label: "720p".to_string(), url: String::new() },
-                QualityOption { label: "480p".to_string(), url: String::new() },
-                QualityOption { label: "360p".to_string(), url: String::new() },
+                QualityOption::simple("1080p", ""),
+                QualityOption::simple("720p", ""),
+                QualityOption::simple("480p", ""),
+                QualityOption::simple("360p", ""),
             ],
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
@@ -77,9 +407,9 @@ pub fn default_providers() -> Vec<ProviderOption> {
             server_label: "HD-1".to_string(),
             master_url: None,
             qualities: vec![
-                QualityOption { label: "1080p".to_string(), url: String::new() },
-                QualityOption { label: "720p".to_string(), url: String::new() },
-                QualityOption { label: "480p".to_string(), url: String::new() },
+                QualityOption::simple("1080p", ""),
+                QualityOption::simple("720p", ""),
+                QualityOption::simple("480p", ""),
             ],
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
@@ -91,9 +421,9 @@ pub fn default_providers() -> Vec<ProviderOption> {
             server_label: "AnimePahe".to_string(),
             master_url: None,
             qualities: vec![
-                QualityOption { label: "1080p BD".to_string(), url: String::new() },
-                QualityOption { label: "720p BD".to_string(), url: String::new() },
-                QualityOption { label: "480p BD".to_string(), url: String::new() },
+                QualityOption::simple("1080p BD", ""),
+                QualityOption::simple("720p BD", ""),
+                QualityOption::simple("480p BD", ""),
             ],
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
@@ -105,10 +435,10 @@ pub fn default_providers() -> Vec<ProviderOption> {
             server_label: "GogoAnime".to_string(),
             master_url: None,
             qualities: vec![
-                QualityOption { label: "1080p".to_string(), url: String::new() },
-                QualityOption { label: "720p".to_string(), url: String::new() },
-                QualityOption { label: "480p".to_string(), url: String::new() },
-                QualityOption { label: "360p".to_string(), url: String::new() },
+                QualityOption::simple("1080p", ""),
+                QualityOption::simple("720p", ""),
+                QualityOption::simple("480p", ""),
+                QualityOption::simple("360p", ""),
             ],
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
@@ -126,6 +456,8 @@ pub struct StreamInfo {
     pub audio_tracks: Vec<AudioTrackOption>,
     pub providers: Vec<ProviderOption>,
     pub dub_available: bool,
+    #[serde(default)]
+    pub ladder: Option<ResolvedStreamLadder>,
 }
 
 impl StreamInfo {
@@ -133,13 +465,14 @@ impl StreamInfo {
         Self {
             master_url: None,
             qualities: vec![
-                QualityOption { label: "1080p".to_string(), url: String::new() },
-                QualityOption { label: "720p".to_string(), url: String::new() },
+                QualityOption::simple("1080p", ""),
+                QualityOption::simple("720p", ""),
             ],
             subtitles: vec![SubtitleOption::default_english()],
             audio_tracks: Vec::new(),
             providers: default_providers(),
             dub_available: false,
+            ladder: None,
         }
     }
 }
@@ -291,66 +624,147 @@ pub fn prioritize_subtitles(subtitles: &mut [SubtitleOption]) {
     subtitles.sort_by_key(|s| lang_priority(&s.code));
 }
 
-/// Parse actual available video resolutions from an HLS master playlist.
-pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<QualityOption> {
-    let mut raw_qualities: Vec<(u32, QualityOption)> = Vec::new();
+fn resolve_hls_uri(base_url: &str, stream_path: &str) -> String {
+    if stream_path.starts_with("http://") || stream_path.starts_with("https://") {
+        stream_path.to_string()
+    } else {
+        format!("{}/{}", base_url, stream_path.trim_start_matches('/'))
+    }
+}
+
+/// Parse complete video & audio variant ladder from an HLS master playlist.
+pub fn parse_m3u8_ladder(
+    master_url: &str,
+    m3u8_content: &str,
+    anime_id: i64,
+    episode: u32,
+    is_dub: bool,
+    now_unix: i64,
+) -> ResolvedStreamLadder {
     let base_url = match master_url.rfind('/') {
         Some(idx) => &master_url[..idx],
         None => master_url,
     };
 
+    let mut audio_variants = Vec::new();
+    let mut video_variants = Vec::new();
     let lines: Vec<&str> = m3u8_content.lines().map(|l| l.trim()).collect();
+
+    for line in &lines {
+        if !line.starts_with("#EXT-X-MEDIA:") {
+            continue;
+        }
+        let media_type = extract_hls_attr(line, "TYPE").unwrap_or_default();
+        if !media_type.eq_ignore_ascii_case("AUDIO") {
+            continue;
+        }
+        let group_id = extract_hls_attr(line, "GROUP-ID").unwrap_or_default();
+        let name_attr = extract_hls_attr(line, "NAME").unwrap_or_default();
+        let lang_attr = extract_hls_attr(line, "LANGUAGE").unwrap_or_default();
+        let is_default = extract_hls_attr(line, "DEFAULT")
+            .is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+        let uri = extract_hls_attr(line, "URI")
+            .filter(|u| !u.is_empty())
+            .map(|u| resolve_hls_uri(base_url, &u));
+        let (code, resolved_name) = resolve_lang_meta(&name_attr, &lang_attr);
+        audio_variants.push(ResolvedAudioVariant {
+            group_id,
+            code,
+            name: if !name_attr.is_empty() { name_attr } else { resolved_name },
+            uri,
+            is_default,
+        });
+    }
+
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         if line.starts_with("#EXT-X-STREAM-INF:") {
-            let height = line
-                .split(',')
-                .find(|part| part.contains("RESOLUTION="))
-                .and_then(|res| res.split('=').nth(1))
-                .and_then(|dim| dim.split('x').nth(1))
-                .and_then(|h| h.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>().ok());
+            let height = extract_hls_attr(line, "RESOLUTION")
+                .and_then(|dim| dim.split('x').nth(1).map(|s| s.to_string()))
+                .and_then(|h| h.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>().ok())
+                .unwrap_or(1080);
+
+            let bw_bps = extract_hls_attr(line, "AVERAGE-BANDWIDTH")
+                .or_else(|| extract_hls_attr(line, "BANDWIDTH"))
+                .and_then(|v| v.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u64>().ok())
+                .unwrap_or(0);
+            let tbr_kbps = if bw_bps > 0 {
+                ((bw_bps + 500) / 1000).max(1) as u32
+            } else {
+                estimate_tbr_kbps_for_height(height)
+            };
+
+            let fps_x10 = extract_hls_attr(line, "FRAME-RATE")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|&f| f > 0.0 && f < 240.0)
+                .map(|f| (f * 10.0).round() as u32)
+                .unwrap_or(240);
+
+            let vcodec = extract_hls_attr(line, "CODECS").filter(|s| !s.is_empty());
+            let audio_group = extract_hls_attr(line, "AUDIO").filter(|s| !s.is_empty());
 
             let mut j = i + 1;
             while j < lines.len() && (lines[j].starts_with('#') || lines[j].is_empty()) {
                 j += 1;
             }
-
             if j < lines.len() {
-                let stream_path = lines[j];
-                let full_url = if stream_path.starts_with("http://") || stream_path.starts_with("https://") {
-                    stream_path.to_string()
-                } else {
-                    format!("{}/{}", base_url, stream_path)
-                };
-
-                let h = height.unwrap_or(1080);
-                raw_qualities.push((h, QualityOption {
-                    label: format!("{}p", h),
+                let full_url = resolve_hls_uri(base_url, lines[j]);
+                video_variants.push(ResolvedVideoVariant {
+                    label: format!("{}p", height),
                     url: full_url,
-                }));
+                    height,
+                    fps_x10,
+                    tbr_kbps,
+                    vcodec,
+                    audio_group,
+                });
             }
         }
         i += 1;
     }
 
-    raw_qualities.sort_by_key(|a| std::cmp::Reverse(a.0));
+    video_variants.sort_by_key(|v| std::cmp::Reverse((v.height, v.tbr_kbps)));
 
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for (_, opt) in raw_qualities {
-        if seen.insert(opt.label.clone()) {
-            result.push(opt);
-        }
-    }
-
-    if result.is_empty() && !master_url.is_empty() {
-        result.push(QualityOption {
+    if video_variants.is_empty() && !master_url.is_empty() {
+        video_variants.push(ResolvedVideoVariant {
             label: "1080p".to_string(),
             url: master_url.to_string(),
+            height: 1080,
+            fps_x10: 240,
+            tbr_kbps: estimate_tbr_kbps_for_height(1080),
+            vcodec: None,
+            audio_group: None,
         });
     }
 
+    ResolvedStreamLadder {
+        anime_id,
+        episode,
+        is_dub,
+        master_url: (!master_url.is_empty()).then(|| master_url.to_string()),
+        resolved_at_unix: now_unix,
+        video_variants,
+        audio_variants,
+    }
+}
+
+/// Parse actual available video resolutions from an HLS master playlist.
+pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<QualityOption> {
+    let ladder = parse_m3u8_ladder(master_url, m3u8_content, 0, 0, false, 0);
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for variant in ladder.video_variants {
+        if seen.insert(variant.label.clone()) {
+            result.push(QualityOption {
+                label: variant.label,
+                url: variant.url,
+                height: Some(variant.height),
+                tbr_kbps: Some(variant.tbr_kbps),
+                fps_x10: Some(variant.fps_x10),
+            });
+        }
+    }
     result
 }
 
@@ -470,12 +884,29 @@ pub async fn fetch_stream_info_with_mal(
     episode: u32,
     is_dub: bool,
 ) -> StreamInfo {
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    fetch_stream_info_with_network(
+        anilist_id,
+        mal_id_hint,
+        query_title,
+        episode,
+        is_dub,
+        false,
+        5,
+    )
+    .await
+}
+
+/// Network-aware variant of `fetch_stream_info_with_mal` supporting IPv4 forcing and mode timeouts.
+pub async fn fetch_stream_info_with_network(
+    anilist_id: i64,
+    mal_id_hint: Option<i64>,
+    query_title: &str,
+    episode: u32,
+    is_dub: bool,
+    force_ipv4: bool,
+    timeout_secs: u64,
+) -> StreamInfo {
+    let client = build_http_client(force_ipv4, timeout_secs);
 
     // Run stream resolution and external multi-language subtitle fetching in parallel,
     // bounding external subtitle scraping to 4s so stream detection never stalls.
@@ -489,6 +920,11 @@ pub async fn fetch_stream_info_with_mal(
     let ext_subs = ext_subs_res.unwrap_or_default();
 
     let mut info = stream_res.unwrap_or_else(StreamInfo::fallback);
+    if let Some(ref mut ladder) = info.ladder {
+        ladder.anime_id = anilist_id;
+        ladder.episode = episode;
+        ladder.is_dub = is_dub;
+    }
 
     // Merge external community subtitles (OpenSubtitles) into the stream's subtitle list
     let mut existing_codes: HashSet<String> = info.subtitles.iter().map(|s| s.code.clone()).collect();
@@ -522,9 +958,9 @@ pub async fn fetch_stream_info_with_mal(
             }
             "hd1" => {
                 prov.qualities = vec![
-                    QualityOption { label: "1080p".to_string(), url: String::new() },
-                    QualityOption { label: "720p".to_string(), url: String::new() },
-                    QualityOption { label: "480p".to_string(), url: String::new() },
+                    QualityOption::simple("1080p", ""),
+                    QualityOption::simple("720p", ""),
+                    QualityOption::simple("480p", ""),
                 ];
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
@@ -533,9 +969,9 @@ pub async fn fetch_stream_info_with_mal(
             }
             "pahe" => {
                 prov.qualities = vec![
-                    QualityOption { label: "1080p BD".to_string(), url: String::new() },
-                    QualityOption { label: "720p BD".to_string(), url: String::new() },
-                    QualityOption { label: "480p BD".to_string(), url: String::new() },
+                    QualityOption::simple("1080p BD", ""),
+                    QualityOption::simple("720p BD", ""),
+                    QualityOption::simple("480p BD", ""),
                 ];
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
@@ -544,10 +980,10 @@ pub async fn fetch_stream_info_with_mal(
             }
             "gogo" => {
                 prov.qualities = vec![
-                    QualityOption { label: "1080p".to_string(), url: String::new() },
-                    QualityOption { label: "720p".to_string(), url: String::new() },
-                    QualityOption { label: "480p".to_string(), url: String::new() },
-                    QualityOption { label: "360p".to_string(), url: String::new() },
+                    QualityOption::simple("1080p", ""),
+                    QualityOption::simple("720p", ""),
+                    QualityOption::simple("480p", ""),
+                    QualityOption::simple("360p", ""),
                 ];
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
@@ -983,18 +1419,22 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
 
     let mut qualities = Vec::new();
     let mut audio_tracks = Vec::new();
+    let mut ladder = None;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     if let Some(ref m_url) = master_url {
         if let Ok(resp) = client.get(m_url).header("Referer", "https://zokoanime.video/").send().await {
             if let Ok(text) = resp.text().await {
+                let parsed_ladder = parse_m3u8_ladder(m_url, &text, 0, 0, false, now_unix);
                 qualities = parse_m3u8_qualities(m_url, &text);
                 audio_tracks = parse_m3u8_audio_tracks(&text);
+                ladder = Some(parsed_ladder);
             }
         }
         if qualities.is_empty() {
-            qualities.push(QualityOption {
-                label: "1080p".to_string(),
-                url: m_url.clone(),
-            });
+            qualities.push(QualityOption::simple("1080p", m_url.clone()));
         }
     }
 
@@ -1014,6 +1454,7 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
         audio_tracks,
         providers,
         dub_available,
+        ladder,
     })
 }
 
@@ -1465,5 +1906,72 @@ mod tests {
         assert_eq!(tracks[1].code, "eng");
         assert_eq!(tracks[2].code, "spa-419");
         assert_eq!(tracks[3].code, "fra");
+    }
+
+    #[test]
+    fn test_parse_m3u8_ladder_and_two_step_downshift() {
+        let manifest = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Japanese",LANGUAGE="ja",DEFAULT=YES,URI="audio/jpn/index.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=NO,URI="audio/eng/index.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=6400000,AVERAGE-BANDWIDTH=5600000,RESOLUTION=1920x1080,FRAME-RATE=60.000,CODECS="avc1.64002a",AUDIO="aud"
+1080_60/index.m3u8?exp=2000000000
+#EXT-X-STREAM-INF:BANDWIDTH=3400000,RESOLUTION=1920x1080,FRAME-RATE=23.976,CODECS="vp09.00.41.08",AUDIO="aud"
+1080_24/index.m3u8?exp=2000000000
+#EXT-X-STREAM-INF:BANDWIDTH=1800000,RESOLUTION=1280x720,FRAME-RATE=23.976,CODECS="av01.0.05M.08",AUDIO="aud"
+720/index.m3u8?exp=2000000000
+#EXT-X-STREAM-INF:BANDWIDTH=850000,RESOLUTION=854x480,FRAME-RATE=24.000,CODECS="avc1.4d401f",AUDIO="aud"
+480/index.m3u8?exp=2000000000
+"#;
+        let ladder = parse_m3u8_ladder(
+            "https://cdn.example.com/v1/master.m3u8",
+            manifest,
+            154587,
+            12,
+            false,
+            1_900_000_000,
+        );
+        assert!(ladder.is_fresh(1_900_000_100));
+        assert!(!ladder.is_fresh(1_900_000_700)); // > 600s TTL
+        assert!(!ladder.is_fresh(1_999_999_950)); // < 120s before exp=2000000000
+        assert_eq!(ladder.video_variants.len(), 4);
+        assert_eq!(ladder.audio_variants.len(), 2);
+
+        // Normal selects highest 1080p/60fps
+        let best_full = ladder.select_best_variant(None, crate::config::NetworkMode::Normal).unwrap();
+        assert_eq!(best_full.height, 1080);
+        assert_eq!(best_full.fps_x10, 600);
+        assert_eq!(best_full.tbr_kbps, 5600);
+
+        // CongestedWifi clamps to <=720p and <=30fps
+        let best_wifi = ladder.select_best_variant(None, crate::config::NetworkMode::CongestedWifi).unwrap();
+        assert_eq!(best_wifi.height, 720);
+
+        // Step 1 downshift from 1080p60 drops to 1080p24 first (same height, lower FPS & bitrate)
+        let step1 = ladder.select_lower_tier(1080, 600, 5600).unwrap();
+        assert_eq!(step1.height, 1080);
+        assert_eq!(step1.fps_x10, 240);
+        assert_eq!(step1.tbr_kbps, 3400);
+
+        // Step 2 downshift from 1080p24 drops to 720p
+        let step2 = ladder.select_lower_tier(1080, 240, 3400).unwrap();
+        assert_eq!(step2.height, 720);
+        assert_eq!(step2.tbr_kbps, 1800);
+
+        // Step 3 drops to 480p
+        let step3 = ladder.select_lower_tier(720, 240, 1800).unwrap();
+        assert_eq!(step3.height, 480);
+
+        // Bottom rung returns None
+        assert!(ladder.select_lower_tier(480, 240, 850).is_none());
+
+        // Audio URI resolution respects dub vs sub
+        assert_eq!(
+            ladder.audio_uri_for(step2, false).as_deref(),
+            Some("https://cdn.example.com/v1/audio/jpn/index.m3u8")
+        );
+        assert_eq!(
+            ladder.audio_uri_for(step2, true).as_deref(),
+            Some("https://cdn.example.com/v1/audio/eng/index.m3u8")
+        );
     }
 }

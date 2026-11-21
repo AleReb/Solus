@@ -22,6 +22,7 @@ pub struct PlaybackOptionsLayout {
     pub player_chip_rect:  Rect,
     pub audio_chip_rect:   Rect,
     pub anime4k_chip_rect: Rect,
+    pub network_chip_rect: Rect,
     pub player_rect:       Rect,
     pub provider_rect:     Rect,
     pub quality_rect:      Rect,
@@ -37,7 +38,7 @@ pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // Header info
+            Constraint::Length(5), // Header info + network telemetry bar
             Constraint::Min(0),    // 4-column body (Player + Provider + Quality + Subtitles)
             Constraint::Length(3), // Footer hints
         ])
@@ -78,6 +79,12 @@ pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
         width: inner_x.saturating_add(inner_w).saturating_sub(a4k_x),
         height: 1,
     };
+    let network_chip_rect = Rect {
+        x: inner_x,
+        y: header_rect.y.saturating_add(3),
+        width: 24.min(inner_w),
+        height: 1,
+    };
 
     let f_inner_h = footer_rect.height.min(3);
     let launch_w = 18.min(footer_rect.width);
@@ -102,6 +109,7 @@ pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
         player_chip_rect,
         audio_chip_rect,
         anime4k_chip_rect,
+        network_chip_rect,
         player_rect: body_cols[0],
         provider_rect: body_cols[1],
         quality_rect: body_cols[2],
@@ -244,6 +252,42 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        {
+            let net_bg = match state.network_mode {
+                crate::config::NetworkMode::Normal => theme.border_idle,
+                crate::config::NetworkMode::CongestedWifi => Color::Rgb(245, 185, 66),
+                crate::config::NetworkMode::UltraSaver => Color::Rgb(80, 220, 145),
+            };
+            let net_fg = if state.network_mode.is_congested() {
+                Color::Black
+            } else {
+                Color::White
+            };
+            let cap_desc = match state.network_mode {
+                crate::config::NetworkMode::Normal => "Uncapped · 45s buf · Auto-ABR",
+                crate::config::NetworkMode::CongestedWifi => "<=720p30 · 120s Disk · Compact Thumbs",
+                crate::config::NetworkMode::UltraSaver => "<=480p30 · 180s Disk · Low Bandwidth",
+            };
+            let mut row3 = vec![
+                Span::styled(" Network: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!(" {} ", state.network_mode.short_tag()),
+                    Style::default().fg(net_fg).bg(net_bg).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled("([n] cycle)", Style::default().fg(theme.text_dim)),
+                Span::raw("  ·  "),
+                Span::styled(cap_desc, Style::default().fg(theme.text)),
+            ];
+            if state.live_playback.started_at.is_some() {
+                row3.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+                row3.push(Span::styled(
+                    state.live_playback.compact_status_text(),
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(row3)
+        },
     ])
     .block(
         Block::default()
@@ -396,9 +440,20 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Style::default().fg(theme.border_idle)
     };
 
+    let q_cap_tag = state
+        .network_mode
+        .max_height_cap()
+        .map(|h| format!(" (<={h}p)"))
+        .unwrap_or_default();
+    let q_title = if q_focused {
+        format!(" 󰗃 Quality{q_cap_tag} (Active) ")
+    } else {
+        format!(" 󰗃 Quality{q_cap_tag} ")
+    };
+
     let q_block = Block::default()
         .title(Span::styled(
-            if q_focused { " 󰗃 Quality (Active) " } else { " 󰗃 Stream Quality " },
+            q_title,
             q_border_style.add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -453,7 +508,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
-                    Span::styled(clamp_label(&quality.label, q_budget), style),
+                    Span::styled(clamp_label(&quality.display_with_bitrate(), q_budget), style),
                 ]))
             })
             .collect();
@@ -558,6 +613,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::raw(" Player  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
+        Span::styled(" n/N ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::raw(" Net  "),
         Span::styled(" [/] ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Delay  "),
         Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(theme.border_idle)),
@@ -636,14 +693,8 @@ mod tests {
                 subtitles: vec![],
             }];
             loaded_state.playback_qualities = vec![
-                crate::api::subtitles::QualityOption {
-                    label: "1080p".into(),
-                    url: String::new(),
-                },
-                crate::api::subtitles::QualityOption {
-                    label: "720p".into(),
-                    url: String::new(),
-                },
+                crate::api::subtitles::QualityOption::simple("1080p", ""),
+                crate::api::subtitles::QualityOption::simple("720p", ""),
             ];
             loaded_state.playback_sub_languages = vec![
                 crate::api::subtitles::SubtitleOption::none_option(),
@@ -692,5 +743,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_play_options_network_chip_and_capped_quality_render() {
+        let mut state = AppState::new();
+        state.selected_episode = Some(4);
+        state.network_mode = crate::config::NetworkMode::CongestedWifi;
+        state.open_playback_options("Frieren".to_string(), 0, false, crate::config::Player::Mpv);
+        state.is_loading_subs = false;
+        state.playback_qualities = vec![crate::api::subtitles::QualityOption {
+            label: "720p".into(),
+            url: String::new(),
+            height: Some(720),
+            tbr_kbps: Some(1600),
+            fps_x10: Some(240),
+        }];
+        let area = Rect::new(0, 0, 120, 36);
+        let layout = compute_layout(area);
+        assert_eq!(layout.network_chip_rect.height, 1);
+        let mut term = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        term.draw(|f| render_overlay(f, &state)).unwrap();
+        let mut text = String::new();
+        let buf = term.backend().buffer();
+        for y in 0..36 {
+            for x in 0..120 {
+                text.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("NET:WIFI"));
+        assert!(text.contains("(<=720p)"));
+        assert!(text.contains("720p · 1.6M"));
     }
 }

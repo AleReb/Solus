@@ -198,6 +198,34 @@ enum AppMessage {
     RemoteSubDelayChanged(i32),
     /// Mobile companion changed subtitle track selection (or disabled subtitles)
     RemoteSubtitleSelectionChanged(api::subtitles::SubtitleSelection),
+    /// Real-time mpv buffer & stall telemetry sample
+    PlaybackBufferTelemetry(services::ipc::BufferTelemetryUpdate),
+    /// Pre-resolved HLS variant ladder cached for instant Auto-ABR hot-switching
+    StreamLadderResolved {
+        anime_id: i64,
+        episode:  u32,
+        is_dub:   bool,
+        ladder:   api::subtitles::ResolvedStreamLadder,
+    },
+    /// On-demand stream ladder re-fetch completed for Auto-ABR retry
+    AbrRefreshReady {
+        anime_id: i64,
+        episode:  u32,
+        is_dub:   bool,
+        info:     api::subtitles::StreamInfo,
+    },
+    /// Mobile companion changed the active adaptive network profile
+    RemoteNetworkModeChanged(String),
+    /// Mobile companion toggled Auto-ABR downshift
+    RemoteAutoAbrToggled(bool),
+    /// Mobile companion updated theme, character art mode, or portrait slot
+    RemoteThemeChanged {
+        theme_id:  Option<String>,
+        art_mode:  Option<String>,
+        art_index: Option<usize>,
+    },
+    /// Mobile companion WebSocket active connection count updated
+    RemoteClientsChanged(usize),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -388,6 +416,10 @@ async fn main() -> anyhow::Result<()> {
     state.auth = config::AuthConfig::load_for_profile(&active_profile.id);
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
+    state.network_mode = cfg.network_mode;
+    state.force_ipv4 = cfg.force_ipv4;
+    state.auto_abr_downshift = cfg.auto_abr_downshift;
+    set_global_network_flags(cfg.network_mode, cfg.force_ipv4);
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     if let Some(pb_settings) = db::user::get_profile_playback_settings(&pool, &state.active_profile_id).await {
         state.subtitle_delay_ms = pb_settings.subtitle_delay_ms.clamp(-30_000, 30_000);
@@ -402,6 +434,15 @@ async fn main() -> anyhow::Result<()> {
         st.queue_auto_advance = state.queue.auto_advance;
         st.queue_loop = state.queue.loop_mode;
         st.queue = build_remote_queue_snapshot(&state.queue, boot_now as u64);
+        st.network_mode = cfg.network_mode.as_str().to_string();
+        st.network_tag = cfg.network_mode.short_tag().to_string();
+        st.auto_abr = cfg.auto_abr_downshift;
+        st.force_ipv4 = cfg.force_ipv4;
+        st.remote_theme = cfg.remote.theme_id.clone();
+        st.remote_art_mode = cfg.remote.art_mode.clone();
+        st.remote_art_index = cfg.remote.art_index.unwrap_or_else(|| {
+            services::remote::find_remote_theme(&cfg.remote.theme_id).default_art_idx
+        });
     }
 
     // ── Instant Stale-While-Revalidate startup: load cached catalog (<15ms) ────
@@ -539,6 +580,8 @@ async fn main() -> anyhow::Result<()> {
                     let active_snapshot = state.queue.active_item.clone();
                     state.now_playing = None;
                     state.player_stop = None;
+                    state.live_playback.clear();
+                    services::ipc::set_playback_paused_for_cache(false);
                     services::ipc::set_active_ipc_sender(None);
                     services::ipc::set_active_socket_path(None);
                     let remote_state_done = state.remote_state.clone();
@@ -546,6 +589,11 @@ async fn main() -> anyhow::Result<()> {
                         {
                             let mut st = remote_state_done.write().await;
                             st.is_playing = false;
+                            st.paused_for_cache = false;
+                            st.buffering_pct = 0;
+                            st.buffer_secs = 0.0;
+                            st.cache_mb = 0.0;
+                            st.cache_speed_kbps = 0.0;
                         }
                         services::remote::broadcast_state(&remote_state_done).await;
                     });
@@ -855,6 +903,11 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         state.sync_active_provider();
+                        if let Some(ref ladder) = info.ladder {
+                            state
+                                .stream_ladder_cache
+                                .insert((anime_id, ep, is_dub), ladder.clone());
+                        }
                         state.is_loading_subs = false;
 
                         let r_state = state.remote_state.clone();
@@ -1150,6 +1203,7 @@ async fn main() -> anyhow::Result<()> {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                         state.anime_progress.insert(ep, (pos, dur));
                     }
+                    state.live_playback.last_time_pos = pos;
                     let remote_state_clone = state.remote_state.clone();
                     let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
                     let ep_title = state.episode_titles.get(&ep).cloned().unwrap_or_else(|| format!("Episode {}", ep));
@@ -1451,6 +1505,87 @@ async fn main() -> anyhow::Result<()> {
                     }
                     persist_profile_playback_settings_fields(&state, &pool).await;
                 }
+                AppMessage::PlaybackBufferTelemetry(upd) => {
+                    let newly_stalled =
+                        upd.stall_edge || (!state.live_playback.paused_for_cache && upd.paused_for_cache);
+                    if newly_stalled {
+                        state.live_playback.record_stall(std::time::Instant::now());
+                    }
+                    state.live_playback.paused_for_cache = upd.paused_for_cache;
+                    state.live_playback.buffering_pct = upd.buffering_pct;
+                    state.live_playback.cache_duration_secs = upd.cache_duration_secs;
+                    state.live_playback.cache_fw_bytes = upd.cache_fw_bytes;
+                    state.live_playback.cache_speed_bps = upd.cache_speed_bps;
+                    sync_remote_telemetry_snapshot(&state);
+                    if upd.paused_for_cache {
+                        maybe_trigger_auto_abr_downshift(&mut state, &cfg, &tx).await;
+                    }
+                }
+                AppMessage::StreamLadderResolved {
+                    anime_id,
+                    episode,
+                    is_dub,
+                    ladder,
+                } => {
+                    state
+                        .stream_ladder_cache
+                        .insert((anime_id, episode, is_dub), ladder);
+                }
+                AppMessage::AbrRefreshReady {
+                    anime_id,
+                    episode,
+                    is_dub,
+                    mut info,
+                } => {
+                    state.live_playback.abr_refresh_in_flight = false;
+                    if let Some(ladder) = info.ladder.take() {
+                        state
+                            .stream_ladder_cache
+                            .insert((anime_id, episode, is_dub), ladder);
+                    }
+                    if state.live_playback.paused_for_cache
+                        && state.live_playback.anime_id == Some(anime_id)
+                        && state.live_playback.episode == episode
+                    {
+                        maybe_trigger_auto_abr_downshift(&mut state, &cfg, &tx).await;
+                    }
+                }
+                AppMessage::RemoteNetworkModeChanged(mode_raw) => {
+                    let mode = config::NetworkMode::from_str_lossy(&mode_raw);
+                    apply_network_mode(&mut state, &mut cfg, mode, &tx).await;
+                }
+                AppMessage::RemoteAutoAbrToggled(enabled) => {
+                    cfg.auto_abr_downshift = enabled;
+                    state.auto_abr_downshift = enabled;
+                    let _ = cfg.save();
+                    sync_remote_telemetry_snapshot(&state);
+                    state.show_toast(
+                        format!(
+                            "❖ Remote Auto-ABR: {}",
+                            if enabled { "Enabled" } else { "Disabled" }
+                        ),
+                        unix_now(),
+                    );
+                }
+                AppMessage::RemoteThemeChanged {
+                    theme_id,
+                    art_mode,
+                    art_index,
+                } => {
+                    if let Some(tid) = theme_id {
+                        cfg.remote.theme_id = tid;
+                    }
+                    if let Some(am) = art_mode {
+                        cfg.remote.art_mode = am;
+                    }
+                    if let Some(idx) = art_index {
+                        cfg.remote.art_index = Some(idx);
+                    }
+                    let _ = cfg.save();
+                }
+                AppMessage::RemoteClientsChanged(count) => {
+                    state.remote_ws_clients = count;
+                }
             }
         }
 
@@ -1507,7 +1642,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Screen::Settings => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
-                        ui::settings::render_overlay(frame, &state, &cfg);
+                        ui::settings::render_overlay(frame, &mut state, &cfg);
                     }
                     Screen::Setup => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
@@ -1922,6 +2057,13 @@ async fn handle_mouse(
                     state.scroll_analytics_list(2);
                     true
                 }
+                Screen::Settings => {
+                    let len = ui::settings::get_filtered_items(cfg, state).len();
+                    if len > 0 && state.settings_cursor + 1 < len {
+                        state.settings_cursor += 1;
+                    }
+                    true
+                }
                 _ => false,
             }
         }
@@ -1969,6 +2111,10 @@ async fn handle_mouse(
                 }
                 Screen::TasteAnalytics => {
                     state.scroll_analytics_list(-2);
+                    true
+                }
+                Screen::Settings => {
+                    state.settings_cursor = state.settings_cursor.saturating_sub(1);
                     true
                 }
                 _ => false,
@@ -2261,6 +2407,10 @@ async fn handle_mouse(
                         );
                         return true;
                     }
+                    if layout.network_chip_rect.contains(pos) {
+                        cycle_network_mode(state, cfg, true, tx).await;
+                        return true;
+                    }
                     if layout.launch_btn_rect.contains(pos) {
                         let enter_key = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
                         handle_playback_options(enter_key, state, pool, cfg, tx).await;
@@ -2432,6 +2582,9 @@ async fn handle_home(
         }
         KeyCode::Char('Q') => {
             open_queue_hub(state, pool).await;
+        }
+        KeyCode::Char('N') => {
+            cycle_network_mode(state, cfg, true, tx).await;
         }
         KeyCode::Char('e') => {
             if let Some(anime) = active_anime(state, home_data) {
@@ -2836,9 +2989,20 @@ fn trigger_stream_detection(
     let anime_id = anime.id;
     let mal_id = anime.mal_id;
     let title = anime.playback_query();
+    let net_mode = current_network_mode();
+    let force_v4 = current_force_ipv4();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let info = api::subtitles::fetch_stream_info_with_mal(anime_id, mal_id, &title, episode, is_dub).await;
+        let info = api::subtitles::fetch_stream_info_with_network(
+            anime_id,
+            mal_id,
+            &title,
+            episode,
+            is_dub,
+            force_v4,
+            net_mode.network_timeout_secs(),
+        )
+        .await;
         let _ = tx
             .send(AppMessage::StreamInfoDetected(
                 anime_id,
@@ -2865,10 +3029,358 @@ fn cover_http_client() -> &'static reqwest::Client {
     })
 }
 
+static ACTIVE_NETWORK_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static ACTIVE_FORCE_IPV4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn current_network_mode() -> config::NetworkMode {
+    match ACTIVE_NETWORK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => config::NetworkMode::CongestedWifi,
+        2 => config::NetworkMode::UltraSaver,
+        _ => config::NetworkMode::Normal,
+    }
+}
+
+fn current_force_ipv4() -> bool {
+    ACTIVE_FORCE_IPV4.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_global_network_flags(mode: config::NetworkMode, force_ipv4: bool) {
+    let idx = match mode {
+        config::NetworkMode::Normal        => 0,
+        config::NetworkMode::CongestedWifi => 1,
+        config::NetworkMode::UltraSaver    => 2,
+    };
+    ACTIVE_NETWORK_MODE.store(idx, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE_FORCE_IPV4.store(force_ipv4, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn compact_anilist_cover_url(url: &str, compact: bool) -> String {
+    if compact && url.contains("/large/") {
+        url.replacen("/large/", "/medium/", 1)
+    } else {
+        url.to_string()
+    }
+}
+
 /// Bounded concurrency semaphore so startup preloading saturates keep-alive connections without socket/API spikes.
 fn cover_download_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     SEM.get_or_init(|| tokio::sync::Semaphore::new(12))
+}
+
+fn congested_cover_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(3))
+}
+
+fn ultra_cover_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(1))
+}
+
+fn active_cover_semaphore(mode: config::NetworkMode) -> &'static tokio::sync::Semaphore {
+    match mode {
+        config::NetworkMode::Normal        => cover_download_semaphore(),
+        config::NetworkMode::CongestedWifi => congested_cover_semaphore(),
+        config::NetworkMode::UltraSaver    => ultra_cover_semaphore(),
+    }
+}
+
+async fn wait_while_paused_for_cache() {
+    for _ in 0..48 {
+        if !services::ipc::is_playback_paused_for_cache() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn sync_remote_telemetry_snapshot(state: &AppState) {
+    let remote_state = state.remote_state.clone();
+    let net_mode = state.network_mode.as_str().to_string();
+    let net_tag = state.network_mode.short_tag().to_string();
+    let auto_abr = state.auto_abr_downshift;
+    let force_ipv4 = state.force_ipv4;
+    let cur_quality = if state.live_playback.current_height > 0 {
+        format!("{}p", state.live_playback.current_height)
+    } else {
+        String::new()
+    };
+    let buffer_secs = state.live_playback.cache_duration_secs;
+    let cache_mb = state.live_playback.cache_mb();
+    let cache_speed_kbps = state.live_playback.cache_speed_kbps();
+    let paused_for_cache = state.live_playback.paused_for_cache;
+    let buffering_pct = state.live_playback.buffering_pct;
+    let stall_count = state.live_playback.stall_count;
+
+    tokio::spawn(async move {
+        {
+            let mut st = remote_state.write().await;
+            st.network_mode = net_mode;
+            st.network_tag = net_tag;
+            st.auto_abr = auto_abr;
+            st.force_ipv4 = force_ipv4;
+            if !cur_quality.is_empty() {
+                st.current_quality = cur_quality;
+            }
+            st.buffer_secs = buffer_secs;
+            st.cache_mb = cache_mb;
+            st.cache_speed_kbps = cache_speed_kbps;
+            st.paused_for_cache = paused_for_cache;
+            st.buffering_pct = buffering_pct;
+            st.stall_count = stall_count;
+        }
+        services::remote::broadcast_state(&remote_state).await;
+    });
+}
+
+fn sync_remote_theme_snapshot(state: &AppState, cfg: &config::Config) {
+    let remote_state = state.remote_state.clone();
+    let theme_id = cfg.remote.theme_id.clone();
+    let art_mode = cfg.remote.art_mode.clone();
+    let art_index = cfg
+        .remote
+        .art_index
+        .unwrap_or_else(|| services::remote::find_remote_theme(&theme_id).default_art_idx);
+    tokio::spawn(async move {
+        {
+            let mut st = remote_state.write().await;
+            st.remote_theme = theme_id;
+            st.remote_art_mode = art_mode;
+            st.remote_art_index = art_index;
+        }
+        services::remote::broadcast_state(&remote_state).await;
+    });
+}
+
+async fn apply_network_mode(
+    state: &mut AppState,
+    cfg: &mut config::Config,
+    mode: config::NetworkMode,
+    _tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    cfg.network_mode = mode;
+    state.network_mode = mode;
+    set_global_network_flags(mode, cfg.force_ipv4);
+    let _ = cfg.save();
+    sync_remote_telemetry_snapshot(state);
+    if state.now_playing.is_some() {
+        let _ = services::ipc::send_set_network_mode(mode);
+    }
+    state.show_toast(
+        format!("◈ Network Mode: {} [{}]", mode.label(), mode.short_tag()),
+        unix_now(),
+    );
+}
+
+async fn cycle_network_mode(
+    state: &mut AppState,
+    cfg: &mut config::Config,
+    forward: bool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let next = if forward {
+        state.network_mode.next()
+    } else {
+        state.network_mode.prev()
+    };
+    apply_network_mode(state, cfg, next, tx).await;
+}
+
+async fn maybe_trigger_auto_abr_downshift(
+    state: &mut AppState,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if !cfg.auto_abr_downshift {
+        return;
+    }
+    if !state.live_playback.player.to_ascii_lowercase().contains("mpv") {
+        return;
+    }
+    let Some(anime_id) = state.live_playback.anime_id else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if !state.live_playback.can_abr_downshift(now) {
+        return;
+    }
+
+    let multi_stall = state.live_playback.recent_stall_times.len() >= 2;
+    let slow_throughput = state.live_playback.current_tbr_kbps > 0
+        && state.live_playback.cache_speed_bps > 0.0
+        && state.live_playback.cache_speed_kbps()
+            < (state.live_playback.current_tbr_kbps as f64) * 0.60;
+    if !multi_stall && !slow_throughput {
+        return;
+    }
+
+    let ep = state.live_playback.episode;
+    let is_dub = state.live_playback.is_dub;
+    let unix = unix_now();
+
+    if let Some(ladder) = state.stream_ladder_cache.get(&(anime_id, ep, is_dub)).cloned() {
+        if ladder.is_fresh(unix) {
+            if let Some(variant) = ladder
+                .select_lower_tier(
+                    state.live_playback.current_height,
+                    state.live_playback.current_fps_x10,
+                    state.live_playback.current_tbr_kbps,
+                )
+                .cloned()
+            {
+                execute_abr_hot_switch(state, variant, &ladder, "Auto-ABR");
+            } else if state.network_mode == config::NetworkMode::Normal
+                && multi_stall
+                && !state.live_playback.prompted_congested_mode
+            {
+                state.live_playback.prompted_congested_mode = true;
+                state.show_toast(
+                    "Repeated stalls at lowest tier — press [N] for Congested Wi-Fi mode",
+                    unix_now(),
+                );
+            }
+            return;
+        }
+    }
+
+    if !state.live_playback.abr_refresh_in_flight {
+        if let Some(ref anime) = state.selected_anime.clone() {
+            state.live_playback.abr_refresh_in_flight = true;
+            let title = state
+                .last_play_options
+                .as_ref()
+                .map(|o| o.title.clone())
+                .unwrap_or_else(|| anime.playback_query());
+            let mal_id = anime.mal_id;
+            let net_mode = state.network_mode;
+            let force_v4 = cfg.force_ipv4;
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let info = api::subtitles::fetch_stream_info_with_network(
+                    anime_id,
+                    mal_id,
+                    &title,
+                    ep,
+                    is_dub,
+                    force_v4,
+                    net_mode.network_timeout_secs(),
+                )
+                .await;
+                let _ = tx2
+                    .send(AppMessage::AbrRefreshReady {
+                        anime_id,
+                        episode: ep,
+                        is_dub,
+                        info,
+                    })
+                    .await;
+            });
+        }
+    }
+}
+
+async fn manual_abr_step_down(
+    state: &mut AppState,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let Some(anime_id) = state.live_playback.anime_id else {
+        state.show_toast("Start mpv playback first to step down stream tier", unix_now());
+        return;
+    };
+    if !state.live_playback.player.to_ascii_lowercase().contains("mpv") {
+        state.show_toast("Live tier hot-switch requires mpv player", unix_now());
+        return;
+    }
+    let ep = state.live_playback.episode;
+    let is_dub = state.live_playback.is_dub;
+    let unix = unix_now();
+    if let Some(ladder) = state.stream_ladder_cache.get(&(anime_id, ep, is_dub)).cloned() {
+        if ladder.is_fresh(unix) {
+            if let Some(variant) = ladder
+                .select_lower_tier(
+                    state.live_playback.current_height,
+                    state.live_playback.current_fps_x10,
+                    state.live_playback.current_tbr_kbps,
+                )
+                .cloned()
+            {
+                execute_abr_hot_switch(state, variant, &ladder, "Manual ABR");
+            } else {
+                state.show_toast("Already at lowest available stream tier", unix_now());
+            }
+            return;
+        }
+    }
+    if let Some(ref anime) = state.selected_anime.clone() {
+        state.live_playback.abr_refresh_in_flight = true;
+        let title = anime.playback_query();
+        let mal_id = anime.mal_id;
+        let net_mode = state.network_mode;
+        let force_v4 = cfg.force_ipv4;
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let info = api::subtitles::fetch_stream_info_with_network(
+                anime_id,
+                mal_id,
+                &title,
+                ep,
+                is_dub,
+                force_v4,
+                net_mode.network_timeout_secs(),
+            )
+            .await;
+            let _ = tx2
+                .send(AppMessage::AbrRefreshReady {
+                    anime_id,
+                    episode: ep,
+                    is_dub,
+                    info,
+                })
+                .await;
+        });
+        state.show_toast("Refreshing stream ladder for downshift...", unix_now());
+    }
+}
+
+fn execute_abr_hot_switch(
+    state: &mut AppState,
+    variant: api::subtitles::ResolvedVideoVariant,
+    ladder: &api::subtitles::ResolvedStreamLadder,
+    origin: &str,
+) {
+    let anime_title = state
+        .selected_anime
+        .as_ref()
+        .map(|a| a.display_title().to_string())
+        .unwrap_or_else(|| "Solus".to_string());
+    let osd_label = format!("{origin}: {}p (~{} kbps)", variant.height, variant.tbr_kbps);
+    let req = services::ipc::HotSwitchRequest {
+        new_url: variant.url.clone(),
+        resume_pos: state.live_playback.last_time_pos,
+        audio_file: ladder.audio_uri_for(&variant, state.live_playback.is_dub),
+        sub_url: state.last_play_options.as_ref().and_then(|o| o.sub_url.clone()),
+        subtitles_disabled: state
+            .last_play_options
+            .as_ref()
+            .is_some_and(|o| o.subtitles_disabled),
+        sub_delay_ms: state.subtitle_delay_ms,
+        media_title: format!("{} - Episode {}", anime_title, state.live_playback.episode),
+        osd_label: osd_label.clone(),
+    };
+    if services::ipc::send_hot_switch_stream(&req) {
+        state.live_playback.current_height = variant.height;
+        state.live_playback.current_fps_x10 = variant.fps_x10;
+        state.live_playback.current_tbr_kbps = variant.tbr_kbps;
+        state.live_playback.current_url = variant.url;
+        state.live_playback.last_abr_switch_at = Some(std::time::Instant::now());
+        state.live_playback.abr_downshift_count =
+            state.live_playback.abr_downshift_count.saturating_add(1);
+        state.live_playback.last_abr_note = Some(osd_label.clone());
+        sync_remote_telemetry_snapshot(state);
+        state.show_toast(format!("◈ {osd_label}"), unix_now());
+    }
 }
 
 /// Spawn a background cover fetch from SQLite/HTTP by `anime_id` when raw artwork is missing.
@@ -3333,6 +3845,9 @@ async fn handle_detail(
         KeyCode::Char('Q') => {
             open_queue_hub(state, pool).await;
         }
+        KeyCode::Char('N') => {
+            cycle_network_mode(state, cfg, true, tx).await;
+        }
 
         KeyCode::Char('a') | KeyCode::Char('A') => {
             if state.now_playing.is_some() {
@@ -3559,6 +4074,8 @@ async fn handle_download_modal(
                     anime,
                     episodes,
                     cfg.default_sub_lang.clone(),
+                    state.network_mode,
+                    cfg.force_ipv4,
                     pool.clone(),
                     tx.clone(),
                 );
@@ -3572,6 +4089,8 @@ fn queue_episodes_for_download(
     anime: db::cache::Anime,
     episodes: Vec<u32>,
     preferred_sub: String,
+    network_mode: config::NetworkMode,
+    force_ipv4: bool,
     pool: sqlx::SqlitePool,
     tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
@@ -3581,7 +4100,16 @@ fn queue_episodes_for_download(
         let mut tasks = Vec::new();
 
         for ep in episodes {
-            let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, false).await;
+            let stream_info = api::subtitles::fetch_stream_info_with_network(
+                anime.id,
+                anime.mal_id,
+                &query,
+                ep,
+                false,
+                force_ipv4,
+                network_mode.network_timeout_secs(),
+            )
+            .await;
             let stream_url = stream_info
                 .qualities
                 .first()
@@ -3602,6 +4130,7 @@ fn queue_episodes_for_download(
                     episode: ep,
                     stream_url: s_url,
                     sub_url,
+                    force_ipv4,
                 });
             }
         }
@@ -3721,7 +4250,7 @@ async fn handle_playback_options(
     key:   event::KeyEvent,
     state: &mut AppState,
     pool:  &sqlx::SqlitePool,
-    cfg:   &config::Config,
+    cfg:   &mut config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     match key.code {
@@ -3833,6 +4362,9 @@ async fn handle_playback_options(
         KeyCode::Char('u') | KeyCode::Char('U') => {
             state.toggle_anime4k();
             state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            cycle_network_mode(state, cfg, true, tx).await;
         }
         KeyCode::Char('e') | KeyCode::Enter => {
             let force_enqueue = matches!(key.code, KeyCode::Char('e'));
@@ -4000,6 +4532,8 @@ async fn handle_playback_options(
                             sub_delay_ms: state.subtitle_delay_ms,
                             subtitles_disabled,
                             loading_image: None,
+                            network_mode: state.network_mode,
+                            force_ipv4: cfg.force_ipv4,
                         };
                         start_playback(state, opts, title, ep, tx, pool, cfg).await;
                     }
@@ -4150,6 +4684,26 @@ async fn handle_settings(
                 state.settings_cursor = 0;
             }
         }
+        KeyCode::Tab => {
+            let n = ui::settings::SETTINGS_CATEGORIES.len();
+            state.settings_category = (state.settings_category + 1) % n;
+            state.settings_cursor = 0;
+            state.settings_scroll_offset = 0;
+        }
+        KeyCode::BackTab => {
+            let n = ui::settings::SETTINGS_CATEGORIES.len();
+            state.settings_category = (state.settings_category + n - 1) % n;
+            state.settings_cursor = 0;
+            state.settings_scroll_offset = 0;
+        }
+        KeyCode::Char(d @ '0'..='5') if state.settings_query.is_empty() => {
+            state.settings_category = (d as u8 - b'0') as usize;
+            state.settings_cursor = 0;
+            state.settings_scroll_offset = 0;
+        }
+        KeyCode::Char('N') if state.settings_query.is_empty() => {
+            cycle_network_mode(state, cfg, true, tx).await;
+        }
         KeyCode::Char(c) => {
             state.settings_query.push(c);
             state.settings_cursor = 0;
@@ -4170,6 +4724,63 @@ async fn execute_hub_action(
     use services::substyler::{SubtitlePreset, SubtitleStyleConfig};
 
     match item.id {
+        NetworkMode => {
+            cycle_network_mode(state, cfg, delta >= 0, tx).await;
+        }
+        AutoAbrDownshift => {
+            cfg.auto_abr_downshift = !cfg.auto_abr_downshift;
+            state.auto_abr_downshift = cfg.auto_abr_downshift;
+            let _ = cfg.save();
+            sync_remote_telemetry_snapshot(state);
+            let label = if cfg.auto_abr_downshift { "Enabled" } else { "Disabled" };
+            state.show_toast(format!("◈ Auto-ABR Downshift: {label}"), unix_now());
+        }
+        ForceIpv4 => {
+            cfg.force_ipv4 = !cfg.force_ipv4;
+            state.force_ipv4 = cfg.force_ipv4;
+            set_global_network_flags(state.network_mode, cfg.force_ipv4);
+            let _ = cfg.save();
+            sync_remote_telemetry_snapshot(state);
+            let label = if cfg.force_ipv4 { "Forced" } else { "Auto (IPv4/IPv6)" };
+            state.show_toast(format!("◈ Force IPv4 Transport: {label}"), unix_now());
+        }
+        ManualAbrStepDown => {
+            manual_abr_step_down(state, cfg, tx).await;
+        }
+        RemoteTheme => {
+            let next = services::remote::cycle_remote_theme_id(&cfg.remote.theme_id, delta >= 0);
+            cfg.remote.theme_id = next.id.to_string();
+            cfg.remote.art_index = Some(next.default_art_idx);
+            let _ = cfg.save();
+            sync_remote_theme_snapshot(state, cfg);
+            state.show_toast(
+                format!("❖ Remote Theme: {} ({})", next.name, next.genre),
+                unix_now(),
+            );
+        }
+        RemoteArtMode => {
+            if delta < 0 {
+                let base_idx = cfg.remote.art_index.unwrap_or_else(|| {
+                    services::remote::find_remote_theme(&cfg.remote.theme_id).default_art_idx
+                });
+                let next_idx = (base_idx + 1) % services::loading_art::Y2K_ART_COUNT;
+                cfg.remote.art_index = Some(next_idx);
+                let (_bytes, tag) = services::loading_art::raw_y2k_art(next_idx);
+                state.show_toast(
+                    format!("❖ Remote Portrait #{:02}: {}", next_idx + 1, tag),
+                    unix_now(),
+                );
+            } else {
+                cfg.remote.art_mode =
+                    services::remote::cycle_remote_art_mode(&cfg.remote.art_mode).to_string();
+                state.show_toast(
+                    format!("❖ Remote Art Mode: {}", cfg.remote.art_mode.to_ascii_uppercase()),
+                    unix_now(),
+                );
+            }
+            let _ = cfg.save();
+            sync_remote_theme_snapshot(state, cfg);
+        }
         SubPreset => {
             let presets = [
                 SubtitlePreset::StudioMinimal,
@@ -6099,11 +6710,19 @@ fn warm_next_queue_item_now(
         state.queue.set_resolving(target.uid, true);
         let a4k = state.anime4k_mode;
         let sub_style = cfg.subtitle_style.clone();
+        let net_mode = state.network_mode;
+        let force_v4 = cfg.force_ipv4;
         let tx2 = tx.clone();
         tokio::spawn(async move {
-            let resolved =
-                services::queue::resolve_item_prefetch(&target, a4k, sub_style, unix_now() as u64)
-                    .await;
+            let resolved = services::queue::resolve_item_prefetch(
+                &target,
+                a4k,
+                sub_style,
+                net_mode,
+                force_v4,
+                unix_now() as u64,
+            )
+            .await;
             let _ = tx2
                 .send(AppMessage::QueuePrefetchReady {
                     uid: target.uid,
@@ -6246,6 +6865,8 @@ async fn play_queue_item(
             &item,
             state.anime4k_mode,
             cfg.subtitle_style.clone(),
+            state.network_mode,
+            cfg.force_ipv4,
             now,
         )
         .await;
@@ -6253,6 +6874,11 @@ async fn play_queue_item(
     };
 
     if let Some(ref pre) = resolved_pre {
+        if let Some(ref ladder) = pre.ladder {
+            state
+                .stream_ladder_cache
+                .insert((item.anime_id, item.episode, item.dub), ladder.clone());
+        }
         state.playback_sub_languages = pre.subtitles.clone();
         api::subtitles::SubtitleOption::ensure_none_option_first(
             &mut state.playback_sub_languages,
@@ -6300,10 +6926,14 @@ async fn play_queue_item(
             sub_delay_ms: state.subtitle_delay_ms,
             subtitles_disabled: sub_disabled,
             loading_image: None,
+            network_mode: state.network_mode,
+            force_ipv4: cfg.force_ipv4,
         });
 
     opts.ipc_socket = None;
     opts.loading_image = None;
+    opts.network_mode = state.network_mode;
+    opts.force_ipv4 = cfg.force_ipv4;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -7216,9 +7846,21 @@ async fn handle_cast_modal(
                 let start_pos = state.anime_progress.get(&ep).map(|(p, _)| *p).unwrap_or(0.0);
                 if let Some(ref anime) = state.selected_anime {
                     let anime_id = anime.id;
+                    let mal_id = anime.mal_id;
                     let title = anime.playback_query();
+                    let net_mode = current_network_mode();
+                    let force_v4 = current_force_ipv4();
                     tokio::spawn(async move {
-                        let stream_info = api::subtitles::fetch_stream_info(anime_id, &title, ep, false).await;
+                        let stream_info = api::subtitles::fetch_stream_info_with_network(
+                            anime_id,
+                            mal_id,
+                            &title,
+                            ep,
+                            false,
+                            force_v4,
+                            net_mode.network_timeout_secs(),
+                        )
+                        .await;
                         let target_url = stream_info.qualities.first().map(|q| q.url.clone())
                             .or(stream_info.master_url);
                         if let Some(url) = target_url {
@@ -8228,7 +8870,21 @@ async fn launch_remote_stream_switch(
     }
 
     // Resolve fresh stream URL and subtitle track for the requested episode & audio stream
-    let mut stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
+    let mut stream_info = api::subtitles::fetch_stream_info_with_network(
+        anime.id,
+        anime.mal_id,
+        &query,
+        ep,
+        is_dub,
+        cfg.force_ipv4,
+        state.network_mode.network_timeout_secs(),
+    )
+    .await;
+    if let Some(ref ladder) = stream_info.ladder {
+        state
+            .stream_ladder_cache
+            .insert((anime.id, ep, is_dub), ladder.clone());
+    }
     api::subtitles::SubtitleOption::ensure_none_option_first(&mut stream_info.subtitles);
     state.playback_qualities = stream_info.qualities.clone();
     state.playback_sub_languages = stream_info.subtitles.clone();
@@ -8312,6 +8968,8 @@ async fn launch_remote_stream_switch(
         sub_delay_ms: state.subtitle_delay_ms,
         subtitles_disabled,
         loading_image: None,
+        network_mode: state.network_mode,
+        force_ipv4: cfg.force_ipv4,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
 }
@@ -8390,9 +9048,11 @@ async fn start_playback(
     }
 
     // 1. Instant 0ms launch if episode was downloaded offline
+    let mut is_offline_local = false;
     if let Some(offline_path) = state.offline_episodes.get(&episode) {
         if std::path::Path::new(offline_path).exists() {
             opts.stream_url = Some(offline_path.clone());
+            is_offline_local = true;
             state.show_toast(format!("❖ Instant launch from offline vault: Ep {}", episode), unix_now());
         }
     }
@@ -8424,6 +9084,32 @@ async fn start_playback(
         let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
         let _ = std::os::unix::fs::symlink(&sock_path, "/tmp/solus-mpv.sock");
     }
+    services::ipc::set_playback_paused_for_cache(false);
+    let init_h = api::subtitles::parse_height_from_label(&opts.quality).unwrap_or(1080);
+    let (init_height, init_fps_x10, init_tbr_kbps) = state
+        .stream_ladder_cache
+        .get(&(anime_id, episode, opts.dub))
+        .and_then(|l| l.select_best_variant(Some(init_h), state.network_mode))
+        .map(|v| (v.height, v.fps_x10, v.tbr_kbps))
+        .unwrap_or_else(|| {
+            (
+                init_h,
+                240,
+                api::subtitles::estimate_tbr_kbps_for_height(init_h),
+            )
+        });
+    state.live_playback.reset_for_session(
+        anime_id,
+        episode,
+        opts.dub,
+        is_offline_local,
+        opts.player.clone(),
+        init_height,
+        init_fps_x10,
+        init_tbr_kbps,
+        opts.stream_url.as_deref().unwrap_or(""),
+    );
+
     services::ipc::set_active_socket_path(Some(sock_path.clone()));
     opts.ipc_socket = Some(sock_path.clone());
 
@@ -8487,6 +9173,17 @@ async fn start_playback(
     let r_queue_loop = state.queue.loop_mode;
     let r_sub_delay = opts.sub_delay_ms as f64 / 1000.0;
     let r_sub_active = !opts.subtitles_disabled;
+    let r_net_mode = state.network_mode.as_str().to_string();
+    let r_net_tag = state.network_mode.short_tag().to_string();
+    let r_auto_abr = state.auto_abr_downshift;
+    let r_force_ipv4 = cfg.force_ipv4;
+    let r_quality = format!("{}p", init_height);
+    let r_theme_id = cfg.remote.theme_id.clone();
+    let r_art_mode = cfg.remote.art_mode.clone();
+    let r_art_idx = cfg
+        .remote
+        .art_index
+        .unwrap_or_else(|| services::remote::find_remote_theme(&r_theme_id).default_art_idx);
 
     tokio::spawn(async move {
         {
@@ -8515,6 +9212,20 @@ async fn start_playback(
             st.queue = r_queue_snapshot;
             st.queue_auto_advance = r_queue_auto;
             st.queue_loop = r_queue_loop;
+            st.network_mode = r_net_mode;
+            st.network_tag = r_net_tag;
+            st.auto_abr = r_auto_abr;
+            st.force_ipv4 = r_force_ipv4;
+            st.current_quality = r_quality;
+            st.buffer_secs = 0.0;
+            st.cache_mb = 0.0;
+            st.cache_speed_kbps = 0.0;
+            st.paused_for_cache = false;
+            st.buffering_pct = 0;
+            st.stall_count = 0;
+            st.remote_theme = r_theme_id;
+            st.remote_art_mode = r_art_mode;
+            st.remote_art_index = r_art_idx;
         }
         services::remote::broadcast_state(&remote_state_init).await;
     });
@@ -8643,6 +9354,44 @@ async fn start_playback(
         playback_exit_kind: Some(playback_exit_kind.clone()),
     };
     services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
+
+    // Pre-warm HLS variant ladder in background for instant Auto-ABR downshift if playback stalls
+    let need_ladder_warm = has_mpv_ipc
+        && !is_offline_local
+        && state.auto_abr_downshift
+        && state
+            .stream_ladder_cache
+            .get(&(anime_id, episode, opts.dub))
+            .is_none_or(|l| !l.is_fresh(unix_now()));
+    if need_ladder_warm {
+        let q_title = opts.title.clone();
+        let dub_flag = opts.dub;
+        let net_mode = state.network_mode;
+        let force_v4 = cfg.force_ipv4;
+        let tx_ladder = tx.clone();
+        tokio::spawn(async move {
+            let info = api::subtitles::fetch_stream_info_with_network(
+                anime_id,
+                mal_id_opt,
+                &q_title,
+                episode,
+                dub_flag,
+                force_v4,
+                net_mode.network_timeout_secs(),
+            )
+            .await;
+            if let Some(ladder) = info.ladder {
+                let _ = tx_ladder
+                    .send(AppMessage::StreamLadderResolved {
+                        anime_id,
+                        episode,
+                        is_dub: dub_flag,
+                        ladder,
+                    })
+                    .await;
+            }
+        });
+    }
 
     // Queue state stays saved immediately; actual N+1 stream warm-up happens Just-In-Time ~90s before EOF.
     persist_and_warm_queue(state, cfg, tx);
@@ -8788,12 +9537,17 @@ fn preload_nearby_episode_thumbnails(
     let win_start = selected.saturating_sub(3).max(1);
     let win_end = selected + 6;
 
-    let mut targets: Vec<u32> = (win_start..=win_end).collect();
-    for ep in 1..=16 {
-        if !targets.contains(&ep) {
-            targets.push(ep);
+    let targets: Vec<u32> = if state.network_mode == config::NetworkMode::UltraSaver {
+        vec![selected, selected + 1]
+    } else {
+        let mut list: Vec<u32> = (win_start..=win_end).collect();
+        for ep in 1..=16 {
+            if !list.contains(&ep) {
+                list.push(ep);
+            }
         }
-    }
+        list
+    };
 
     for ep in targets {
         if let Some(url) = state.episode_thumbnail_urls.get(&ep).cloned() {
@@ -8821,9 +9575,21 @@ async fn fetch_cover_bytes(
     if let Ok(Some(blob)) = db::cache::get_cover_blob(pool, anime.id).await {
         return Some(blob);
     }
-    let url = anime.cover_url.as_ref()?;
-    let _permit = cover_download_semaphore().acquire().await.ok()?;
-    let resp = cover_http_client().get(url).send().await.ok()?;
+    let raw_url = anime.cover_url.as_ref()?;
+    wait_while_paused_for_cache().await;
+    let mode = current_network_mode();
+    let force_v4 = current_force_ipv4();
+    let _permit = active_cover_semaphore(mode).acquire().await.ok()?;
+    let url = compact_anilist_cover_url(raw_url, mode.prefer_compact_artwork());
+    let resp = if force_v4 {
+        api::subtitles::build_http_client(true, mode.network_timeout_secs())
+            .get(&url)
+            .send()
+            .await
+            .ok()?
+    } else {
+        cover_http_client().get(&url).send().await.ok()?
+    };
     if !resp.status().is_success() {
         return None;
     }
@@ -9010,8 +9776,13 @@ fn trigger_episode_metadata_fetch(
                 None
             };
 
-            if let Some(kitsu_map) =
-                api::kitsu::fetch_kitsu_episodes(&client, primary, fallback).await
+            if let Some(kitsu_map) = api::kitsu::fetch_kitsu_episodes_with_mode(
+                &client,
+                primary,
+                fallback,
+                current_network_mode().prefer_compact_artwork(),
+            )
+            .await
             {
                 for (ep_num, k_info) in kitsu_map {
                     merge_episode_metadata(
@@ -9067,10 +9838,10 @@ async fn download_anime_banner(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
+    wait_while_paused_for_cache().await;
+    let mode = current_network_mode();
+    let _permit = active_cover_semaphore(mode).acquire().await.ok()?;
+    let client = api::subtitles::build_http_client(current_force_ipv4(), mode.network_timeout_secs());
     let resp = client.get(url).send().await.ok()?;
     let bytes = resp.bytes().await.ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
@@ -9130,10 +9901,10 @@ async fn download_episode_thumbnail(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
+    wait_while_paused_for_cache().await;
+    let mode = current_network_mode();
+    let _permit = active_cover_semaphore(mode).acquire().await.ok()?;
+    let client = api::subtitles::build_http_client(current_force_ipv4(), mode.network_timeout_secs());
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;

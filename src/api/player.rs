@@ -44,18 +44,41 @@ pub struct PlayOptions {
     /// Explicit "No subtitles" toggle (disables subtitle tracks across mpv/iina/vlc)
     #[serde(default)]
     pub subtitles_disabled: bool,
+    /// Active network resilience mode shaping buffer cushions & HLS caps
+    #[serde(default)]
+    pub network_mode: crate::config::NetworkMode,
+    /// Force IPv4 socket binding for player / ytdl network requests
+    #[serde(default)]
+    pub force_ipv4: bool,
 }
 
 /// Build the ani-cli command arguments for a given play request.
 /// Pure function — separated from spawn so it can be tested without forking.
 pub fn build_args(opts: &PlayOptions) -> Vec<String> {
+    let effective_quality = if let Some(cap) = opts.network_mode.max_height_cap() {
+        let q_lower = opts.quality.trim().to_ascii_lowercase();
+        if q_lower == "best" {
+            format!("{cap}p")
+        } else if let Some(h) = crate::api::subtitles::parse_height_from_label(&q_lower) {
+            if h > cap {
+                format!("{cap}p")
+            } else {
+                opts.quality.clone()
+            }
+        } else {
+            opts.quality.clone()
+        }
+    } else {
+        opts.quality.clone()
+    };
+
     let mut args = vec![
         "-S".to_string(),
         "1".to_string(),
         "-e".to_string(),
         opts.episode.to_string(),
         "-q".to_string(),
-        opts.quality.clone(),
+        effective_quality,
         "--exit-after-play".to_string(),
     ];
 
@@ -712,12 +735,44 @@ pub fn ensure_solus_audio_lua() -> Option<PathBuf> {
     Some(path)
 }
 
+pub fn mpv_network_args(
+    mode: crate::config::NetworkMode,
+    force_ipv4: bool,
+    is_local_file: bool,
+) -> Vec<String> {
+    if is_local_file {
+        return Vec::new();
+    }
+    let mut args = vec![
+        "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=3,multiple_requests=1".to_string(),
+        "--demuxer-lavf-o=http_persistent=1,http_multiple=1".to_string(),
+        format!("--hls-bitrate={}", mode.hls_bitrate_cap()),
+        format!("--demuxer-readahead-secs={}", mode.vod_readahead_secs()),
+        "--cache-pause-initial=yes".to_string(),
+        format!("--cache-pause-wait={:.1}", mode.vod_cache_pause_wait_secs()),
+        format!("--network-timeout={}", mode.network_timeout_secs()),
+    ];
+    if mode.use_disk_cache() {
+        args.push("--cache-on-disk=yes".to_string());
+        if let Ok(cache_root) = crate::config::Config::cache_dir() {
+            let mpv_cache = cache_root.join("mpv-cache");
+            let _ = std::fs::create_dir_all(&mpv_cache);
+            args.push(format!("--demuxer-cache-dir={}", mpv_cache.display()));
+        }
+    }
+    if force_ipv4 {
+        args.push("--ytdl-raw-options-append=force-ipv4=".to_string());
+    }
+    args
+}
+
 /// Build direct `mpv` arguments, wrapping the stream in `--{ ... --}` when a Y2K loading screen precedes it.
 pub fn build_mpv_direct_args(
     opts: &PlayOptions,
     direct_url: &str,
     youtube_conf: Option<&Path>,
 ) -> Vec<String> {
+    let is_local_file = !(direct_url.starts_with("http://") || direct_url.starts_with("https://"));
     let mut args = vec![
         "--ytdl=no".to_string(),
         "--force-window=immediate".to_string(),
@@ -725,6 +780,7 @@ pub fn build_mpv_direct_args(
         "--referrer=https://zokoanime.video/".to_string(),
         "--input-terminal=no".to_string(),
     ];
+    args.extend(mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file));
 
     if let Some(conf_path) = youtube_conf {
         args.push(format!("--input-conf={}", conf_path.display()));
@@ -840,6 +896,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         if !direct_url.is_empty() {
             let is_vlc = player.to_lowercase().contains("vlc");
             let is_iina = player.to_lowercase().contains("iina");
+            let is_local_file = !(direct_url.starts_with("http://") || direct_url.starts_with("https://"));
 
             let mut cmd = Command::new(&player);
 
@@ -857,6 +914,12 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg(format!("--meta-title={} Episode {}", opts.title, opts.episode));
                 cmd.arg("--http-referrer=https://zokoanime.video/");
                 cmd.arg("--http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                if !is_local_file {
+                    cmd.arg(format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()));
+                    if opts.force_ipv4 {
+                        cmd.arg("--ipv4");
+                    }
+                }
                 if opts.dub {
                     cmd.arg("--audio-language=en,eng");
                 } else {
@@ -886,6 +949,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--no-stdin");
                 cmd.arg("--mpv-ytdl=no");
                 cmd.arg("--mpv-force-window=immediate");
+                for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file) {
+                    cmd.arg(format!("--mpv-{}", net_flag.trim_start_matches("--")));
+                }
                 if let Some(ref conf_path) = yt_conf {
                     cmd.arg(format!("--mpv-input-conf={}", conf_path.display()));
                 }
@@ -1107,11 +1173,20 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     if player.contains("iina") {
         player_flags.push("--keep-running".to_string());
         player_flags.push("--no-stdin".to_string());
-    } else if player.contains("vlc") {
+    } else if player.to_lowercase().contains("vlc") {
         player_flags.push("--play-and-exit".to_string());
         player_flags.push("--no-video-title-show".to_string());
+        player_flags.push(format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()));
+        if opts.force_ipv4 {
+            player_flags.push("--ipv4".to_string());
+        }
     } else {
         player_flags.push("--input-terminal=no".to_string());
+        for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, false) {
+            if !net_flag.contains(' ') {
+                player_flags.push(net_flag);
+            }
+        }
     }
     if let Some(ref conf_path) = yt_conf {
         if player.contains("iina") {
@@ -1236,6 +1311,8 @@ mod tests {
             loading_image: None,
             sub_delay_ms: 0,
             subtitles_disabled: false,
+            network_mode: crate::config::NetworkMode::Normal,
+            force_ipv4: false,
         }
     }
 
@@ -1300,6 +1377,8 @@ mod tests {
             loading_image: None,
             sub_delay_ms: 0,
             subtitles_disabled: false,
+            network_mode: crate::config::NetworkMode::Normal,
+            force_ipv4: false,
         });
         assert_eq!(
             args,
@@ -1336,6 +1415,8 @@ mod tests {
             loading_image: None,
             sub_delay_ms: 0,
             subtitles_disabled: false,
+            network_mode: crate::config::NetworkMode::Normal,
+            force_ipv4: false,
         });
         assert_eq!(
             args,
@@ -1455,5 +1536,37 @@ mod tests {
         let args_pos = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
         assert!(args_pos.contains(&"--sub-file=https://cdn.example.com/eng.vtt".to_string()));
         assert!(args_pos.contains(&"--sub-delay=0.250".to_string()));
+    }
+
+    #[test]
+    fn test_mpv_network_args_and_quality_clamp() {
+        let normal = mpv_network_args(crate::config::NetworkMode::Normal, false, false);
+        assert!(normal.contains(&"--hls-bitrate=max".to_string()));
+        assert!(normal.contains(&"--demuxer-readahead-secs=45".to_string()));
+        assert!(normal.contains(&"--cache-pause-wait=2.5".to_string()));
+        assert!(normal.contains(&"--network-timeout=15".to_string()));
+        assert!(!normal.contains(&"--cache-on-disk=yes".to_string()));
+        assert!(normal.iter().any(|a| a.starts_with("--stream-lavf-o=reconnect=1")));
+
+        let wifi = mpv_network_args(crate::config::NetworkMode::CongestedWifi, true, false);
+        assert!(wifi.contains(&"--hls-bitrate=1800000".to_string()));
+        assert!(wifi.contains(&"--demuxer-readahead-secs=120".to_string()));
+        assert!(wifi.contains(&"--cache-pause-wait=4.5".to_string()));
+        assert!(wifi.contains(&"--network-timeout=12".to_string()));
+        assert!(wifi.contains(&"--cache-on-disk=yes".to_string()));
+        assert!(wifi.contains(&"--ytdl-raw-options-append=force-ipv4=".to_string()));
+
+        let eco = mpv_network_args(crate::config::NetworkMode::UltraSaver, false, false);
+        assert!(eco.contains(&"--hls-bitrate=900000".to_string()));
+        assert!(eco.contains(&"--demuxer-readahead-secs=180".to_string()));
+        assert!(eco.contains(&"--cache-pause-wait=6.0".to_string()));
+
+        assert!(mpv_network_args(crate::config::NetworkMode::UltraSaver, true, true).is_empty());
+
+        let mut o = opts("Frieren", 1, "1080p", false);
+        o.network_mode = crate::config::NetworkMode::CongestedWifi;
+        let cli_args = build_args(&o);
+        let q_pos = cli_args.iter().position(|a| a == "-q").unwrap();
+        assert_eq!(cli_args[q_pos + 1], "720p");
     }
 }

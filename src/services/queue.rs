@@ -3,7 +3,7 @@
 use crate::{
     api::{
         player::PlayOptions,
-        subtitles::{fetch_stream_info_with_mal, AudioTrackOption, SubtitleOption},
+        subtitles::{AudioTrackOption, SubtitleOption},
     },
     config::{Anime4KMode, Config},
     db::playlists::{PlaylistItemDraft, SavedPlaylistItem},
@@ -69,6 +69,8 @@ pub struct ResolvedPrefetch {
     pub audio_tracks:  Vec<AudioTrackOption>,
     #[serde(default)]
     pub dub_available: bool,
+    #[serde(default)]
+    pub ladder:        Option<crate::api::subtitles::ResolvedStreamLadder>,
 }
 
 impl ResolvedPrefetch {
@@ -701,15 +703,17 @@ pub fn parse_batch_queue_input(input: &str, max_aired: u32) -> Vec<u32> {
     parse_episode_range(input, max_aired.max(1), &[])
 }
 
-async fn verify_stream_url_alive(url: &str) -> bool {
+async fn verify_stream_url_alive(url: &str, force_ipv4: bool) -> bool {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return true;
     }
-    let client = match reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .build()
-    {
+        .timeout(Duration::from_secs(3));
+    if force_ipv4 {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    let client = match builder.build() {
         Ok(c) => c,
         Err(_) => return true,
     };
@@ -748,30 +752,75 @@ pub async fn resolve_item_prefetch(
     item:         &QueueItem,
     anime4k_mode: Anime4KMode,
     sub_style:    SubtitleStyleConfig,
+    network_mode: crate::config::NetworkMode,
+    force_ipv4:   bool,
     resolved_at:  u64,
 ) -> Option<ResolvedPrefetch> {
-    let stream_info = fetch_stream_info_with_mal(
+    let stream_info = crate::api::subtitles::fetch_stream_info_with_network(
         item.anime_id,
         item.mal_id,
         &item.query,
         item.episode,
         item.dub,
+        force_ipv4,
+        network_mode.network_timeout_secs(),
     )
     .await;
 
-    let stream_url = stream_info
-        .qualities
-        .iter()
-        .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
-        .or_else(|| stream_info.qualities.first())
-        .map(|q| q.url.clone())
-        .filter(|u| !u.is_empty())
-        .or_else(|| stream_info.master_url.clone())
-        .filter(|u| !u.is_empty());
+    let desired_h = crate::api::subtitles::parse_height_from_label(&item.quality);
+    let capped_h = match (desired_h, network_mode.max_height_cap()) {
+        (Some(d), Some(c)) => Some(d.min(c)),
+        (Some(d), None) => Some(d),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+
+    let (selected_quality_label, stream_url) = if let Some(ref ladder) = stream_info.ladder {
+        if let Some(variant) = ladder.select_best_variant(capped_h, network_mode) {
+            (variant.label.clone(), Some(variant.url.clone()))
+        } else {
+            (
+                item.quality.clone(),
+                stream_info
+                    .qualities
+                    .iter()
+                    .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
+                    .or_else(|| stream_info.qualities.first())
+                    .map(|q| q.url.clone())
+                    .filter(|u| !u.is_empty())
+                    .or_else(|| stream_info.master_url.clone())
+                    .filter(|u| !u.is_empty()),
+            )
+        }
+    } else {
+        let chosen_q = if let Some(cap) = capped_h {
+            stream_info
+                .qualities
+                .iter()
+                .find(|q| {
+                    crate::api::subtitles::parse_height_from_label(&q.label).is_some_and(|h| h <= cap)
+                })
+                .or_else(|| stream_info.qualities.last())
+        } else {
+            stream_info
+                .qualities
+                .iter()
+                .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
+                .or_else(|| stream_info.qualities.first())
+        };
+        (
+            chosen_q.map(|q| q.label.clone()).unwrap_or_else(|| item.quality.clone()),
+            chosen_q
+                .map(|q| q.url.clone())
+                .filter(|u| !u.is_empty())
+                .or_else(|| stream_info.master_url.clone())
+                .filter(|u| !u.is_empty()),
+        )
+    };
 
     // Do not cache empty fallback results as Ready; require an actual verified HTTP stream URL.
     let valid_url = match stream_url {
-        Some(ref url) if verify_stream_url_alive(url).await => Some(url.clone()),
+        Some(ref url) if verify_stream_url_alive(url, force_ipv4).await => Some(url.clone()),
         _ => return None,
     };
 
@@ -850,7 +899,7 @@ pub async fn resolve_item_prefetch(
     let options = PlayOptions {
         title: item.query.clone(),
         episode: item.episode,
-        quality: item.quality.clone(),
+        quality: selected_quality_label,
         dub: item.dub,
         player: item.player.clone(),
         sub_lang,
@@ -863,6 +912,8 @@ pub async fn resolve_item_prefetch(
         loading_image: None,
         sub_delay_ms: 0,
         subtitles_disabled: subs_disabled,
+        network_mode,
+        force_ipv4,
     };
 
     Some(ResolvedPrefetch {
@@ -873,6 +924,7 @@ pub async fn resolve_item_prefetch(
         subtitles: stream_info.subtitles,
         audio_tracks: stream_info.audio_tracks,
         dub_available: stream_info.dub_available,
+        ladder: stream_info.ladder,
     })
 }
 
@@ -913,6 +965,8 @@ mod tests {
                 loading_image: None,
                 sub_delay_ms: 0,
                 subtitles_disabled: false,
+                network_mode: crate::config::NetworkMode::Normal,
+                force_ipv4: false,
             },
             resolved_at,
             sub_synced: false,
@@ -920,6 +974,7 @@ mod tests {
             subtitles: Vec::new(),
             audio_tracks: Vec::new(),
             dub_available: false,
+            ladder: None,
         }
     }
 

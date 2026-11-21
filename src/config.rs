@@ -30,6 +30,169 @@ impl Quality {
             Quality::Best  => "best",
         }
     }
+
+    pub fn height_px(&self) -> Option<u32> {
+        match self {
+            Quality::P360  => Some(360),
+            Quality::P480  => Some(480),
+            Quality::P720  => Some(720),
+            Quality::P1080 => Some(1080),
+            Quality::Best  => None,
+        }
+    }
+
+    pub fn clamped_for_network(&self, mode: NetworkMode) -> Quality {
+        let Some(cap) = mode.max_height_cap() else {
+            return self.clone();
+        };
+        let eff_h = self.height_px().map(|h| h.min(cap)).unwrap_or(cap);
+        match eff_h {
+            0..=360 => Quality::P360,
+            361..=480 => Quality::P480,
+            481..=720 => Quality::P720,
+            _ => Quality::P1080,
+        }
+    }
+}
+
+/// Network resilience profile controlling stream caps, player readahead cushions, and artwork throttling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Normal,
+    CongestedWifi,
+    UltraSaver,
+}
+
+impl NetworkMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::CongestedWifi,
+            Self::CongestedWifi => Self::UltraSaver,
+            Self::UltraSaver => Self::Normal,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Normal => Self::UltraSaver,
+            Self::CongestedWifi => Self::Normal,
+            Self::UltraSaver => Self::CongestedWifi,
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        let norm = s.trim().to_ascii_lowercase();
+        if norm.contains("wifi") || norm.contains("congested") {
+            Self::CongestedWifi
+        } else if norm.contains("eco") || norm.contains("ultra") || norm.contains("saver") {
+            Self::UltraSaver
+        } else {
+            Self::Normal
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::CongestedWifi => "congested_wifi",
+            Self::UltraSaver => "ultra_saver",
+        }
+    }
+
+    pub fn short_tag(&self) -> &'static str {
+        match self {
+            Self::Normal => "NET:FULL",
+            Self::CongestedWifi => "NET:WIFI",
+            Self::UltraSaver => "NET:ECO",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Normal => "Normal (Full)",
+            Self::CongestedWifi => "Congested Wi-Fi",
+            Self::UltraSaver => "Ultra Saver",
+        }
+    }
+
+    pub fn is_congested(&self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub fn max_height_cap(&self) -> Option<u32> {
+        match self {
+            Self::Normal => None,
+            Self::CongestedWifi => Some(720),
+            Self::UltraSaver => Some(480),
+        }
+    }
+
+    pub fn max_fps_cap(&self) -> Option<u32> {
+        match self {
+            Self::Normal => None,
+            Self::CongestedWifi | Self::UltraSaver => Some(30),
+        }
+    }
+
+    pub fn hls_bitrate_cap(&self) -> &'static str {
+        match self {
+            Self::Normal => "max",
+            Self::CongestedWifi => "1800000",
+            Self::UltraSaver => "900000",
+        }
+    }
+
+    pub fn vod_readahead_secs(&self) -> u32 {
+        match self {
+            Self::Normal => 45,
+            Self::CongestedWifi => 120,
+            Self::UltraSaver => 180,
+        }
+    }
+
+    pub fn vod_cache_pause_wait_secs(&self) -> f64 {
+        match self {
+            Self::Normal => 2.5,
+            Self::CongestedWifi => 4.5,
+            Self::UltraSaver => 6.0,
+        }
+    }
+
+    pub fn use_disk_cache(&self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub fn network_timeout_secs(&self) -> u64 {
+        match self {
+            Self::Normal => 15,
+            Self::CongestedWifi => 12,
+            Self::UltraSaver => 10,
+        }
+    }
+
+    pub fn vlc_network_caching_ms(&self) -> u32 {
+        match self {
+            Self::Normal => 3000,
+            Self::CongestedWifi => 8000,
+            Self::UltraSaver => 12000,
+        }
+    }
+
+    pub fn prefer_compact_artwork(&self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub fn max_bg_image_concurrency(&self, is_playing: bool) -> usize {
+        match (self, is_playing) {
+            (Self::Normal, false) => 12,
+            (Self::Normal, true) => 4,
+            (Self::CongestedWifi, false) => 2,
+            (Self::CongestedWifi, true) => 1,
+            (Self::UltraSaver, _) => 1,
+        }
+    }
 }
 
 
@@ -156,6 +319,15 @@ pub struct Config {
     /// Schema revision for one-time default migrations (0 = legacy v1.0.6 defaults)
     #[serde(default)]
     pub config_version:   u32,
+    /// Network resilience profile (Normal, CongestedWifi, UltraSaver)
+    #[serde(default)]
+    pub network_mode:     NetworkMode,
+    /// Force IPv4 socket binding for HTTP / yt-dlp / VLC requests
+    #[serde(default)]
+    pub force_ipv4:       bool,
+    /// Enable automatic HLS ladder downshift on sustained buffering/stalls
+    #[serde(default = "default_true")]
+    pub auto_abr_downshift: bool,
 }
 
 impl Default for Config {
@@ -176,6 +348,9 @@ impl Default for Config {
             trackers:         TrackersConfig::default(),
             active_profile:   default_active_profile(),
             config_version:   2,
+            network_mode:     NetworkMode::Normal,
+            force_ipv4:       false,
+            auto_abr_downshift: true,
         }
     }
 }
@@ -214,6 +389,12 @@ pub struct RemoteConfig {
     pub enabled: bool,
     #[serde(default = "default_remote_port")]
     pub port: u16,
+    #[serde(default = "default_remote_theme")]
+    pub theme_id: String,
+    #[serde(default = "default_remote_art_mode")]
+    pub art_mode: String,
+    #[serde(default)]
+    pub art_index: Option<usize>,
 }
 
 fn default_remote_enabled() -> bool {
@@ -224,11 +405,22 @@ fn default_remote_port() -> u16 {
     8484
 }
 
+fn default_remote_theme() -> String {
+    "lain-wired".to_string()
+}
+
+fn default_remote_art_mode() -> String {
+    "companion".to_string()
+}
+
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             enabled: default_remote_enabled(),
             port: default_remote_port(),
+            theme_id: default_remote_theme(),
+            art_mode: default_remote_art_mode(),
+            art_index: None,
         }
     }
 }
@@ -783,6 +975,9 @@ mod tests {
             trackers:         TrackersConfig::default(),
             active_profile:   default_active_profile(),
             config_version:   1,
+            network_mode:     NetworkMode::CongestedWifi,
+            force_ipv4:       true,
+            auto_abr_downshift: false,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -793,6 +988,9 @@ mod tests {
         assert_eq!(deserialized.default_sub_lang, "Arabic");
         assert_eq!(deserialized.anime4k_mode,     Anime4KMode::Balanced);
         assert!(deserialized.ambilight_enabled);
+        assert_eq!(deserialized.network_mode,     NetworkMode::CongestedWifi);
+        assert!(deserialized.force_ipv4);
+        assert!(!deserialized.auto_abr_downshift);
     }
 
     #[test]
@@ -816,6 +1014,7 @@ mod tests {
             trackers:         TrackersConfig::default(),
             active_profile:   default_active_profile(),
             config_version:   1,
+            ..Config::default()
         };
 
         // Save manually (bypassing config_path() which uses XDG dirs)
@@ -875,5 +1074,46 @@ detail_ttl = 3600
         cfg.update.auto_install = false;
         assert!(!cfg.migrate_legacy_defaults());
         assert!(!cfg.update.auto_install);
+        // Legacy configs missing network fields receive sane defaults.
+        assert_eq!(cfg.network_mode, NetworkMode::Normal);
+        assert!(!cfg.force_ipv4);
+        assert!(cfg.auto_abr_downshift);
+        assert_eq!(cfg.remote.theme_id, "lain-wired");
+        assert_eq!(cfg.remote.art_mode, "companion");
+    }
+
+    #[test]
+    fn test_network_mode_profiles_and_quality_clamping() {
+        assert_eq!(NetworkMode::Normal.next(), NetworkMode::CongestedWifi);
+        assert_eq!(NetworkMode::CongestedWifi.next(), NetworkMode::UltraSaver);
+        assert_eq!(NetworkMode::UltraSaver.next(), NetworkMode::Normal);
+        assert_eq!(NetworkMode::Normal.prev(), NetworkMode::UltraSaver);
+
+        assert!(!NetworkMode::Normal.is_congested());
+        assert!(NetworkMode::CongestedWifi.is_congested());
+        assert!(NetworkMode::UltraSaver.is_congested());
+
+        assert_eq!(NetworkMode::Normal.max_height_cap(), None);
+        assert_eq!(NetworkMode::CongestedWifi.max_height_cap(), Some(720));
+        assert_eq!(NetworkMode::UltraSaver.max_height_cap(), Some(480));
+
+        assert_eq!(NetworkMode::Normal.vod_readahead_secs(), 45);
+        assert_eq!(NetworkMode::CongestedWifi.vod_readahead_secs(), 120);
+        assert_eq!(NetworkMode::UltraSaver.vod_readahead_secs(), 180);
+
+        assert!(!NetworkMode::Normal.use_disk_cache());
+        assert!(NetworkMode::CongestedWifi.use_disk_cache());
+        assert!(NetworkMode::UltraSaver.use_disk_cache());
+
+        assert_eq!(NetworkMode::Normal.vlc_network_caching_ms(), 3000);
+        assert_eq!(NetworkMode::CongestedWifi.vlc_network_caching_ms(), 8000);
+        assert_eq!(NetworkMode::UltraSaver.vlc_network_caching_ms(), 12000);
+
+        assert_eq!(Quality::P1080.clamped_for_network(NetworkMode::Normal), Quality::P1080);
+        assert_eq!(Quality::Best.clamped_for_network(NetworkMode::CongestedWifi), Quality::P720);
+        assert_eq!(Quality::P1080.clamped_for_network(NetworkMode::CongestedWifi), Quality::P720);
+        assert_eq!(Quality::P480.clamped_for_network(NetworkMode::CongestedWifi), Quality::P480);
+        assert_eq!(Quality::P720.clamped_for_network(NetworkMode::UltraSaver), Quality::P480);
+        assert_eq!(Quality::P360.clamped_for_network(NetworkMode::UltraSaver), Quality::P360);
     }
 }

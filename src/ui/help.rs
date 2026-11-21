@@ -74,7 +74,7 @@ const FEATURES_BINDINGS: &[BindingRow] = &[
 const SYSTEM_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "P", desc: "Switch / manage user profiles" },
     BindingRow { key: "s", desc: "Open Settings Control Hub" },
-    BindingRow { key: "t / T", desc: "Cycle active UI theme palette" },
+    BindingRow { key: "N", desc: "Cycle network mode (Full/WiFi/Eco)" },
     BindingRow { key: "!", desc: "Open System Doctor & Pipeline" },
     BindingRow { key: "U", desc: "Check or install self-update" },
     BindingRow { key: "X", desc: "Stop active player process" },

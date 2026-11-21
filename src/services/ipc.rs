@@ -11,7 +11,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, RwLock,
 };
 use std::time::Duration;
@@ -20,6 +20,15 @@ use tokio::sync::mpsc::{self, Sender, UnboundedSender};
 
 static ACTIVE_SOCKET_PATH: RwLock<Option<String>> = RwLock::new(None);
 static ACTIVE_IPC_TX: RwLock<Option<UnboundedSender<String>>> = RwLock::new(None);
+static PLAYBACK_PAUSED_FOR_CACHE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_playback_paused_for_cache() -> bool {
+    PLAYBACK_PAUSED_FOR_CACHE.load(Ordering::Relaxed)
+}
+
+pub fn set_playback_paused_for_cache(paused: bool) {
+    PLAYBACK_PAUSED_FOR_CACHE.store(paused, Ordering::Relaxed);
+}
 
 #[cfg(test)]
 pub fn test_ipc_lock() -> &'static tokio::sync::Mutex<()> {
@@ -103,6 +112,122 @@ async fn connect_ipc(sock_path: &str) -> Option<IpcStream> {
         let _ = sock_path;
         None
     }
+}
+
+/// Live buffer & stall telemetry sample emitted by the mpv IPC monitor.
+#[derive(Debug, Clone, Default)]
+pub struct BufferTelemetryUpdate {
+    pub anime_id:            i64,
+    pub episode:             u32,
+    pub paused_for_cache:    bool,
+    pub buffering_pct:       u8,
+    pub cache_duration_secs: f64,
+    pub cache_fw_bytes:      u64,
+    pub cache_speed_bps:     f64,
+    pub stall_edge:          bool,
+}
+
+/// Request payload for seamless mid-playback stream hot-switching via mpv JSON IPC.
+#[derive(Debug, Clone)]
+pub struct HotSwitchRequest {
+    pub new_url:            String,
+    pub resume_pos:         f64,
+    pub audio_file:         Option<String>,
+    pub sub_url:            Option<String>,
+    pub subtitles_disabled: bool,
+    pub sub_delay_ms:       i32,
+    pub media_title:        String,
+    pub osd_label:          String,
+}
+
+pub fn build_hot_switch_commands(req: &HotSwitchRequest) -> Vec<Value> {
+    let mut cmds = vec![
+        serde_json::json!({ "command": ["set_property", "start", format!("{:.2}", req.resume_pos.max(0.0))] }),
+        serde_json::json!({ "command": ["set_property", "referrer", "https://zokoanime.video/"] }),
+        serde_json::json!({ "command": ["set_property", "force-media-title", req.media_title] }),
+    ];
+    if let Some(ref audio) = req.audio_file {
+        if !audio.trim().is_empty() {
+            cmds.push(serde_json::json!({ "command": ["set_property", "audio-files", [audio]] }));
+        }
+    }
+    if req.subtitles_disabled {
+        cmds.push(serde_json::json!({ "command": ["set_property", "sid", "no"] }));
+        cmds.push(serde_json::json!({ "command": ["set_property", "sub-visibility", false] }));
+    } else if let Some(ref sub) = req.sub_url {
+        if !sub.trim().is_empty() {
+            cmds.push(serde_json::json!({ "command": ["set_property", "sub-files", [sub]] }));
+            cmds.push(serde_json::json!({ "command": ["set_property", "sub-visibility", true] }));
+        }
+    }
+    cmds.push(serde_json::json!({ "command": ["set_property", "sub-delay", req.sub_delay_ms as f64 / 1000.0] }));
+    cmds.push(serde_json::json!({ "command": ["loadfile", req.new_url, "replace"] }));
+    cmds.push(serde_json::json!({ "command": ["show-text", req.osd_label, 3500] }));
+    cmds
+}
+
+pub fn send_hot_switch_stream(req: &HotSwitchRequest) -> bool {
+    let cmds = build_hot_switch_commands(req);
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+pub fn build_set_network_mode_commands(mode: crate::config::NetworkMode) -> Vec<Value> {
+    vec![
+        serde_json::json!({ "command": ["set_property", "demuxer-readahead-secs", mode.vod_readahead_secs()] }),
+        serde_json::json!({ "command": ["set_property", "cache-pause-wait", mode.vod_cache_pause_wait_secs()] }),
+        serde_json::json!({ "command": ["set_property", "network-timeout", mode.network_timeout_secs()] }),
+        serde_json::json!({ "command": ["set_property", "hls-bitrate", mode.hls_bitrate_cap()] }),
+        serde_json::json!({ "command": ["show-text", format!("◈ Solus: {} ({}s readahead)", mode.short_tag(), mode.vod_readahead_secs()), 3000] }),
+    ]
+}
+
+pub fn send_set_network_mode(mode: crate::config::NetworkMode) -> bool {
+    let cmds = build_set_network_mode_commands(mode);
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+/// Parse `demuxer-cache-state` JSON object returning `(cache_duration_secs, fw_bytes)`.
+pub fn parse_demuxer_cache_state(line: &str) -> Option<(f64, u64)> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? != "property-change"
+        || parsed.get("name")?.as_str()? != "demuxer-cache-state"
+    {
+        return None;
+    }
+    let data = parsed.get("data")?.as_object()?;
+    let duration_secs = data
+        .get("cache-duration")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let fw_bytes = data
+        .get("fw-bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some((duration_secs, fw_bytes))
+}
+
+/// Parse a numeric `property-change` (float or integer) by property name.
+pub fn parse_numeric_property_change(line: &str, target_name: &str) -> Option<f64> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? == "property-change"
+        && parsed.get("name")?.as_str()? == target_name
+    {
+        return parsed.get("data")?.as_f64();
+    }
+    None
 }
 
 /// Atomic exit classification written by IPC monitor & checked when `mpv` exits.
@@ -435,14 +560,19 @@ async fn drive_ipc_stream<S>(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
     set_active_socket_path(Some(sock_path.clone()));
     set_active_ipc_sender(Some(cmd_tx.clone()));
+    set_playback_paused_for_cache(false);
 
-    // Subscribe to time-pos, duration, track-list, playlist-pos, and eof-reached property changes
+    // Subscribe to time-pos, duration, track-list, playlist-pos, eof-reached, and live buffer telemetry
     let observe_cmds = [
         r#"{"command": ["observe_property", 1, "time-pos"]}"#,
         r#"{"command": ["observe_property", 2, "duration"]}"#,
         r#"{"command": ["observe_property", 3, "track-list"]}"#,
         r#"{"command": ["observe_property", 4, "playlist-pos"]}"#,
         r#"{"command": ["observe_property", 5, "eof-reached"]}"#,
+        r#"{"command": ["observe_property", 6, "paused-for-cache"]}"#,
+        r#"{"command": ["observe_property", 7, "cache-buffering-state"]}"#,
+        r#"{"command": ["observe_property", 8, "cache-speed"]}"#,
+        r#"{"command": ["observe_property", 9, "demuxer-cache-state"]}"#,
     ];
     for cmd in observe_cmds {
         let _ = writer_half.write_all(format!("{}\n", cmd).as_bytes()).await;
@@ -465,6 +595,12 @@ async fn drive_ipc_stream<S>(
     let mut skip_rx_pending = true;
     let loader_start = tokio::time::Instant::now();
     let mut loader_tick = tokio::time::interval(Duration::from_millis(120));
+    let mut paused_for_cache = false;
+    let mut buffering_pct: u8 = 100;
+    let mut cache_duration_secs: f64 = 0.0;
+    let mut cache_fw_bytes: u64 = 0;
+    let mut cache_speed_bps: f64 = 0.0;
+    let mut last_telemetry_emit = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -569,6 +705,51 @@ async fn drive_ipc_stream<S>(
                         last_audio_tracks = tracks.clone();
                         let _ = tx.send(AppMessage::AudioTracksUpdated(tracks)).await;
                     }
+                }
+
+                // Live buffer & stall telemetry (strictly gated after loading screen finishes)
+                let mut telemetry_changed = false;
+                let mut stall_edge = false;
+                if let Some(pfc) = parse_bool_property_change(&line, "paused-for-cache") {
+                    if pfc != paused_for_cache {
+                        stall_edge = pfc && !paused_for_cache;
+                        paused_for_cache = pfc;
+                        set_playback_paused_for_cache(pfc);
+                        telemetry_changed = true;
+                    }
+                }
+                if let Some(pct) = parse_numeric_property_change(&line, "cache-buffering-state") {
+                    let clamped = pct.round().clamp(0.0, 100.0) as u8;
+                    if clamped != buffering_pct {
+                        buffering_pct = clamped;
+                        telemetry_changed = true;
+                    }
+                }
+                if let Some(spd) = parse_numeric_property_change(&line, "cache-speed") {
+                    cache_speed_bps = spd.max(0.0);
+                    telemetry_changed = true;
+                }
+                if let Some((dur_s, fw_b)) = parse_demuxer_cache_state(&line) {
+                    cache_duration_secs = dur_s;
+                    cache_fw_bytes = fw_b;
+                    telemetry_changed = true;
+                }
+                if telemetry_changed
+                    && (stall_edge || last_telemetry_emit.elapsed() >= Duration::from_millis(500))
+                {
+                    last_telemetry_emit = tokio::time::Instant::now();
+                    let _ = tx
+                        .send(AppMessage::PlaybackBufferTelemetry(BufferTelemetryUpdate {
+                            anime_id,
+                            episode,
+                            paused_for_cache,
+                            buffering_pct,
+                            cache_duration_secs,
+                            cache_fw_bytes,
+                            cache_speed_bps,
+                            stall_edge,
+                        }))
+                        .await;
                 }
 
                 if let Some((name, val)) = parse_property_change(&line) {
@@ -698,6 +879,7 @@ async fn drive_ipc_stream<S>(
     }
 
     clear_active_monitor_if_same(&sock_path, &cmd_tx);
+    set_playback_paused_for_cache(false);
 
     // On player exit, persist the final position
     if current_pos > 0.0 {
@@ -816,17 +998,18 @@ mod tests {
         let (server_read, _server_write) = tokio::io::split(server_io);
         let mut lines = BufReader::new(server_read).lines();
 
-        // First five commands must be observe_property subscriptions
-        let l1 = lines.next_line().await.unwrap().unwrap();
-        let l2 = lines.next_line().await.unwrap().unwrap();
-        let l3 = lines.next_line().await.unwrap().unwrap();
-        let l4 = lines.next_line().await.unwrap().unwrap();
-        let l5 = lines.next_line().await.unwrap().unwrap();
-        assert!(l1.contains("observe_property"));
-        assert!(l2.contains("observe_property"));
-        assert!(l3.contains("observe_property"));
-        assert!(l4.contains("observe_property"));
-        assert!(l5.contains("eof-reached"));
+        // First nine commands must be observe_property subscriptions
+        let mut observed = Vec::new();
+        for _ in 0..9 {
+            let line = lines.next_line().await.unwrap().unwrap();
+            assert!(line.contains("observe_property"));
+            observed.push(line);
+        }
+        assert!(observed[4].contains("eof-reached"));
+        assert!(observed[5].contains("paused-for-cache"));
+        assert!(observed[6].contains("cache-buffering-state"));
+        assert!(observed[7].contains("cache-speed"));
+        assert!(observed[8].contains("demuxer-cache-state"));
         assert_eq!(
             get_active_socket_path().as_deref(),
             Some(r"\\.\pipe\solus-mpv-1-1")
@@ -834,8 +1017,8 @@ mod tests {
 
         // Send a command through the active monitor channel
         assert!(try_send_via_active_monitor(r#"{"command":["cycle","pause"]}"#));
-        let l6 = lines.next_line().await.unwrap().unwrap();
-        assert_eq!(l6, r#"{"command":["cycle","pause"]}"#);
+        let l_cmd = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(l_cmd, r#"{"command":["cycle","pause"]}"#);
 
         drop(lines);
         drop(_server_write);
@@ -897,5 +1080,45 @@ mod tests {
             parse_end_file_reason(r#"{"event":"end-file","reason":"quit"}"#).as_deref(),
             Some("quit")
         );
+        assert_eq!(
+            parse_end_file_reason(r#"{"event":"end-file","reason":"stop"}"#).as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn test_buffer_telemetry_parsers_and_hot_switch_commands() {
+        let demux = r#"{"event":"property-change","id":9,"name":"demuxer-cache-state","data":{"cache-duration":42.5,"fw-bytes":18874368}}"#;
+        let parsed = parse_demuxer_cache_state(demux).unwrap();
+        assert!((parsed.0 - 42.5).abs() < 1e-6);
+        assert_eq!(parsed.1, 18_874_368);
+
+        let spd = r#"{"event":"property-change","id":8,"name":"cache-speed","data":1536000}"#;
+        assert_eq!(parse_numeric_property_change(spd, "cache-speed"), Some(1_536_000.0));
+
+        let pct = r#"{"event":"property-change","id":7,"name":"cache-buffering-state","data":67}"#;
+        assert_eq!(parse_numeric_property_change(pct, "cache-buffering-state"), Some(67.0));
+
+        let cmds = build_hot_switch_commands(&HotSwitchRequest {
+            new_url: "https://cdn.example.com/720/index.m3u8".into(),
+            resume_pos: 312.4,
+            audio_file: Some("https://cdn.example.com/audio/jpn.m3u8".into()),
+            sub_url: Some("https://cdn.example.com/en.vtt".into()),
+            subtitles_disabled: false,
+            sub_delay_ms: -250,
+            media_title: "Frieren Episode 12".into(),
+            osd_label: "Auto-ABR: 720p (~1.6 Mbps)".into(),
+        });
+        let joined: Vec<String> = cmds.iter().map(|v| v.to_string()).collect();
+        assert!(joined.iter().any(|s| s.contains("\"referrer\",\"https://zokoanime.video/\"")));
+        assert!(joined.iter().any(|s| s.contains("\"audio-files\"")));
+        assert!(joined.iter().any(|s| s.contains("\"sub-files\"")));
+        assert!(joined.iter().any(|s| s.contains("\"sub-delay\",-0.25")));
+        assert!(joined.iter().any(|s| s.contains("\"loadfile\",\"https://cdn.example.com/720/index.m3u8\",\"replace\"")));
+
+        let net_cmds = build_set_network_mode_commands(crate::config::NetworkMode::CongestedWifi);
+        assert_eq!(net_cmds.len(), 5);
+        assert!(net_cmds[0].to_string().contains("120"));
+        assert!(net_cmds[3].to_string().contains("1800000"));
     }
 }
