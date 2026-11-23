@@ -2178,9 +2178,9 @@ impl HomeData {
 /// Modal size percentages for the Bento Status & Tracker List Picker popup.
 pub fn watchlist_modal_pct(area: Rect) -> (u16, u16) {
     if area.width >= 104 && area.height >= 28 {
-        (68, 66)
+        (68, 44)
     } else {
-        (92, 84)
+        (92, 68)
     }
 }
 
@@ -2331,7 +2331,7 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(
         Paragraph::new(header_lines)
             .style(Style::default().bg(bg))
-            .wrap(Wrap { trim: true }),
+            .wrap(Wrap { trim: false }),
         chunks[0],
     );
 
@@ -2428,7 +2428,7 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
         rows.push(Line::from(line_spans));
     }
 
-    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: true }), chunks[2]);
+    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), chunks[2]);
 
     let footer = Line::from(vec![
         Span::styled(" [1-6]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
@@ -2445,7 +2445,7 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(
         Paragraph::new(footer)
             .style(Style::default().bg(bg))
-            .wrap(Wrap { trim: true }),
+            .wrap(Wrap { trim: false }),
         chunks[3],
     );
 }
