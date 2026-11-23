@@ -363,6 +363,10 @@ impl Default for Config {
     }
 }
 
+/// Built-in public MyAnimeList mobile API Client ID enabling zero-config `[u]` Username sync
+/// and `[p]` Direct Username + Password login without requiring developer app registration.
+pub const DEFAULT_MAL_CLIENT_ID: &str = "6114d00ca681b7701d1e15fe11a4987e";
+
 /// Optional user/app OAuth2 Client IDs for tracker APIs
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TrackersConfig {
@@ -373,12 +377,18 @@ pub struct TrackersConfig {
 }
 
 impl TrackersConfig {
-    /// Resolve MAL OAuth Client ID (env var overrides config.toml).
-    pub fn resolved_mal_client_id(&self) -> Option<String> {
+    /// Return a user-configured or env-overridden custom MAL OAuth Client ID, if any.
+    pub fn custom_mal_client_id(&self) -> Option<String> {
         std::env::var("SOLUS_MAL_CLIENT_ID")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| self.mal_client_id.clone().filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Resolve MAL OAuth Client ID (env var -> config.toml -> built-in default).
+    pub fn resolved_mal_client_id(&self) -> Option<String> {
+        self.custom_mal_client_id()
+            .or_else(|| Some(DEFAULT_MAL_CLIENT_ID.to_string()))
     }
 
     /// Resolve AniList OAuth Client ID (env var overrides config.toml).
@@ -1126,5 +1136,15 @@ detail_ttl = 3600
         assert_eq!(Quality::P480.clamped_for_network(NetworkMode::CongestedWifi), Quality::P480);
         assert_eq!(Quality::P720.clamped_for_network(NetworkMode::UltraSaver), Quality::P480);
         assert_eq!(Quality::P360.clamped_for_network(NetworkMode::UltraSaver), Quality::P360);
+    }
+
+    #[test]
+    fn test_resolved_mal_client_id_defaults_to_builtin() {
+        let trackers = TrackersConfig::default();
+        assert_eq!(trackers.custom_mal_client_id(), None);
+        assert_eq!(
+            trackers.resolved_mal_client_id().as_deref(),
+            Some(DEFAULT_MAL_CLIENT_ID)
+        );
     }
 }

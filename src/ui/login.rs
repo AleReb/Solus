@@ -290,7 +290,7 @@ fn render_live_trackers_view(
         cards[1],
         TrackerProvider::Mal,
         &state.auth.mal,
-        cfg.trackers.resolved_mal_client_id().is_some(),
+        cfg.trackers.custom_mal_client_id().is_some(),
         mal_count,
         state.account_focus_provider == TrackerProvider::Mal,
         theme,
@@ -432,21 +432,74 @@ fn render_provider_card(
     let write_cap = if account.has_write_token() {
         ("LIVE Two-Way Database Sync ✓", EMERALD)
     } else if account.username.is_some() {
-        ("Read-Only (Connect [o] OAuth for Live Writeback)", AMBER)
-    } else {
-        ("Idle — Link via [o] Browser or [u] Username", MUTED)
-    };
-    let cid_status = if has_client_id {
-        ("Configured ✓", EMERALD)
+        match provider {
+            TrackerProvider::Mal => ("Read-Only (Press [p] Password Login for 2-Way Sync)", AMBER),
+            TrackerProvider::AniList => ("Read-Only (Connect [o] OAuth for Live Writeback)", AMBER),
+        }
     } else {
         match provider {
-            TrackerProvider::AniList => ("Optional ([k] Client ID / [t] Token)", MUTED),
-            TrackerProvider::Mal => ("Needed for OAuth ([k] Set MAL Client ID)", AMBER),
+            TrackerProvider::Mal => ("Idle — Press [p] Password Login or [u] Username", MUTED),
+            TrackerProvider::AniList => ("Idle — Link via [o] Browser or [u] Username", MUTED),
+        }
+    };
+    let cid_status = match provider {
+        TrackerProvider::Mal => {
+            if has_client_id {
+                ("Custom OAuth ID Configured ✓", EMERALD)
+            } else {
+                ("Built-In ✓ (Ready — No Client ID needed)", EMERALD)
+            }
+        }
+        TrackerProvider::AniList => {
+            if has_client_id {
+                ("Configured ✓", EMERALD)
+            } else {
+                ("Optional ([k] Client ID / [t] Token)", MUTED)
+            }
         }
     };
     let synced_str = synced_count
         .map(|c| format!("{c} entries"))
         .unwrap_or_else(|| "—".to_string());
+
+    let (action_row_1, action_row_2) = match provider {
+        TrackerProvider::Mal => (
+            Line::from(vec![
+                Span::styled(" [p]", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+                Span::styled(" Password Login  ", Style::default().fg(Color::White)),
+                Span::styled("[u]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Username  ", Style::default().fg(Color::White)),
+                Span::styled("[o]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Browser", Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [r]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Refresh         ", Style::default().fg(Color::White)),
+                Span::styled("[t]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Token     ", Style::default().fg(Color::White)),
+                Span::styled("[x]", Style::default().fg(ROSE).add_modifier(Modifier::BOLD)),
+                Span::styled(" Unlink", Style::default().fg(ROSE)),
+            ]),
+        ),
+        TrackerProvider::AniList => (
+            Line::from(vec![
+                Span::styled(" [o]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Browser OAuth  ", Style::default().fg(Color::White)),
+                Span::styled("[u]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Username  ", Style::default().fg(Color::White)),
+                Span::styled("[t]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Paste Token", Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [k]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Client ID     ", Style::default().fg(Color::White)),
+                Span::styled("[r]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" Refresh   ", Style::default().fg(Color::White)),
+                Span::styled("[x]", Style::default().fg(ROSE).add_modifier(Modifier::BOLD)),
+                Span::styled(" Unlink", Style::default().fg(ROSE)),
+            ]),
+        ),
+    };
 
     let lines = vec![
         Line::from(vec![
@@ -481,22 +534,8 @@ fn render_provider_card(
             Span::styled(format_last_sync(account.last_sync_time), Style::default().fg(CYAN)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" [o]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" Browser OAuth  ", Style::default().fg(Color::White)),
-            Span::styled("[u]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" Username  ", Style::default().fg(Color::White)),
-            Span::styled("[t]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" Paste Token", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled(" [k]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" Client ID     ", Style::default().fg(Color::White)),
-            Span::styled("[r]", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" Refresh   ", Style::default().fg(Color::White)),
-            Span::styled("[x]", Style::default().fg(ROSE).add_modifier(Modifier::BOLD)),
-            Span::styled(" Unlink", Style::default().fg(ROSE)),
-        ]),
+        action_row_1,
+        action_row_2,
     ];
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -947,6 +986,20 @@ fn render_action_drawer(frame: &mut Frame, area: Rect, state: &AppState, _theme:
                 },
             )
         }
+        AccountInputMode::MalPasswordLoginUsername => (
+            " ◆ MYANIMELIST DIRECT LOGIN (STEP 1/2: USERNAME) ".to_string(),
+            "Type your MyAnimeList username & press [Enter] to continue ([Esc] cancel)".to_string(),
+            MAL_BLUE,
+        ),
+        AccountInputMode::MalPasswordLoginPassword => (
+            format!(
+                " ◆ MYANIMELIST DIRECT LOGIN (STEP 2/2: PASSWORD FOR @{}) ",
+                state.pending_mal_login_username
+            ),
+            "Type your MAL password & press [Enter] — sent via HTTPS for tokens, never saved to disk ([Esc] cancel)"
+                .to_string(),
+            EMERALD,
+        ),
         AccountInputMode::None => return,
     };
 
@@ -965,7 +1018,9 @@ fn render_action_drawer(frame: &mut Frame, area: Rect, state: &AppState, _theme:
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let masked = if matches!(state.account_input_mode, AccountInputMode::ManualToken(_))
+    let masked = if matches!(state.account_input_mode, AccountInputMode::MalPasswordLoginPassword) {
+        "•".repeat(state.account_text_input.chars().count())
+    } else if matches!(state.account_input_mode, AccountInputMode::ManualToken(_))
         && state.account_text_input.len() > 12
     {
         format!(
@@ -1002,9 +1057,9 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &ThemeP
         match state.account_sync_tab {
             0 => vec![
                 ("Tab/←→", "Focus AL/MAL"),
-                ("o", "Browser OAuth"),
+                ("p", "MAL Password"),
                 ("u", "Username"),
-                ("k", "Client ID"),
+                ("o", "Browser OAuth"),
                 ("m", "Policy"),
                 ("a", "Auto-Both"),
                 ("r", "Refresh"),
@@ -1099,5 +1154,32 @@ mod tests {
                 .draw(|f| render_overlay(f, &state, &cfg))
                 .expect("compact hub should render without panic");
         }
+    }
+
+    #[test]
+    fn test_login_hub_mal_password_drawer_masks_password() {
+        let cfg = Config::default();
+        let mut state = AppState::new();
+        state.account_focus_provider = TrackerProvider::Mal;
+
+        // Step 1: Username entry renders clearly
+        state.account_input_mode = AccountInputMode::MalPasswordLoginUsername;
+        state.account_text_input = "my_mal_handle".to_string();
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|f| render_overlay(f, &state, &cfg)).unwrap();
+        let step1_text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(step1_text.contains("STEP 1/2: USERNAME"));
+        assert!(step1_text.contains("my_mal_handle"));
+        assert!(step1_text.contains("Built-In"));
+
+        // Step 2: Password entry masks every character with '•'
+        state.pending_mal_login_username = "my_mal_handle".to_string();
+        state.account_input_mode = AccountInputMode::MalPasswordLoginPassword;
+        state.account_text_input = "SuperSecretPass99".to_string();
+        terminal.draw(|f| render_overlay(f, &state, &cfg)).unwrap();
+        let step2_text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(step2_text.contains("STEP 2/2: PASSWORD FOR @my_mal_handle"));
+        assert!(!step2_text.contains("SuperSecretPass99"));
+        assert!(step2_text.contains("•••••••••••••••••"));
     }
 }

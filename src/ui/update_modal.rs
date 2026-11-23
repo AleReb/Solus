@@ -108,9 +108,9 @@ fn notes_for_info(info: &crate::services::updater::UpdateInfo) -> Vec<String> {
         default_current_release_notes()
     };
 
-    if notes.len() < 5 {
+    if notes.len() < 6 {
         for fallback in default_current_release_notes() {
-            if notes.len() >= 5 {
+            if notes.len() >= 6 {
                 break;
             }
             let prefix = fallback
@@ -139,9 +139,9 @@ fn push_plain_english_section(lines: &mut Vec<Line<'static>>, notes: &[String], 
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
-    for (idx, note) in notes.iter().take(5).enumerate() {
+    for (idx, note) in notes.iter().take(6).enumerate() {
         lines.push(format_plain_english_bullet(note));
-        if idx + 1 < notes.len().min(5) {
+        if idx + 1 < notes.len().min(6) {
             lines.push(Line::from(""));
         }
     }

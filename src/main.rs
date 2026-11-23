@@ -5733,6 +5733,128 @@ fn spawn_provider_username_sync(
     });
 }
 
+async fn complete_mal_authenticated_sync(
+    pool: &sqlx::SqlitePool,
+    existing: config::TrackerAccount,
+    mal_cid: Option<String>,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
+    sync_mode: &str,
+    policy: config::MergePolicy,
+    now: i64,
+) -> std::result::Result<(config::TrackerAccount, services::tracker_merge::MergeReport, ui::home::HomeData, String), String> {
+    let mc = api::mal::MalClient::with_token(mal_cid, Some(access_token.clone()));
+    let me = mc.fetch_me().await.map_err(|e| e.to_string())?;
+    let mal_entries = mc
+        .fetch_user_animelist("@me")
+        .await
+        .map_err(|e| e.to_string())?;
+    let al_public = api::anilist::AniListClient::new();
+    let (snaps, unresolved) =
+        services::tracker_merge::resolve_mal_entries_to_canonical(pool, &al_public, &mal_entries, now)
+            .await
+            .map_err(|e| e.to_string())?;
+    let report = services::tracker_merge::merge_and_reconcile(
+        pool,
+        &[config::TrackerProvider::Mal],
+        &snaps,
+        policy,
+        unresolved,
+        now,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let home = services::sync::load_cached_home_data(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let account = config::TrackerAccount {
+        token: Some(access_token),
+        refresh_token: refresh_token.or(existing.refresh_token),
+        expires_at: expires_at.or(existing.expires_at),
+        user_id: Some(me.id),
+        username: Some(me.name.clone()),
+        avatar_url: me.picture,
+        sync_mode: Some(sync_mode.to_string()),
+        last_imported_file: existing.last_imported_file,
+        last_sync_time: Some(now),
+    };
+    let msg = format!(
+        "✓ Connected MAL @{} via {} ({} entries, 2-Way Sync ✓)",
+        me.name,
+        sync_mode,
+        mal_entries.len()
+    );
+    Ok((account, report, home, msg))
+}
+
+fn spawn_mal_password_login(
+    username: String,
+    password: String,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let pool2 = pool.clone();
+    let tx2 = tx.clone();
+    let policy = state.auth.merge_policy;
+    let mal_cid = cfg.trackers.resolved_mal_client_id();
+    let existing = state.auth.mal.clone();
+
+    state.login_status = Some(format!(
+        "Signing in to MyAnimeList as @{}...",
+        username
+    ));
+
+    tokio::spawn(async move {
+        let now = unix_now();
+        let res = async {
+            let auth_client = api::mal::MalClient::new(mal_cid.clone(), None);
+            let tok = auth_client
+                .login_with_password(&username, &password)
+                .await
+                .map_err(|e| e.to_string())?;
+            let expires_at = tok.expires_in.map(|secs| now + secs);
+            complete_mal_authenticated_sync(
+                &pool2,
+                existing,
+                mal_cid,
+                tok.access_token,
+                tok.refresh_token,
+                expires_at,
+                "Direct Login",
+                policy,
+                now,
+            )
+            .await
+        }
+        .await;
+
+        match res {
+            Ok((account, report, home, summary)) => {
+                let _ = tx2
+                    .send(AppMessage::TrackerSyncCompleted {
+                        provider: config::TrackerProvider::Mal,
+                        account,
+                        report,
+                        home_data: Box::new(home),
+                        summary,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx2
+                    .send(AppMessage::TrackerSyncFailed(
+                        config::TrackerProvider::Mal,
+                        e,
+                    ))
+                    .await;
+            }
+        }
+    });
+}
+
 fn spawn_provider_token_sync(
     provider: config::TrackerProvider,
     token: String,
@@ -5794,51 +5916,20 @@ fn spawn_provider_token_sync(
                     Ok((account, report, home, msg))
                 }
                 .await,
-                config::TrackerProvider::Mal => async {
-                    let mc = api::mal::MalClient::with_token(mal_cid.clone(), Some(token.clone()));
-                    let me = mc.fetch_me().await.map_err(|e| e.to_string())?;
-                    let mal_entries = mc
-                        .fetch_user_animelist("@me")
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let al_public = api::anilist::AniListClient::new();
-                    let (snaps, unresolved) =
-                        services::tracker_merge::resolve_mal_entries_to_canonical(
-                            &pool2,
-                            &al_public,
-                            &mal_entries,
-                            now,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let report = services::tracker_merge::merge_and_reconcile(
+                config::TrackerProvider::Mal => {
+                    complete_mal_authenticated_sync(
                         &pool2,
-                        &[config::TrackerProvider::Mal],
-                        &snaps,
+                        existing,
+                        mal_cid,
+                        token,
+                        None,
+                        None,
+                        "OAuth2 Token",
                         policy,
-                        unresolved,
                         now,
                     )
                     .await
-                    .map_err(|e| e.to_string())?;
-                    let home = services::sync::load_cached_home_data(&pool2)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let account = config::TrackerAccount {
-                        token: Some(token),
-                        refresh_token: existing.refresh_token,
-                        expires_at: existing.expires_at,
-                        user_id: Some(me.id),
-                        username: Some(me.name.clone()),
-                        avatar_url: me.picture,
-                        sync_mode: Some("OAuth2 Token".into()),
-                        last_imported_file: existing.last_imported_file,
-                        last_sync_time: Some(now),
-                    };
-                    let msg = format!("✓ Connected MAL @{} via Token ({} entries)", me.name, mal_entries.len());
-                    Ok((account, report, home, msg))
                 }
-                .await,
             };
 
         match res {
@@ -6028,6 +6119,7 @@ async fn handle_login(
             KeyCode::Esc => {
                 state.account_input_mode = state::AccountInputMode::None;
                 state.account_text_input.clear();
+                state.pending_mal_login_username.clear();
             }
             KeyCode::Backspace => {
                 state.account_text_input.pop();
@@ -6036,22 +6128,44 @@ async fn handle_login(
                 state.account_text_input.push(c);
             }
             KeyCode::Enter => {
-                let input = state.account_text_input.trim().to_string();
                 let mode = state.account_input_mode;
+                if mode == state::AccountInputMode::MalPasswordLoginPassword {
+                    let raw_password = std::mem::take(&mut state.account_text_input);
+                    if raw_password.is_empty() {
+                        state.login_status = Some("! Password cannot be empty.".into());
+                        return;
+                    }
+                    let uname = std::mem::take(&mut state.pending_mal_login_username);
+                    state.account_input_mode = state::AccountInputMode::None;
+                    spawn_mal_password_login(uname, raw_password, state, pool, cfg, tx);
+                    return;
+                }
+
+                let input = state.account_text_input.trim().to_string();
                 if input.is_empty() {
                     state.login_status = Some("! Input cannot be empty.".into());
                     return;
                 }
-                state.account_input_mode = state::AccountInputMode::None;
                 state.account_text_input.clear();
                 match mode {
+                    state::AccountInputMode::MalPasswordLoginUsername => {
+                        state.pending_mal_login_username = input;
+                        state.account_input_mode = state::AccountInputMode::MalPasswordLoginPassword;
+                        state.login_status = Some(
+                            "Step 2/2: Type your MAL password & press [Enter] (never stored on disk)."
+                                .into(),
+                        );
+                    }
                     state::AccountInputMode::PublicUsername(provider) => {
+                        state.account_input_mode = state::AccountInputMode::None;
                         spawn_provider_username_sync(provider, input, state, pool, cfg, tx);
                     }
                     state::AccountInputMode::ManualToken(provider) => {
+                        state.account_input_mode = state::AccountInputMode::None;
                         spawn_provider_token_sync(provider, input, state, pool, cfg, tx);
                     }
                     state::AccountInputMode::ClientId(provider) => {
+                        state.account_input_mode = state::AccountInputMode::None;
                         match provider {
                             config::TrackerProvider::AniList => {
                                 cfg.trackers.anilist_client_id = Some(input);
@@ -6069,7 +6183,8 @@ async fn handle_login(
                             ));
                         }
                     }
-                    state::AccountInputMode::None => {}
+                    state::AccountInputMode::MalPasswordLoginPassword
+                    | state::AccountInputMode::None => {}
                 }
             }
             _ => {}
@@ -6127,14 +6242,30 @@ async fn handle_login(
         }
         _ => match state.account_sync_tab {
             0 => match key.code {
+                KeyCode::Char('p') => {
+                    state.account_focus_provider = config::TrackerProvider::Mal;
+                    state.pending_mal_login_username.clear();
+                    state.account_text_input = state.auth.mal.username.clone().unwrap_or_default();
+                    state.account_input_mode = state::AccountInputMode::MalPasswordLoginUsername;
+                    state.login_status = Some(
+                        "Step 1/2: Enter your MyAnimeList username & press [Enter].".into(),
+                    );
+                }
                 KeyCode::Char('o') => {
                     let provider = state.account_focus_provider;
                     let cid_opt = match provider {
                         config::TrackerProvider::AniList => cfg.trackers.resolved_anilist_client_id(),
-                        config::TrackerProvider::Mal => cfg.trackers.resolved_mal_client_id(),
+                        config::TrackerProvider::Mal => cfg.trackers.custom_mal_client_id(),
                     };
                     if let Some(cid) = cid_opt {
                         spawn_provider_oauth(provider, cid, state, pool, tx);
+                    } else if provider == config::TrackerProvider::Mal {
+                        state.account_input_mode = state::AccountInputMode::ClientId(provider);
+                        state.account_text_input.clear();
+                        state.login_status = Some(
+                            "Tip: Press [p] for instant MAL Username + Password Login (zero Client ID needed!), or enter a custom MAL Web Client ID."
+                                .into(),
+                        );
                     } else {
                         state.account_input_mode = state::AccountInputMode::ClientId(provider);
                         state.account_text_input.clear();
@@ -6163,7 +6294,7 @@ async fn handle_login(
                     let p = state.account_focus_provider;
                     state.account_text_input = match p {
                         config::TrackerProvider::AniList => cfg.trackers.resolved_anilist_client_id().unwrap_or_default(),
-                        config::TrackerProvider::Mal => cfg.trackers.resolved_mal_client_id().unwrap_or_default(),
+                        config::TrackerProvider::Mal => cfg.trackers.custom_mal_client_id().unwrap_or_default(),
                     };
                     state.account_input_mode = state::AccountInputMode::ClientId(p);
                 }

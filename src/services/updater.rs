@@ -60,11 +60,12 @@ pub struct LastSeenBuild {
 }
 
 const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
-    "[NEW] Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window that stays on top of other apps. How to use: Press 'p' inside the video player to turn PiP on or off, press 'Shift+P' to move it to another corner or resize it, or click [PiP:ON/OFF] and [Corner] in the Episode Launch Menu (Enter / o, or press 'w' / 'W') or Settings ('s').",
-    "[NEW] Live Video & Audio Info Card: Check your video resolution, frame rate, audio language, and stream health at a glance. How to use: Press 'i' in the player to show the info card for 6 seconds, press 'Shift+I' to keep it pinned on screen, or click [i HUD] in the Episode Launch Menu or Settings ('s').",
-    "[NEW] Auto-Fullscreen on Launch: Automatically open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s'), or click [AutoFS:ON/OFF] (or press 'f') in the Episode Launch Menu (Enter / o).",
-    "[FIXED] Smarter Watch Queue Protection: Episodes now stay in your Watch Queue until you finish at least 90% of the episode, so closing the player early or a crash never skips ahead by accident. How to use: Press 'Q' from the home screen anytime to resume your queue right where you left off.",
-    "[NEW] Plain-English Update Summaries: Every update now shows a clear, jargon-free guide to what changed, what was fixed, and how to use it. How to use: Open Settings ('s') and select 'What's New & Release Notes' anytime.",
+    "[NEW] Effortless MyAnimeList Login & Sync: Sign in to MyAnimeList directly inside Solus with just your username and password (no developer Client ID or token copying), or sync public lists by username. How to use: Press 'L' -> 'Tab' -> 'p' for full Password Login or 'u' for Username Only.",
+    "[NEW] Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window that stays on top of other apps. How to use: Press 'p' inside the video player to toggle PiP, 'Shift+P' to move/resize corners, or click [PiP:ON/OFF] in the Episode Launch Menu ('w'/'W') or Settings ('s').",
+    "[NEW] Live Video & Audio Info Card: Check video resolution, frame rate, audio track, and stream health at a glance. How to use: Press 'i' in the player for 6 seconds, 'Shift+I' to pin it live, or click [i HUD] in the Episode Launch Menu or Settings ('s').",
+    "[NEW] Auto-Fullscreen on Launch: Automatically open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s'), or press 'f' in the Episode Launch Menu (Enter / o).",
+    "[FIXED] Smarter Watch Queue Protection: Episodes stay in your Watch Queue until you finish at least 90% of the episode, so closing early or a crash never skips ahead. How to use: Press 'Q' from Home to resume your queue.",
+    "[NEW] Plain-English Update Summaries: Every update shows a clear, jargon-free guide to what changed, what was fixed, and how to use it. How to use: Open Settings ('s') -> 'What's New & Release Notes' anytime.",
 ];
 
 /// Return plain-English release highlights for the currently running Solus build.
@@ -86,7 +87,7 @@ pub fn current_display_version_label() -> String {
     }
 }
 
-/// Translate raw GitHub Release notes or commit summaries into up to 5 plain-English,
+/// Translate raw GitHub Release notes or commit summaries into up to 6 plain-English,
 /// jargon-free bullet points prefixed with `[NEW]`, `[FIXED]`, or `[IMPROVED]`.
 pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
     let mut bullets: Vec<String> = Vec::new();
@@ -110,13 +111,13 @@ pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
             for translated in translate_note_lines(line) {
                 push_unique_bullet(&mut bullets, translated);
             }
-            if bullets.len() >= 5 {
+            if bullets.len() >= 6 {
                 break;
             }
         }
     }
 
-    bullets.truncate(5);
+    bullets.truncate(6);
     if bullets.is_empty() {
         bullets.push(
             "[IMPROVED] Faster video playback, smoother streaming, and stability improvements."
@@ -127,7 +128,7 @@ pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
 }
 
 fn push_unique_bullet(bullets: &mut Vec<String>, candidate: String) {
-    if bullets.len() >= 5 {
+    if bullets.len() >= 6 {
         return;
     }
     let norm = candidate.to_ascii_lowercase();
@@ -239,6 +240,12 @@ fn translate_note_lines(raw_line: &str) -> Vec<String> {
     let s_lower = stripped.to_ascii_lowercase();
     let mut matched = Vec::new();
 
+    if s_lower.contains("mal") && (s_lower.contains("password") || s_lower.contains("direct login") || s_lower.contains("official mal v2")) {
+        matched.push(format!(
+            "{} Effortless MyAnimeList Login & Sync: Sign in directly inside Solus with just your MAL username and password (no Client ID or token copying), or sync public lists by username. How to use: Press 'L' -> 'Tab' -> 'p' for Password Login or 'u' for Username Only.",
+            badge
+        ));
+    }
     if s_lower.contains("pip")
         || s_lower.contains("picture-in-picture")
         || s_lower.contains("picture on picture")
@@ -985,7 +992,8 @@ Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle
     #[test]
     fn test_default_release_notes_and_pip_hud_commit_translation() {
         let notes = default_current_release_notes();
-        assert_eq!(notes.len(), 5);
+        assert_eq!(notes.len(), 6);
+        assert!(notes.iter().any(|n| n.contains("MyAnimeList") && n.contains("How to use:")));
         assert!(notes.iter().any(|n| n.contains("Picture-in-Picture") && n.contains("Shift+P") && n.contains("How to use:")));
         assert!(notes.iter().any(|n| n.contains("Shift+I") && n.contains("[i HUD]") && n.contains("How to use:")));
         assert!(notes.iter().any(|n| n.contains("Auto-Fullscreen") && n.contains("How to use:")));

@@ -98,6 +98,8 @@ pub enum AccountInputMode {
     PublicUsername(crate::config::TrackerProvider),
     ManualToken(crate::config::TrackerProvider),
     ClientId(crate::config::TrackerProvider),
+    MalPasswordLoginUsername,
+    MalPasswordLoginPassword,
 }
 
 /// Mode for the interactive Watchlist Database Target Picker popup.
@@ -479,6 +481,9 @@ pub struct AppState {
 
     /// Text buffer for the active `[L]` input mode
     pub account_text_input: String,
+
+    /// Ephemeral MAL username held between step 1 (username) and step 2 (password) of `[p]` login
+    pub pending_mal_login_username: String,
 
     /// Currently awaiting browser OAuth loopback callback for this provider
     pub oauth_pending: Option<crate::config::TrackerProvider>,
@@ -928,6 +933,7 @@ impl AppState {
             account_focus_provider: crate::config::TrackerProvider::AniList,
             account_input_mode: AccountInputMode::None,
             account_text_input: String::new(),
+            pending_mal_login_username: String::new(),
             oauth_pending: None,
             oauth_cancel_tx: None,
             merge_report: None,
@@ -1419,6 +1425,7 @@ impl AppState {
         self.overlay_base = self.current_base_screen();
         self.login_token_input = String::new();
         self.account_text_input = String::new();
+        self.pending_mal_login_username = String::new();
         self.account_input_mode = AccountInputMode::None;
         self.login_status = None;
         self.account_sync_tab = 0;

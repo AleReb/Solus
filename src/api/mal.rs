@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 const MAL_API_BASE: &str = "https://api.myanimelist.net/v2";
 const MAL_OAUTH_TOKEN_URL: &str = "https://myanimelist.net/v1/oauth2/token";
+const MAL_MOBILE_AUTH_TOKEN_URL: &str = "https://api.myanimelist.net/v2/auth/token";
 
 /// Authenticated MAL user summary from `/v2/users/@me`.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,7 +54,9 @@ impl MalClient {
     pub fn new(client_id: Option<String>, access_token: Option<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
-            client_id: client_id.filter(|s| !s.trim().is_empty()),
+            client_id: client_id
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(crate::config::DEFAULT_MAL_CLIENT_ID.to_string())),
             access_token: access_token.filter(|s| !s.trim().is_empty()),
         }
     }
@@ -119,26 +122,63 @@ impl MalClient {
         Ok(resp.json::<MalTokenResponse>().await?)
     }
 
-    /// Fetch full anime list for `"@me"` (OAuth) or a public username (`X-MAL-CLIENT-ID` or Jikan fallback).
+    /// Sign in directly with a MyAnimeList username and password via official MAL mobile auth (`grant_type=password`).
+    pub async fn login_with_password(&self, username: &str, password: &str) -> Result<MalTokenResponse> {
+        let clean_user = username.trim();
+        if clean_user.is_empty() || password.is_empty() {
+            return Err(AppError::Auth(
+                "MyAnimeList username and password cannot be empty.".into(),
+            ));
+        }
+
+        let cid = self
+            .client_id
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_MAL_CLIENT_ID);
+
+        let resp = self
+            .http
+            .post(MAL_MOBILE_AUTH_TOKEN_URL)
+            .header("X-MAL-CLIENT-ID", cid)
+            .form(&[
+                ("client_id", cid),
+                ("grant_type", "password"),
+                ("username", clean_user),
+                ("password", password),
+            ])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("invalid_grant") || body.contains("Incorrect username or password") {
+                return Err(AppError::Auth(
+                    "Incorrect MyAnimeList username or password. (Use your MAL username, not email; if you use Google/Apple sign-in or 2FA, press [o] Browser Login.)".into(),
+                ));
+            }
+            return Err(AppError::Auth(format!(
+                "MyAnimeList sign-in failed ({}): {}",
+                code, body
+            )));
+        }
+        Ok(resp.json::<MalTokenResponse>().await?)
+    }
+
+    /// Fetch full anime list for `"@me"` (OAuth / direct login) or any public username via official MAL API v2.
     pub async fn fetch_user_animelist(&self, username_or_me: &str) -> Result<Vec<MalListEntry>> {
         let target = username_or_me.trim();
         if target.is_empty() {
             return Err(AppError::Auth("MyAnimeList username cannot be empty.".into()));
         }
 
-        // Prefer official MAL API v2 whenever OAuth token or Client ID is configured.
-        if self.access_token.is_some() || self.client_id.is_some() {
-            return self.fetch_official_animelist(target).await;
-        }
-
-        if target == "@me" {
+        if target == "@me" && self.access_token.is_none() {
             return Err(AppError::Auth(
-                "MyAnimeList OAuth sign-in requires a configured mal_client_id.".into(),
+                "Press [p] Password Login to sign in to MyAnimeList first.".into(),
             ));
         }
 
-        // Graceful public fallback when no MAL Client ID is configured yet.
-        self.fetch_jikan_public_animelist(target).await
+        self.fetch_official_animelist(target).await
     }
 
     async fn fetch_official_animelist(&self, username_or_me: &str) -> Result<Vec<MalListEntry>> {
@@ -153,7 +193,7 @@ impl MalClient {
             let status = resp.status();
             if status.as_u16() == 404 {
                 return Err(AppError::Auth(format!(
-                    "MyAnimeList user '{}' not found or list is private.",
+                    "MyAnimeList user '{}' was not found, or their anime list is set to Private. Tip: Press [p] Password Login to sign in directly (works on private lists too!).",
                     username_or_me
                 )));
             }
@@ -173,38 +213,6 @@ impl MalClient {
                 .map(str::to_string);
         }
 
-        Ok(out)
-    }
-
-    async fn fetch_jikan_public_animelist(&self, username: &str) -> Result<Vec<MalListEntry>> {
-        let mut out = Vec::new();
-        for page in 1..=8 {
-            let url = format!(
-                "https://api.jikan.moe/v4/users/{}/animelist?page={}",
-                username, page
-            );
-            let resp = self.http.get(&url).send().await?;
-            if !resp.status().is_success() {
-                if page == 1 {
-                    return Err(AppError::Auth(
-                        "Public MAL lookup unavailable without Client ID — configure mal_client_id in [L] -> [k], or import animelist.xml.gz in [3]."
-                            .to_string(),
-                    ));
-                }
-                break;
-            }
-            let raw: serde_json::Value = resp.json().await?;
-            let page_items = parse_jikan_page(&raw);
-            let empty = page_items.is_empty();
-            out.extend(page_items);
-            let has_next = raw
-                .pointer("/pagination/has_next_page")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !has_next || empty {
-                break;
-            }
-        }
         Ok(out)
     }
 
@@ -319,7 +327,10 @@ pub fn parse_official_mal_page(raw: &serde_json::Value) -> Vec<MalListEntry> {
             .and_then(|v| v.as_str())
             .unwrap_or("plan_to_watch");
         let progress = list_status
-            .and_then(|ls| ls.get("num_watched_episodes"))
+            .and_then(|ls| {
+                ls.get("num_episodes_watched")
+                    .or_else(|| ls.get("num_watched_episodes"))
+            })
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let score_10 = list_status
@@ -380,66 +391,6 @@ pub fn parse_official_mal_page(raw: &serde_json::Value) -> Vec<MalListEntry> {
     out
 }
 
-fn parse_jikan_page(raw: &serde_json::Value) -> Vec<MalListEntry> {
-    let Some(items) = raw.get("data").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for item in items {
-        let anime = item.get("anime").unwrap_or(item);
-        let Some(mal_id) = anime.get("mal_id").and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        let title = anime
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown Title")
-            .to_string();
-        let status_raw = item
-            .get("watching_status")
-            .or_else(|| item.get("status"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("plan_to_watch");
-        let progress = item
-            .get("episodes_watched")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let total_episodes = anime
-            .get("episodes")
-            .and_then(|v| v.as_i64())
-            .filter(|&n| n > 0);
-        let score_10 = item
-            .get("score")
-            .and_then(|v| v.as_i64())
-            .filter(|&s| s > 0);
-        let cover_url = anime
-            .pointer("/images/jpg/large_image_url")
-            .or_else(|| anime.pointer("/images/jpg/image_url"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        out.push(MalListEntry {
-            mal_id,
-            title,
-            title_english: None,
-            status: normalize_mal_status(status_raw).to_string(),
-            progress,
-            total_episodes,
-            score: score_10.map(|s| (s * 10).clamp(0, 100)),
-            format: anime
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_ascii_uppercase()),
-            season: None,
-            season_year: None,
-            genres: Vec::new(),
-            cover_url,
-            updated_at: None,
-        });
-    }
-    out
-}
-
 /// Lightweight UTC RFC3339 parser (`YYYY-MM-DDTHH:MM:SS...`) returning Unix seconds.
 pub fn parse_iso8601_unix(ts: &str) -> Option<i64> {
     if ts.len() < 19 {
@@ -486,7 +437,7 @@ mod tests {
                     "list_status": {
                         "status": "watching",
                         "score": 9,
-                        "num_watched_episodes": 15,
+                        "num_episodes_watched": 15,
                         "updated_at": "2026-11-10T12:00:00+00:00"
                     }
                 },
@@ -500,7 +451,7 @@ mod tests {
                     "list_status": {
                         "status": "plan_to_watch",
                         "score": 0,
-                        "num_watched_episodes": 0
+                        "num_watched_episodes": 7
                     }
                 }
             ],
@@ -520,6 +471,7 @@ mod tests {
         assert!(parsed[0].updated_at.is_some());
         assert_eq!(parsed[1].mal_id, 9253);
         assert_eq!(parsed[1].status, "PLANNING");
+        assert_eq!(parsed[1].progress, 7);
         assert_eq!(parsed[1].score, None);
     }
 
