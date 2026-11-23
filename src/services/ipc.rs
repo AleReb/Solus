@@ -198,6 +198,31 @@ pub fn send_set_network_mode(mode: crate::config::NetworkMode) -> bool {
     all_ok
 }
 
+/// Build mpv IPC JSON commands to toggle fullscreen mode live with an OSD confirmation toast.
+pub fn build_set_fullscreen_commands(fullscreen: bool) -> Vec<Value> {
+    let label = if fullscreen {
+        "◈ Solus: Auto-Fullscreen ON"
+    } else {
+        "◈ Solus: Auto-Fullscreen OFF"
+    };
+    vec![
+        serde_json::json!({ "command": ["set_property", "fullscreen", fullscreen] }),
+        serde_json::json!({ "command": ["show-text", label, 2500] }),
+    ]
+}
+
+/// Toggle fullscreen on any currently active mpv/IINA IPC session.
+pub fn send_set_fullscreen(fullscreen: bool) -> bool {
+    let cmds = build_set_fullscreen_commands(fullscreen);
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
 /// Parse `demuxer-cache-state` JSON object returning `(cache_duration_secs, fw_bytes)`.
 pub fn parse_demuxer_cache_state(line: &str) -> Option<(f64, u64)> {
     let parsed: Value = serde_json::from_str(line).ok()?;

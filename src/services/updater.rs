@@ -9,7 +9,7 @@
 use crate::error::{AppError, Result};
 use crate::AppMessage;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
@@ -36,14 +36,460 @@ pub struct GitHubRelease {
 }
 
 /// Metadata about an available update.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub download_url: String,
     pub asset_name: String,
     pub release_notes: Option<String>,
+    #[serde(default)]
+    pub simple_notes: Vec<String>,
     pub is_homebrew: bool,
+}
+
+/// Persisted state tracking the last seen build SHA/version and any pending Post-Update "What's New" popup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastSeenBuild {
+    pub last_seen_sha: String,
+    pub last_seen_version: String,
+    #[serde(default)]
+    pub pending_whats_new: Vec<String>,
+    #[serde(default)]
+    pub updated_to_label: Option<String>,
+}
+
+const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
+    "[NEW] Added an Auto-Fullscreen setting in the Control Hub so your video player can open in fullscreen automatically.",
+    "[FIXED] Episodes now stay in your watch queue until you finish at least 90% of the episode, so closing the player early never skips ahead.",
+    "[NEW] Added clear, jargon-free update summaries during and after updates so you always know what changed and what was fixed.",
+    "[IMPROVED] Smoother video streaming that automatically adjusts quality on slow Wi-Fi to prevent mid-episode buffering.",
+];
+
+/// Return plain-English release highlights for the currently running Solus build.
+pub fn default_current_release_notes() -> Vec<String> {
+    BUILTIN_CURRENT_RELEASE_NOTES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Return a readable display label for the currently running binary version.
+pub fn current_display_version_label() -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    let sha = current_build_sha();
+    if sha != "unknown" && !sha.is_empty() {
+        format!("v{} ({})", ver, short_sha(sha))
+    } else {
+        format!("v{}", ver)
+    }
+}
+
+/// Translate raw GitHub Release notes or commit summaries into up to 5 plain-English,
+/// jargon-free bullet points prefixed with `[NEW]`, `[FIXED]`, or `[IMPROVED]`.
+pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
+    let mut bullets: Vec<String> = Vec::new();
+
+    if let (Some(start_idx), Some(end_idx)) = (
+        raw_body.find("<!-- solus-notes-start -->"),
+        raw_body.find("<!-- solus-notes-end -->"),
+    ) {
+        let inner_start = start_idx + "<!-- solus-notes-start -->".len();
+        if inner_start < end_idx {
+            for line in raw_body[inner_start..end_idx].lines() {
+                if let Some(translated) = translate_single_note_line(line) {
+                    push_unique_bullet(&mut bullets, translated);
+                }
+            }
+        }
+    }
+
+    if bullets.is_empty() {
+        for line in raw_body.lines() {
+            if let Some(translated) = translate_single_note_line(line) {
+                push_unique_bullet(&mut bullets, translated);
+            }
+            if bullets.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    bullets.truncate(5);
+    if bullets.is_empty() {
+        bullets.push(
+            "[IMPROVED] Faster video playback, smoother streaming, and stability improvements."
+                .to_string(),
+        );
+    }
+    bullets
+}
+
+fn push_unique_bullet(bullets: &mut Vec<String>, candidate: String) {
+    if bullets.len() >= 5 {
+        return;
+    }
+    let norm = candidate.to_ascii_lowercase();
+    if !bullets.iter().any(|b| b.to_ascii_lowercase() == norm) {
+        bullets.push(candidate);
+    }
+}
+
+fn translate_single_note_line(raw_line: &str) -> Option<String> {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("<!--")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("Full Changelog")
+        || trimmed.starts_with("**Full Changelog**")
+    {
+        return None;
+    }
+
+    let mut line = trimmed
+        .trim_start_matches(['-', '*', '+', '•'])
+        .trim();
+    if let Some((num, rest)) = line.split_once('.') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            line = rest.trim();
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+
+    // Strip automated rolling release wrapper: "Automated build for commit `abcd123`: <msg>"
+    if let Some(rest) = line.strip_prefix("Automated build for commit") {
+        if let Some((_, msg)) = rest.split_once(':') {
+            line = msg.trim();
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+
+    for prefix in ["Simple:", "simple:", "Note:", "note:"] {
+        if let Some(custom) = line.strip_prefix(prefix) {
+            let clean = custom.trim();
+            if !clean.is_empty() {
+                if clean.starts_with("[NEW]")
+                    || clean.starts_with("[FIXED]")
+                    || clean.starts_with("[IMPROVED]")
+                {
+                    return Some(ensure_period(clean));
+                }
+                return Some(format!("[IMPROVED] {}", ensure_period(clean)));
+            }
+        }
+    }
+
+    for badge in ["[NEW]", "[FIXED]", "[IMPROVED]"] {
+        if let Some(rest) = line.strip_prefix(badge) {
+            let cleaned = strip_github_trailers(rest.trim());
+            if !cleaned.is_empty() {
+                return Some(format!("{} {}", badge, ensure_period(&cleaned)));
+            }
+        }
+    }
+
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("merge pull request")
+        || lower.starts_with("merge branch")
+        || lower.starts_with("chore")
+        || lower.starts_with("ci:")
+        || lower.starts_with("ci(")
+        || lower.starts_with("test:")
+        || lower.starts_with("test(")
+        || lower.starts_with("tests:")
+        || lower.starts_with("docs:")
+        || lower.starts_with("docs(")
+        || lower.starts_with("style:")
+        || lower.starts_with("build:")
+        || lower.starts_with("bump ")
+    {
+        return None;
+    }
+
+    let badge = if lower.starts_with("feat")
+        || lower.starts_with("add ")
+        || lower.starts_with("added ")
+        || lower.starts_with("introduce")
+    {
+        "[NEW]"
+    } else if lower.starts_with("fix")
+        || lower.starts_with("resolve")
+        || lower.starts_with("prevent")
+        || lower.starts_with("repair")
+        || lower.contains("bug")
+        || lower.contains("crash")
+    {
+        "[FIXED]"
+    } else {
+        "[IMPROVED]"
+    };
+
+    let stripped = strip_conventional_prefix(line);
+    let stripped = strip_github_trailers(&stripped);
+    if stripped.is_empty() {
+        return None;
+    }
+
+    let s_lower = stripped.to_ascii_lowercase();
+    if s_lower.contains("fullscreen") || s_lower.contains("auto_fullscreen") {
+        return Some(format!(
+            "{} Added an Auto-Fullscreen setting in the Control Hub so your video player can open in fullscreen automatically.",
+            badge
+        ));
+    }
+    if (s_lower.contains("queue") || s_lower.contains("que"))
+        && (s_lower.contains("90%")
+            || s_lower.contains("5%")
+            || s_lower.contains("10%")
+            || s_lower.contains("early")
+            || s_lower.contains("crash")
+            || s_lower.contains("restore")
+            || s_lower.contains("completion"))
+    {
+        return Some(format!(
+            "{} Episodes now stay in your watch queue until you finish at least 90% of the episode, so closing the player early never skips ahead.",
+            badge
+        ));
+    }
+    if (s_lower.contains("update") || s_lower.contains("release"))
+        && (s_lower.contains("plain")
+            || s_lower.contains("jargon")
+            || s_lower.contains("what's new")
+            || s_lower.contains("whats new")
+            || s_lower.contains("transparency")
+            || s_lower.contains("popup"))
+    {
+        return Some(format!(
+            "{} Added clear, jargon-free update summaries during and after updates so you always know what changed and what was fixed.",
+            badge
+        ));
+    }
+    if s_lower.contains("network_mode")
+        || s_lower.contains("auto-abr")
+        || s_lower.contains("abr")
+        || s_lower.contains("congested")
+        || s_lower.contains("readahead")
+        || s_lower.contains("rebuffer")
+    {
+        return Some(format!(
+            "{} Smoother video streaming that automatically adjusts quality on slow Wi-Fi to prevent mid-episode buffering.",
+            badge
+        ));
+    }
+    if s_lower.contains("remote") && (s_lower.contains("theme") || s_lower.contains("qr") || s_lower.contains("mobile")) {
+        return Some(format!(
+            "{} Upgraded the phone remote control with smoother playback syncing and customizable themes.",
+            badge
+        ));
+    }
+    if s_lower.contains("subtitle") || s_lower.contains("subsync") || s_lower.contains("sub-delay") || s_lower.contains(".vtt") {
+        return Some(format!(
+            "{} Cleaner, better-timed subtitles that stay in sync with voices and avoid overlapping on-screen text.",
+            badge
+        ));
+    }
+    if (s_lower.contains("audio") || s_lower.contains("dub")) && (s_lower.contains("switch") || s_lower.contains("track")) {
+        return Some(format!(
+            "{} Smoother switching between Japanese (Sub) and English (Dub) audio tracks.",
+            badge
+        ));
+    }
+    if s_lower.contains("anilist") || s_lower.contains("mal") || s_lower.contains("scrobble") || s_lower.contains("tracker") {
+        return Some(format!(
+            "{} More reliable episode progress saving and watchlist syncing with AniList and MyAnimeList.",
+            badge
+        ));
+    }
+    if s_lower.contains("cover") || s_lower.contains("thumbnail") || s_lower.contains("portrait") || s_lower.contains("banner") {
+        return Some(format!(
+            "{} Crisper anime cover art and episode thumbnails with smoother browsing.",
+            badge
+        ));
+    }
+
+    let humanized = humanize_free_text(&stripped);
+    if humanized.len() < 4 {
+        return None;
+    }
+    Some(format!("{} {}", badge, ensure_period(&humanized)))
+}
+
+fn strip_conventional_prefix(line: &str) -> String {
+    if let Some((head, tail)) = line.split_once(':') {
+        let h = head.trim().to_ascii_lowercase();
+        let known = [
+            "feat", "fix", "perf", "refactor", "ui", "audio", "playback", "queue",
+            "update", "updater", "improve", "remote", "network", "settings",
+        ];
+        if known
+            .iter()
+            .any(|k| h == *k || h.starts_with(&format!("{k}(")) || h.starts_with(&format!("{k}!")))
+        {
+            return tail.trim().to_string();
+        }
+    }
+    line.trim().to_string()
+}
+
+fn strip_github_trailers(line: &str) -> String {
+    let mut s = line.trim().to_string();
+    if let Some(idx) = s.find(" by @") {
+        s.truncate(idx);
+    }
+    if let Some(idx) = s.find(" in https://") {
+        s.truncate(idx);
+    }
+    if let Some(open) = s.rfind("(#") {
+        if s.ends_with(')') && s[open + 2..s.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+            s.truncate(open);
+        }
+    }
+    s.trim().to_string()
+}
+
+fn humanize_free_text(input: &str) -> String {
+    let mut words = Vec::new();
+    for raw_word in input.split_whitespace() {
+        let clean = raw_word.trim_matches(['`', '*']);
+        if clean.is_empty()
+            || clean.contains("src/")
+            || clean.contains(".rs")
+            || clean.contains("::")
+            || clean.starts_with("0x")
+        {
+            continue;
+        }
+        words.push(clean);
+    }
+    let joined = words.join(" ");
+    let mut chars = joined.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn ensure_period(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+/// Path to `last_seen_build.json` used to trigger the one-time Post-Update "What's New" welcome popup.
+pub fn last_seen_build_path() -> Option<PathBuf> {
+    crate::config::Config::config_dir()
+        .ok()
+        .map(|d| d.join("last_seen_build.json"))
+}
+
+/// Save plain-English release notes before restart so the next launch shows "What's New & Fixed".
+pub fn record_pending_post_update_welcome(info: &UpdateInfo) {
+    if let Some(path) = last_seen_build_path() {
+        let _ = record_pending_post_update_welcome_at(&path, info);
+    }
+}
+
+pub fn record_pending_post_update_welcome_at(path: &Path, info: &UpdateInfo) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let notes = if info.simple_notes.is_empty() {
+        simplify_release_notes(info.release_notes.as_deref().unwrap_or(""))
+    } else {
+        info.simple_notes.clone()
+    };
+    let state = LastSeenBuild {
+        last_seen_sha: current_build_sha().to_string(),
+        last_seen_version: info.latest_version.clone(),
+        pending_whats_new: notes,
+        updated_to_label: Some(info.latest_version.clone()),
+    };
+    let json = serde_json::to_string_pretty(&state)?;
+    std::fs::write(path, json)
+}
+
+/// Consume pending Post-Update Welcome notes on startup, or detect an external upgrade (e.g. Homebrew/script).
+pub fn check_or_take_post_update_welcome() -> Option<(String, Vec<String>)> {
+    let path = last_seen_build_path()?;
+    check_or_take_post_update_welcome_at(
+        &path,
+        env!("CARGO_PKG_VERSION"),
+        current_build_sha(),
+    )
+}
+
+pub fn check_or_take_post_update_welcome_at(
+    path: &Path,
+    running_version: &str,
+    running_sha: &str,
+) -> Option<(String, Vec<String>)> {
+    let running_label = if running_sha != "unknown" && !running_sha.is_empty() {
+        format!("v{} ({})", running_version.trim_start_matches(['v', 'V']), short_sha(running_sha))
+    } else {
+        format!("v{}", running_version.trim_start_matches(['v', 'V']))
+    };
+
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        // First time creating last_seen_build.json: record current build without spamming first-run users.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let initial = LastSeenBuild {
+            last_seen_sha: running_sha.to_string(),
+            last_seen_version: running_version.to_string(),
+            pending_whats_new: Vec::new(),
+            updated_to_label: None,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&initial) {
+            let _ = std::fs::write(path, json);
+        }
+        return None;
+    };
+
+    let Ok(mut state) = serde_json::from_str::<LastSeenBuild>(&raw) else {
+        return None;
+    };
+
+    if !state.pending_whats_new.is_empty() {
+        let notes = std::mem::take(&mut state.pending_whats_new);
+        let label = state
+            .updated_to_label
+            .take()
+            .unwrap_or_else(|| running_label.clone());
+        state.last_seen_sha = running_sha.to_string();
+        state.last_seen_version = running_version.to_string();
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+        return Some((label, notes));
+    }
+
+    let version_changed = !state.last_seen_version.is_empty()
+        && state.last_seen_version.trim_start_matches(['v', 'V'])
+            != running_version.trim_start_matches(['v', 'V']);
+    let sha_changed = !state.last_seen_sha.is_empty()
+        && state.last_seen_sha != "unknown"
+        && running_sha != "unknown"
+        && !state.last_seen_sha.eq_ignore_ascii_case(running_sha);
+
+    if version_changed || sha_changed {
+        state.last_seen_sha = running_sha.to_string();
+        state.last_seen_version = running_version.to_string();
+        state.updated_to_label = None;
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+        return Some((running_label, default_current_release_notes()));
+    }
+
+    None
 }
 
 /// Parse semantic version numbers into (major, minor, patch).
@@ -211,12 +657,16 @@ pub fn evaluate_release_update(
         .find(|a| a.name == target_name)
         .or_else(|| release.assets.iter().find(|a| a.name.contains("solus")))?;
 
+    let cleaned_notes = clean_release_notes(release.body);
+    let simple_notes = simplify_release_notes(cleaned_notes.as_deref().unwrap_or(""));
+
     Some(UpdateInfo {
         current_version: display_curr,
         latest_version: display_latest,
         download_url: asset.browser_download_url.clone(),
         asset_name: asset.name.clone(),
-        release_notes: clean_release_notes(release.body),
+        release_notes: cleaned_notes,
+        simple_notes,
         is_homebrew: is_homebrew_install(),
     })
 }
@@ -456,5 +906,55 @@ mod tests {
         assert!(is_homebrew_binary_path(std::path::Path::new("/opt/homebrew/Cellar/solus/1.0.7/bin/solus")));
         assert!(is_homebrew_binary_path(std::path::Path::new("/usr/local/Cellar/solus/1.0.7/bin/solus")));
         assert!(is_homebrew_binary_path(std::path::Path::new("/opt/homebrew/Caskroom/solus/1.0.7/solus")));
+    }
+
+    #[test]
+    fn test_simplify_release_notes_strips_jargon_and_formats_badges() {
+        let raw = r#"
+<!-- solus-sha:abcdef1234567890abcdef1234567890abcdef12 -->
+Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle in src/ui/settings.rs (#42)
+- fix(queue): keep episode in queue until 90% completion on early close by @dev in https://github.com/example/pr/43
+- chore: bump serde version
+- feat(updater): plain-english update transparency popup without jargon
+"#;
+        let notes = simplify_release_notes(raw);
+        assert!(notes.len() >= 3);
+        assert!(notes.iter().any(|n| n.starts_with("[NEW]") && n.contains("Auto-Fullscreen")));
+        assert!(notes.iter().any(|n| n.starts_with("[FIXED]") && n.contains("90%")));
+        assert!(notes.iter().any(|n| n.starts_with("[NEW]") && n.contains("jargon-free")));
+        for n in &notes {
+            assert!(!n.contains("src/"), "file path leaked: {n}");
+            assert!(!n.contains("serde"), "chore/jargon leaked: {n}");
+            assert!(!n.contains("#43"), "PR trailer leaked: {n}");
+        }
+    }
+
+    #[test]
+    fn test_post_update_welcome_persistence_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("last_seen_build.json");
+
+        // First launch initializes file without showing popup
+        assert!(check_or_take_post_update_welcome_at(&path, "1.0.7", "1111111").is_none());
+        assert!(path.exists());
+
+        // Recording an update stores plain-English summary for next launch
+        let info = UpdateInfo {
+            current_version: "1.0.7".to_string(),
+            latest_version: "v1.0.8".to_string(),
+            download_url: "https://example.com/solus".to_string(),
+            asset_name: "solus".to_string(),
+            release_notes: None,
+            simple_notes: vec!["[NEW] Auto-Fullscreen added.".to_string()],
+            is_homebrew: false,
+        };
+        record_pending_post_update_welcome_at(&path, &info).unwrap();
+
+        let (label, notes) = check_or_take_post_update_welcome_at(&path, "1.0.8", "2222222").unwrap();
+        assert_eq!(label, "v1.0.8");
+        assert_eq!(notes, vec!["[NEW] Auto-Fullscreen added.".to_string()]);
+
+        // Subsequent launch does not re-show the same popup
+        assert!(check_or_take_post_update_welcome_at(&path, "1.0.8", "2222222").is_none());
     }
 }

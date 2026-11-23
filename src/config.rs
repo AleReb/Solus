@@ -328,6 +328,9 @@ pub struct Config {
     /// Enable automatic HLS ladder downshift on sustained buffering/stalls
     #[serde(default = "default_true")]
     pub auto_abr_downshift: bool,
+    /// Automatically launch the external video player (mpv / IINA / VLC) in fullscreen mode
+    #[serde(default)]
+    pub auto_fullscreen: bool,
 }
 
 impl Default for Config {
@@ -351,6 +354,7 @@ impl Default for Config {
             network_mode:     NetworkMode::Normal,
             force_ipv4:       false,
             auto_abr_downshift: true,
+            auto_fullscreen:  false,
         }
     }
 }
@@ -978,6 +982,7 @@ mod tests {
             network_mode:     NetworkMode::CongestedWifi,
             force_ipv4:       true,
             auto_abr_downshift: false,
+            auto_fullscreen:  true,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -991,6 +996,7 @@ mod tests {
         assert_eq!(deserialized.network_mode,     NetworkMode::CongestedWifi);
         assert!(deserialized.force_ipv4);
         assert!(!deserialized.auto_abr_downshift);
+        assert!(deserialized.auto_fullscreen);
     }
 
     #[test]

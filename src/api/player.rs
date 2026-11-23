@@ -50,6 +50,9 @@ pub struct PlayOptions {
     /// Force IPv4 socket binding for player / ytdl network requests
     #[serde(default)]
     pub force_ipv4: bool,
+    /// Launch external video player in fullscreen mode automatically
+    #[serde(default)]
+    pub auto_fullscreen: bool,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -505,6 +508,16 @@ if [ -n "$SOLUS_SHADERS" ]; then
     fi
 fi
 
+if [ "$SOLUS_AUTO_FULLSCREEN" = "1" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-fullscreen=yes")
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=("--fullscreen")
+    else
+        args+=("--fullscreen=yes")
+    fi
+fi
+
 if [ "$is_vlc" -eq 1 ]; then
     vlc_args=("--play-and-exit" "--no-video-title-show")
     item_opts=()
@@ -780,6 +793,9 @@ pub fn build_mpv_direct_args(
         "--referrer=https://zokoanime.video/".to_string(),
         "--input-terminal=no".to_string(),
     ];
+    if opts.auto_fullscreen {
+        args.push("--fullscreen=yes".to_string());
+    }
     args.extend(mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file));
 
     if let Some(conf_path) = youtube_conf {
@@ -911,6 +927,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // --play-and-exit ensures VLC immediately quits when playback finishes or the window is closed
                 cmd.arg("--play-and-exit");
                 cmd.arg("--no-video-title-show");
+                if opts.auto_fullscreen {
+                    cmd.arg("--fullscreen");
+                }
                 cmd.arg(format!("--meta-title={} Episode {}", opts.title, opts.episode));
                 cmd.arg("--http-referrer=https://zokoanime.video/");
                 cmd.arg("--http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
@@ -949,6 +968,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--no-stdin");
                 cmd.arg("--mpv-ytdl=no");
                 cmd.arg("--mpv-force-window=immediate");
+                if opts.auto_fullscreen {
+                    cmd.arg("--mpv-fullscreen=yes");
+                }
                 for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file) {
                     cmd.arg(format!("--mpv-{}", net_flag.trim_start_matches("--")));
                 }
@@ -1057,6 +1079,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
             }
 
             cmd.env("SOLUS_REAL_PLAYER", &player);
+            cmd.env("SOLUS_AUTO_FULLSCREEN", if opts.auto_fullscreen { "1" } else { "0" });
             if opts.dub {
                 cmd.env("SOLUS_AUDIO_DUB", "1");
             } else {
@@ -1153,6 +1176,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     } else {
         cmd.env("SOLUS_AUDIO_DUB", "0");
     }
+    cmd.env("SOLUS_AUTO_FULLSCREEN", if opts.auto_fullscreen { "1" } else { "0" });
     if let Some(ref script_path) = audio_script {
         cmd.env("SOLUS_AUDIO_SCRIPT", script_path);
     }
@@ -1173,15 +1197,24 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     if player.contains("iina") {
         player_flags.push("--keep-running".to_string());
         player_flags.push("--no-stdin".to_string());
+        if opts.auto_fullscreen {
+            player_flags.push("--mpv-fullscreen=yes".to_string());
+        }
     } else if player.to_lowercase().contains("vlc") {
         player_flags.push("--play-and-exit".to_string());
         player_flags.push("--no-video-title-show".to_string());
+        if opts.auto_fullscreen {
+            player_flags.push("--fullscreen".to_string());
+        }
         player_flags.push(format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()));
         if opts.force_ipv4 {
             player_flags.push("--ipv4".to_string());
         }
     } else {
         player_flags.push("--input-terminal=no".to_string());
+        if opts.auto_fullscreen {
+            player_flags.push("--fullscreen=yes".to_string());
+        }
         for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, false) {
             if !net_flag.contains(' ') {
                 player_flags.push(net_flag);
@@ -1313,6 +1346,7 @@ mod tests {
             subtitles_disabled: false,
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
         }
     }
 
@@ -1379,6 +1413,7 @@ mod tests {
             subtitles_disabled: false,
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
         });
         assert_eq!(
             args,
@@ -1417,6 +1452,7 @@ mod tests {
             subtitles_disabled: false,
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
         });
         assert_eq!(
             args,
@@ -1568,5 +1604,22 @@ mod tests {
         let cli_args = build_args(&o);
         let q_pos = cli_args.iter().position(|a| a == "-q").unwrap();
         assert_eq!(cli_args[q_pos + 1], "720p");
+    }
+
+    #[test]
+    fn test_auto_fullscreen_mpv_flags_and_wrapper_script() {
+        let mut o = opts("Frieren", 1, "1080p", false);
+        let windowed = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
+        assert!(!windowed.contains(&"--fullscreen=yes".to_string()));
+
+        o.auto_fullscreen = true;
+        let fullscreen = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
+        assert!(fullscreen.contains(&"--fullscreen=yes".to_string()));
+
+        let wrapper = ensure_player_wrapper("mpv").unwrap();
+        let script = std::fs::read_to_string(wrapper).unwrap();
+        assert!(script.contains("SOLUS_AUTO_FULLSCREEN"));
+        assert!(script.contains("--fullscreen=yes"));
+        assert!(script.contains("--mpv-fullscreen=yes"));
     }
 }

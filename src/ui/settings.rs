@@ -51,9 +51,11 @@ pub enum HubActionId {
     RemoteTheme,
     RemoteArtMode,
     Anime4kMode,
+    AutoFullscreen,
     AmbilightGlow,
     AutoSkipIntro,
     CheckUpdates,
+    WhatsNewNotes,
     AutoUpdateMode,
     HealthDoctor,
     AniListSync,
@@ -182,6 +184,16 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         },
 
         // ── 2. VISUAL & PLAYBACK ENGINE ───────────────────────────────────────
+        HubItem {
+            id: HubActionId::AutoFullscreen,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Auto-Fullscreen on Launch",
+            keywords: "fullscreen fs cinema launch window maximize player mpv iina vlc",
+            badge: if cfg.auto_fullscreen { "[✓] Enabled".into() } else { "[ ] Disabled".into() },
+            description: "Automatically enter fullscreen mode when launching mpv, IINA, or VLC, and toggle any currently open mpv window live via IPC.",
+            kind: HubActionKind::Toggle(cfg.auto_fullscreen),
+        },
         HubItem {
             id: HubActionId::Anime4kMode,
             cat_idx: 2,
@@ -337,6 +349,16 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
             },
             description: "Query GitHub Releases for newer Solus binary versions or Homebrew upgrade notifications.",
             kind: HubActionKind::Execute("Check Releases"),
+        },
+        HubItem {
+            id: HubActionId::WhatsNewNotes,
+            cat_idx: 5,
+            category: "❖ SYSTEM & MAINTENANCE",
+            label: "What's New & Release Notes",
+            keywords: "whats new release notes changelog update fixes features plain english",
+            badge: "[ View Notes ]".into(),
+            description: "Open a plain-English, jargon-free popup summarizing what is new, improved, and fixed in this version of Solus.",
+            kind: HubActionKind::Launch("Open What's New"),
         },
         HubItem {
             id: HubActionId::AutoUpdateMode,
@@ -1080,6 +1102,26 @@ fn render_inspector_card(
                         cfg.subtitle_style.border_size
                     ),
                     Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        HubActionId::AutoFullscreen => {
+            lines.push(Line::from(vec![
+                Span::styled("Player Flag: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    match cfg.player {
+                        config::Player::Mpv => "--fullscreen=yes (live IPC synced)",
+                        config::Player::Iina => "--mpv-fullscreen=yes",
+                        config::Player::Vlc => "--fullscreen",
+                    },
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Shortcut   : ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    "Press [f] inside the player anytime to toggle fullscreen",
+                    Style::default().fg(theme.accent),
                 ),
             ]));
         }

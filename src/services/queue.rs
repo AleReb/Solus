@@ -25,6 +25,10 @@ use std::{
 /// Short 3-minute freshness window for near-EOF pre-resolved CDN stream links.
 pub const PREFETCH_TTL_SECS: u64 = 180;
 
+/// Episode completion ratio (90% watched / 10% remaining) required before an active
+/// queued episode is considered finished and permanently removed from the queue.
+pub const QUEUE_COMPLETION_THRESHOLD: f64 = 0.90;
+
 /// Fixed monochrome status label for a queued item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefetchStatus {
@@ -199,11 +203,22 @@ impl QueueItem {
 }
 
 /// Metadata tracking the currently playing episode (whether started from queue or directly).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveNowItem {
-    pub item:            QueueItem,
-    pub used_prefetched: bool,
-    pub retried_once:    bool,
+    pub item:               QueueItem,
+    #[serde(default)]
+    pub used_prefetched:    bool,
+    #[serde(default)]
+    pub retried_once:       bool,
+    /// True when this playback session was launched from the Session Queue / Playlist.
+    #[serde(default)]
+    pub from_queue:         bool,
+    /// True once playback reached >= 90% (`QUEUE_COMPLETION_THRESHOLD`) or natural EOF.
+    #[serde(default)]
+    pub completion_reached: bool,
+    /// Latest observed `pos / duration` ratio (`0.0 ..= 1.0`).
+    #[serde(default)]
+    pub progress_ratio:     f64,
 }
 
 /// Result returned when inserting an item into the queue.
@@ -226,7 +241,7 @@ pub struct WatchQueue {
     pub manual_stop:  bool,
     #[serde(skip)]
     pub next_uid:     u64,
-    #[serde(skip)]
+    #[serde(default)]
     pub active_item:  Option<ActiveNowItem>,
 }
 
@@ -263,7 +278,20 @@ impl WatchQueue {
     }
 
     /// Re-assign monotonic unique IDs and clear transient flags after deserialization.
+    /// If the previous session crashed mid-episode while playing a queued item before 90%
+    /// completion, restore it to index `0` so the user can pick up right where they left off.
     pub fn normalize_uids(&mut self) {
+        if let Some(active) = self.active_item.take() {
+            if active.from_queue && !active.completion_reached {
+                self.items.retain(|existing| {
+                    !(existing.anime_id == active.item.anime_id
+                        && existing.episode == active.item.episode)
+                });
+                let mut restored = active.item;
+                restored.resolving = false;
+                self.items.push_front(restored);
+            }
+        }
         self.next_uid = 1;
         for item in &mut self.items {
             item.uid = self.next_uid;
@@ -272,7 +300,59 @@ impl WatchQueue {
             item.resolving = false;
         }
         self.manual_stop = false;
-        self.active_item = None;
+    }
+
+    /// Update live playback completion progress for the currently active episode.
+    /// Returns `true` the first time the episode crosses `QUEUE_COMPLETION_THRESHOLD` (90%).
+    pub fn record_active_progress(
+        &mut self,
+        anime_id: i64,
+        episode: u32,
+        pos: f64,
+        duration: f64,
+    ) -> bool {
+        let Some(ref mut active) = self.active_item else {
+            return false;
+        };
+        if active.item.anime_id != anime_id || active.item.episode != episode || duration < 60.0 {
+            return false;
+        }
+        let ratio = (pos / duration).clamp(0.0, 1.0);
+        if ratio > active.progress_ratio {
+            active.progress_ratio = ratio;
+        }
+        if !active.completion_reached && active.progress_ratio >= QUEUE_COMPLETION_THRESHOLD {
+            active.completion_reached = true;
+            return true;
+        }
+        false
+    }
+
+    /// Mark the currently active item as completed (e.g., on natural EOF).
+    pub fn mark_active_completed(&mut self) {
+        if let Some(ref mut active) = self.active_item {
+            active.completion_reached = true;
+            active.progress_ratio = active.progress_ratio.max(1.0);
+        }
+    }
+
+    /// If an episode launched from the queue closed early or crashed before reaching 90%
+    /// completion, restore it to the front (`index 0`) of the queue so it can be resumed easily.
+    pub fn restore_unfinished_active_to_front(&mut self) -> Option<QueueItem> {
+        let active = self.active_item.take()?;
+        if !active.from_queue || active.completion_reached {
+            return None;
+        }
+        self.items.retain(|existing| {
+            !(existing.anime_id == active.item.anime_id
+                && existing.episode == active.item.episode)
+        });
+        let mut restored = active.item;
+        restored.uid = self.alloc_uid();
+        restored.spec_version = restored.spec_version.max(1);
+        restored.resolving = false;
+        self.items.push_front(restored.clone());
+        Some(restored)
     }
 
     /// Append to tail unless an identical `(anime_id, episode)` is already queued (in which case refresh metadata).
@@ -386,15 +466,17 @@ impl WatchQueue {
         }
     }
 
-    /// Pop the next episode to play; if `loop_mode` is active, rotate finished `active_item` to the tail.
+    /// Pop the next episode to play; if `loop_mode` is active and the active item completed, rotate it to the tail.
     pub fn pop_next_for_advance(&mut self) -> Option<QueueItem> {
         if self.loop_mode {
             if let Some(finished) = self.active_item.take() {
-                let mut recycled = finished.item;
-                recycled.uid = self.alloc_uid();
-                recycled.resolving = false;
-                recycled.prefetch = None;
-                self.items.push_back(recycled);
+                if finished.completion_reached {
+                    let mut recycled = finished.item;
+                    recycled.uid = self.alloc_uid();
+                    recycled.resolving = false;
+                    recycled.prefetch = None;
+                    self.items.push_back(recycled);
+                }
             }
         } else {
             self.active_item = None;
@@ -914,6 +996,7 @@ pub async fn resolve_item_prefetch(
         subtitles_disabled: subs_disabled,
         network_mode,
         force_ipv4,
+        auto_fullscreen: false,
     };
 
     Some(ResolvedPrefetch {
@@ -967,6 +1050,7 @@ mod tests {
                 subtitles_disabled: false,
                 network_mode: crate::config::NetworkMode::Normal,
                 force_ipv4: false,
+                auto_fullscreen: false,
             },
             resolved_at,
             sub_synced: false,
@@ -1007,6 +1091,9 @@ mod tests {
             item: first,
             used_prefetched: false,
             retried_once: false,
+            from_queue: true,
+            completion_reached: true,
+            progress_ratio: 1.0,
         });
 
         let second = q.pop_next_for_advance().unwrap();
@@ -1128,5 +1215,74 @@ mod tests {
         let applied_fresh = q.apply_prefetch_result(uid, cur_spec, Some(mk_prefetch(1_000)));
         assert!(applied_fresh);
         assert!(q.items[0].prefetch.is_some());
+    }
+
+    #[test]
+    fn test_queue_retains_item_on_early_close_and_removes_at_90_pct() {
+        let mut q = WatchQueue::default();
+        q.enqueue_back(mk_item(1, "Frieren", 1));
+        q.enqueue_back(mk_item(1, "Frieren", 2));
+
+        let first = q.pop_next_for_advance().unwrap();
+        q.active_item = Some(ActiveNowItem {
+            item: first,
+            used_prefetched: false,
+            retried_once: false,
+            from_queue: true,
+            completion_reached: false,
+            progress_ratio: 0.0,
+        });
+
+        // At 35%, episode is NOT finished; closing player restores Ep 1 to front of queue
+        assert!(!q.record_active_progress(1, 1, 500.0, 1420.0));
+        assert!(!q.active_item.as_ref().unwrap().completion_reached);
+        let restored = q.restore_unfinished_active_to_front().unwrap();
+        assert_eq!(restored.episode, 1);
+        assert_eq!(q.items.len(), 2);
+        assert_eq!(q.items[0].episode, 1);
+        assert_eq!(q.items[1].episode, 2);
+
+        // Relaunch Ep 1 and watch past 90% threshold (within 10% of completion)
+        let first_again = q.pop_next_for_advance().unwrap();
+        q.active_item = Some(ActiveNowItem {
+            item: first_again,
+            used_prefetched: false,
+            retried_once: false,
+            from_queue: true,
+            completion_reached: false,
+            progress_ratio: 0.0,
+        });
+        assert!(q.record_active_progress(1, 1, 1290.0, 1420.0));
+        assert!(q.active_item.as_ref().unwrap().completion_reached);
+        assert!(q.restore_unfinished_active_to_front().is_none());
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].episode, 2);
+    }
+
+    #[test]
+    fn test_queue_crash_recovery_restores_unfinished_active_item_on_load() {
+        let mut q = WatchQueue::default();
+        q.enqueue_back(mk_item(1, "Bebop", 5));
+        q.enqueue_back(mk_item(1, "Bebop", 6));
+
+        let active = q.pop_next_for_advance().unwrap();
+        q.active_item = Some(ActiveNowItem {
+            item: active,
+            used_prefetched: false,
+            retried_once: false,
+            from_queue: true,
+            completion_reached: false,
+            progress_ratio: 0.42,
+        });
+
+        // Simulate app crash and reload from JSON
+        let json = serde_json::to_string(&q).unwrap();
+        let mut reloaded: WatchQueue = serde_json::from_str(&json).unwrap();
+        reloaded.normalize_uids();
+
+        assert!(reloaded.active_item.is_none());
+        assert_eq!(reloaded.items.len(), 2);
+        assert_eq!(reloaded.items[0].episode, 5);
+        assert_eq!(reloaded.items[1].episode, 6);
     }
 }

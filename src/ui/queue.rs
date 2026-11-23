@@ -284,7 +284,7 @@ fn render_session_queue_pane(
 
     let now_w = now_inner.width.saturating_sub(2) as usize;
     let now_lines = if let Some(ref np) = state.now_playing {
-        let opts_summary = state
+        let mut opts_summary = state
             .last_play_options
             .as_ref()
             .map(|o| {
@@ -297,6 +297,16 @@ fn render_session_queue_pane(
                 )
             })
             .unwrap_or_else(|| "External player active".to_string());
+        if let Some(ref active) = state.queue.active_item {
+            if active.from_queue {
+                let pct = (active.progress_ratio * 100.0).round() as u32;
+                if active.completion_reached {
+                    opts_summary.push_str(&format!(" · {}% ✓ Done", pct));
+                } else {
+                    opts_summary.push_str(&format!(" · {}% (Kept until 90%)", pct));
+                }
+            }
+        }
         vec![
             Line::from(vec![
                 Span::styled(" ▶ NOW  ", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),

@@ -63,18 +63,26 @@ pub enum ProfileInputMode {
 /// Phases of the in-app self-updater modal dialog.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateModalPhase {
-    /// Update available: shows version diff, release highlights, and prompts Enter to install.
+    /// Update available: shows version diff, plain-English highlights, and prompts Enter to install.
     Available {
         info: crate::services::updater::UpdateInfo,
     },
-    /// Downloading and installing update with live progress bar.
+    /// Downloading and installing update with live progress bar and plain-English summary.
     Downloading {
+        info: Option<crate::services::updater::UpdateInfo>,
         progress_pct: f32,
         speed: String,
     },
-    /// Update successfully installed: prompts user to exit Solus and relaunch.
+    /// Update successfully installed: shows plain-English summary and prompts user to exit and relaunch.
     RestartRequired {
         new_version: String,
+        simple_notes: Vec<String>,
+    },
+    /// First launch after an update (or opened via Control Hub "What's New"):
+    /// explains what changed and what was fixed in plain, jargon-free English.
+    PostUpdateWelcome {
+        version_label: String,
+        simple_notes: Vec<String>,
     },
     /// Update failed with an error message.
     Failed {
@@ -682,6 +690,7 @@ pub struct AppState {
     pub network_mode:                crate::config::NetworkMode,
     pub force_ipv4:                  bool,
     pub auto_abr_downshift:          bool,
+    pub auto_fullscreen:             bool,
     pub live_playback:               LivePlaybackTelemetry,
     pub stream_ladder_cache:         HashMap<(i64, u32, bool), crate::api::subtitles::ResolvedStreamLadder>,
     /// Settings Control Hub v2 navigation + Remote live state
@@ -1022,6 +1031,7 @@ impl AppState {
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
             auto_abr_downshift: true,
+            auto_fullscreen: false,
             live_playback: LivePlaybackTelemetry::default(),
             stream_ladder_cache: HashMap::new(),
             settings_category: 0,
@@ -1376,6 +1386,18 @@ impl AppState {
         }
         self.available_update = Some(info.clone());
         self.update_modal_phase = Some(UpdateModalPhase::Available { info });
+        self.screen = Screen::UpdateModal;
+    }
+
+    /// Open the Post-Update "What's New & Fixed" plain-English welcome modal.
+    pub fn open_post_update_welcome(&mut self, version_label: String, simple_notes: Vec<String>) {
+        if self.screen != Screen::UpdateModal {
+            self.overlay_base = self.current_base_screen();
+        }
+        self.update_modal_phase = Some(UpdateModalPhase::PostUpdateWelcome {
+            version_label,
+            simple_notes,
+        });
         self.screen = Screen::UpdateModal;
     }
 
@@ -2071,6 +2093,7 @@ mod tests {
             download_url: "https://github.com/example/solus".to_string(),
             asset_name: "solus-windows-x86_64.exe".to_string(),
             release_notes: Some("Big launch speed upgrade".to_string()),
+            simple_notes: vec!["[IMPROVED] Faster startup.".to_string()],
             is_homebrew: false,
         };
 

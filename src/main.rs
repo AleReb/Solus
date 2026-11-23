@@ -419,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
     state.network_mode = cfg.network_mode;
     state.force_ipv4 = cfg.force_ipv4;
     state.auto_abr_downshift = cfg.auto_abr_downshift;
+    state.auto_fullscreen = cfg.auto_fullscreen;
     set_global_network_flags(cfg.network_mode, cfg.force_ipv4);
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     if let Some(pb_settings) = db::user::get_profile_playback_settings(&pool, &state.active_profile_id).await {
@@ -539,6 +540,11 @@ async fn main() -> anyhow::Result<()> {
         spawn_update_check(&pool, &tx, cfg.update.auto_install, cfg.update.check_interval, true);
     }
 
+    // ── Startup: one-time Post-Update "What's New & Fixed" welcome popup ─────
+    if let Some((ver_label, notes)) = services::updater::check_or_take_post_update_welcome() {
+        state.open_post_update_welcome(ver_label, notes);
+    }
+
     let mut needs_redraw = true;
     let mut last_screen = state.screen.clone();
     let mut last_update_poll = std::time::Instant::now();
@@ -620,22 +626,61 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Auto-advance next queued item on natural EOF / clean completion
-                    let natural_finish = natural_eof || (exited_ok && !user_quit && elapsed_secs >= 3);
-                    if natural_finish && !state.queue.manual_stop && state.queue.auto_advance {
-                        if let Some(next_item) = state.queue.pop_next_for_advance() {
-                            if state.queue_cursor >= state.queue.len() {
-                                state.queue_cursor = state.queue.len().saturating_sub(1);
+                    // Auto-advance next queued item ONLY on true natural EOF or >=90% completion.
+                    // Never jump to the next episode if the player crashed or was closed early.
+                    let active_completion_reached = active_snapshot
+                        .as_ref()
+                        .is_some_and(|a| {
+                            a.completion_reached
+                                || a.progress_ratio >= services::queue::QUEUE_COMPLETION_THRESHOLD
+                        });
+                    let active_ep = active_snapshot
+                        .as_ref()
+                        .map(|a| a.item.episode)
+                        .unwrap_or(0);
+                    let had_ipc_duration = state
+                        .selected_anime
+                        .as_ref()
+                        .and_then(|_| state.anime_progress.get(&active_ep))
+                        .is_some_and(|(_, dur)| *dur >= 60.0);
+
+                    let natural_finish = natural_eof
+                        || (active_completion_reached && !user_quit)
+                        || (!had_ipc_duration && exited_ok && !user_quit && elapsed_secs >= 900);
+
+                    if natural_finish {
+                        state.queue.mark_active_completed();
+                        if !state.queue.manual_stop && state.queue.auto_advance {
+                            if let Some(next_item) = state.queue.pop_next_for_advance() {
+                                if state.queue_cursor >= state.queue.len() {
+                                    state.queue_cursor = state.queue.len().saturating_sub(1);
+                                }
+                                let label = format!("{} · Ep {}", next_item.title, next_item.episode);
+                                state.show_toast(format!("◈ Up Next: {}", label), unix_now());
+                                play_queue_item(&mut state, next_item, false, false, &pool, &cfg, &tx).await;
+                                continue;
                             }
-                            let label = format!("{} · Ep {}", next_item.title, next_item.episode);
-                            state.show_toast(format!("◈ Up Next: {}", label), unix_now());
-                            play_queue_item(&mut state, next_item, false, false, &pool, &cfg, &tx).await;
-                            continue;
                         }
+                        state.queue.active_item = None;
+                    } else if let Some(restored) = state.queue.restore_unfinished_active_to_front() {
+                        state.queue_cursor = 0;
+                        let pct = active_snapshot
+                            .as_ref()
+                            .map(|a| (a.progress_ratio * 100.0).round() as u32)
+                            .unwrap_or(0);
+                        state.show_toast(
+                            format!(
+                                "◈ Player closed early ({}%) — {} Ep {} kept at #1 in queue to resume",
+                                pct, restored.title, restored.episode
+                            ),
+                            unix_now(),
+                        );
+                    } else {
+                        state.queue.active_item = None;
                     }
 
-                    state.queue.active_item = None;
                     services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+                    sync_remote_queue_snapshot(&state);
                     if state.screen == Screen::Playback {
                         state.screen = Screen::Detail;
                     }
@@ -1203,6 +1248,10 @@ async fn main() -> anyhow::Result<()> {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                         state.anime_progress.insert(ep, (pos, dur));
                     }
+                    if state.queue.record_active_progress(anime_id, ep, pos, dur) {
+                        services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+                        sync_remote_queue_snapshot(&state);
+                    }
                     state.live_playback.last_time_pos = pos;
                     let remote_state_clone = state.remote_state.clone();
                     let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
@@ -1311,8 +1360,9 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::UpdateProgress(pct, spd) => {
                     state.is_updating = true;
                     state.update_progress = Some((pct, spd.clone()));
-                    if matches!(state.update_modal_phase, Some(state::UpdateModalPhase::Downloading { .. })) {
+                    if let Some(state::UpdateModalPhase::Downloading { info, .. }) = state.update_modal_phase.clone() {
                         state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
+                            info: info.or_else(|| state.available_update.clone()),
                             progress_pct: pct,
                             speed: spd,
                         });
@@ -1321,9 +1371,22 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::UpdateSuccess(version) => {
                     state.is_updating = false;
                     state.update_progress = None;
+                    let simple_notes = state
+                        .available_update
+                        .as_ref()
+                        .map(|u| {
+                            services::updater::record_pending_post_update_welcome(u);
+                            if u.simple_notes.is_empty() {
+                                services::updater::default_current_release_notes()
+                            } else {
+                                u.simple_notes.clone()
+                            }
+                        })
+                        .unwrap_or_else(services::updater::default_current_release_notes);
                     state.available_update = None;
                     state.update_modal_phase = Some(state::UpdateModalPhase::RestartRequired {
                         new_version: version.clone(),
+                        simple_notes,
                     });
                     if state.screen != Screen::UpdateModal && state.screen != Screen::Playback {
                         state.overlay_base = state.current_base_screen();
@@ -1901,7 +1964,9 @@ async fn handle_update_modal(
                 KeyCode::Enter | KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if !info.is_homebrew && !state.is_updating {
                         state.is_updating = true;
+                        services::updater::record_pending_post_update_welcome(info);
                         state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
+                            info: Some(info.clone()),
                             progress_pct: 0.0,
                             speed: "Connecting...".to_string(),
                         });
@@ -1923,6 +1988,33 @@ async fn handle_update_modal(
                         });
                     }
                 }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    if !info.is_homebrew && !state.is_updating {
+                        state.is_updating = true;
+                        services::updater::record_pending_post_update_welcome(info);
+                        let client = reqwest::Client::new();
+                        let dl_url = info.download_url.clone();
+                        let target_ver = info.latest_version.clone();
+                        let tx_dl = tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = services::updater::download_and_install_update(
+                                &client,
+                                &dl_url,
+                                &target_ver,
+                                tx_dl.clone(),
+                            )
+                            .await
+                            {
+                                let _ = tx_dl.send(AppMessage::UpdateFailed(e.to_string())).await;
+                            }
+                        });
+                        state.close_update_modal();
+                        state.show_toast(
+                            format!("❖ Downloading Solus {} in background...", info.latest_version),
+                            unix_now(),
+                        );
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     state.close_update_modal();
                 }
@@ -1930,9 +2022,10 @@ async fn handle_update_modal(
             }
         }
         state::UpdateModalPhase::Downloading { .. } => {
-            if key.code == KeyCode::Esc {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B')) {
                 // Allow closing modal to background while download continues
                 state.close_update_modal();
+                state.show_toast("❖ Update download continuing quietly in background...", unix_now());
             }
         }
         state::UpdateModalPhase::RestartRequired { .. } => {
@@ -1945,6 +2038,11 @@ async fn handle_update_modal(
                     state.close_update_modal();
                 }
                 _ => {}
+            }
+        }
+        state::UpdateModalPhase::PostUpdateWelcome { .. } => {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q')) {
+                state.close_update_modal();
             }
         }
         state::UpdateModalPhase::Failed { .. } => {
@@ -3600,6 +3698,7 @@ fn spawn_update_check(
             let _ = db::sync::mark_synced(&pool_update, "update_check", now).await;
             if let Some(ref info) = update_opt {
                 if auto_install && !info.is_homebrew {
+                    services::updater::record_pending_post_update_welcome(info);
                     let download_url = info.download_url.clone();
                     let target_ver = info.latest_version.clone();
                     let tx_dl = tx_update.clone();
@@ -4534,6 +4633,7 @@ async fn handle_playback_options(
                             loading_image: None,
                             network_mode: state.network_mode,
                             force_ipv4: cfg.force_ipv4,
+                            auto_fullscreen: cfg.auto_fullscreen,
                         };
                         start_playback(state, opts, title, ep, tx, pool, cfg).await;
                     }
@@ -4852,6 +4952,18 @@ async fn execute_hub_action(
             let _ = cfg.save();
             state.show_toast(format!("❖ Anime4K: {}", modes[next].as_str()), unix_now());
         }
+        AutoFullscreen => {
+            cfg.auto_fullscreen = !cfg.auto_fullscreen;
+            state.auto_fullscreen = cfg.auto_fullscreen;
+            let _ = cfg.save();
+            services::ipc::send_set_fullscreen(cfg.auto_fullscreen);
+            let msg = if cfg.auto_fullscreen {
+                "❖ Auto-Fullscreen on Launch: Enabled"
+            } else {
+                "❖ Auto-Fullscreen on Launch: Disabled"
+            };
+            state.show_toast(msg, unix_now());
+        }
         AmbilightGlow => {
             cfg.ambilight_enabled = !cfg.ambilight_enabled;
             state.ambilight_enabled = cfg.ambilight_enabled;
@@ -4887,6 +4999,22 @@ async fn execute_hub_action(
                     let _ = tx_check.send(AppMessage::UpdateCheckResult(res)).await;
                 });
             }
+        }
+        WhatsNewNotes => {
+            let (ver_label, notes) = if let Some(ref u) = state.available_update {
+                let n = if u.simple_notes.is_empty() {
+                    services::updater::default_current_release_notes()
+                } else {
+                    u.simple_notes.clone()
+                };
+                (u.latest_version.clone(), n)
+            } else {
+                (
+                    services::updater::current_display_version_label(),
+                    services::updater::default_current_release_notes(),
+                )
+            };
+            state.open_post_update_welcome(ver_label, notes);
         }
         AutoUpdateMode => {
             let next = if !cfg.update.check_on_startup {
@@ -6928,12 +7056,14 @@ async fn play_queue_item(
             loading_image: None,
             network_mode: state.network_mode,
             force_ipv4: cfg.force_ipv4,
+            auto_fullscreen: cfg.auto_fullscreen,
         });
 
     opts.ipc_socket = None;
     opts.loading_image = None;
     opts.network_mode = state.network_mode;
     opts.force_ipv4 = cfg.force_ipv4;
+    opts.auto_fullscreen = cfg.auto_fullscreen;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -6945,6 +7075,9 @@ async fn play_queue_item(
         item: item.clone(),
         used_prefetched: actually_prefetched,
         retried_once,
+        from_queue: true,
+        completion_reached: false,
+        progress_ratio: 0.0,
     });
     state.queue.manual_stop = false;
 
@@ -8970,6 +9103,7 @@ async fn launch_remote_stream_switch(
         loading_image: None,
         network_mode: state.network_mode,
         force_ipv4: cfg.force_ipv4,
+        auto_fullscreen: cfg.auto_fullscreen,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
 }
@@ -9009,6 +9143,7 @@ async fn start_playback(
     }
 
     let mut opts = opts;
+    opts.auto_fullscreen = cfg.auto_fullscreen;
     state.last_play_options = Some(opts.clone());
     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
     let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
@@ -9023,8 +9158,15 @@ async fn start_playback(
         .as_ref()
         .is_none_or(|a| a.item.anime_id != anime_id || a.item.episode != episode)
     {
-        state.queue.active_item = Some(services::queue::ActiveNowItem {
-            item: services::queue::QueueItem::new(
+        let matched_front = state
+            .queue
+            .items
+            .front()
+            .is_some_and(|head| head.anime_id == anime_id && head.episode == episode);
+        let queue_item = if matched_front {
+            state.queue.items.pop_front().unwrap()
+        } else {
+            services::queue::QueueItem::new(
                 anime_id,
                 mal_for_queue,
                 season_year,
@@ -9035,9 +9177,15 @@ async fn start_playback(
                 opts.dub,
                 opts.sub_lang.clone().unwrap_or_else(|| cfg.default_sub_lang.clone()),
                 opts.player.clone(),
-            ),
+            )
+        };
+        state.queue.active_item = Some(services::queue::ActiveNowItem {
+            item: queue_item,
             used_prefetched: false,
             retried_once: false,
+            from_queue: matched_front,
+            completion_reached: false,
+            progress_ratio: 0.0,
         });
     }
     let era = services::shaders::AnimeEra::from_year(season_year);
@@ -9060,7 +9208,7 @@ async fn start_playback(
     // 2. Exact timestamp resume from saved progress
     if opts.start_pos.is_none() {
         if let Ok(Some((pos, dur))) = db::user::get_playback_progress(pool, anime_id, episode).await {
-            if pos > 10.0 && (dur <= 0.0 || pos / dur < 0.85) {
+            if pos > 10.0 && (dur <= 0.0 || pos / dur < services::queue::QUEUE_COMPLETION_THRESHOLD) {
                 opts.start_pos = Some(pos);
                 state.show_toast(
                     format!("❖ Resuming Ep {} at {:02}:{:02}", episode, (pos as u64) / 60, (pos as u64) % 60),
