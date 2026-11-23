@@ -60,12 +60,10 @@ pub struct LastSeenBuild {
 }
 
 const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
-    "[NEW] Effortless MyAnimeList Login & Sync: Sign in to MyAnimeList directly inside Solus with just your username and password (no developer Client ID or token copying), or sync public lists by username. How to use: Press 'L' -> 'Tab' -> 'p' for full Password Login or 'u' for Username Only.",
-    "[NEW] Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window that stays on top of other apps. How to use: Press 'p' inside the video player to toggle PiP, 'Shift+P' to move/resize corners, or click [PiP:ON/OFF] in the Episode Launch Menu ('w'/'W') or Settings ('s').",
-    "[NEW] Live Video & Audio Info Card: Check video resolution, frame rate, audio track, and stream health at a glance. How to use: Press 'i' in the player for 6 seconds, 'Shift+I' to pin it live, or click [i HUD] in the Episode Launch Menu or Settings ('s').",
-    "[NEW] Auto-Fullscreen on Launch: Automatically open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s'), or press 'f' in the Episode Launch Menu (Enter / o).",
-    "[FIXED] Smarter Watch Queue Protection: Episodes stay in your Watch Queue until you finish at least 90% of the episode, so closing early or a crash never skips ahead. How to use: Press 'Q' from Home to resume your queue.",
-    "[NEW] Plain-English Update Summaries: Every update shows a clear, jargon-free guide to what changed, what was fixed, and how to use it. How to use: Open Settings ('s') -> 'What's New & Release Notes' anytime.",
+    "[NEW] Direct MyAnimeList Sign-In (Zero Setup Required): Connect your MyAnimeList account directly inside Solus using just your username and password for full two-way syncing, or pull any public list by username alone. How to use: Press 'L' from the Home screen, press 'Tab' to focus MyAnimeList, then press 'p' for Password Login or 'u' for Username Sync.",
+    "[FIXED] Full AniList & MyAnimeList Library Sync: My Watchlist now pulls every anime from your connected AniList and MyAnimeList accounts across all 5 categories (Watching, Plan to Watch, Completed, On-Hold, and Dropped) so zero shows are left behind. How to use: Press 'R' on the Home screen (or 'r' inside 'L') to refresh your lists.",
+    "[NEW] Status Labels on Watchlist Cards: Every anime in My Watchlist now shows its status tag ( Watch, 󰃰 Plan, 󰄬 Done, 󰏤 Hold, 󰅖 Drop) right next to its rating and show type. How to use: Press '2' on the Home screen to jump directly to My Watchlist.",
+    "[NEW] Status & List Picker Popup: Label or move any anime between Watching, Plan to Watch, Completed, On-Hold, Dropped, or Remove across AniList, MyAnimeList, Both, or Local in one step. How to use: Highlight any anime and press '+' -> use 'Tab' or '←/→' to choose where to save, then press '1'–'6' (or '↑/↓' + 'Enter') to apply.",
 ];
 
 /// Return plain-English release highlights for the currently running Solus build.
@@ -242,7 +240,13 @@ fn translate_note_lines(raw_line: &str) -> Vec<String> {
 
     if s_lower.contains("mal") && (s_lower.contains("password") || s_lower.contains("direct login") || s_lower.contains("official mal v2")) {
         matched.push(format!(
-            "{} Effortless MyAnimeList Login & Sync: Sign in directly inside Solus with just your MAL username and password (no Client ID or token copying), or sync public lists by username. How to use: Press 'L' -> 'Tab' -> 'p' for Password Login or 'u' for Username Only.",
+            "{} Direct MyAnimeList Sign-In (Zero Setup Required): Connect your MyAnimeList account directly inside Solus using just your username and password for full two-way syncing, or pull any public list by username alone. How to use: Press 'L' from the Home screen, press 'Tab' to focus MyAnimeList, then press 'p' for Password Login or 'u' for Username Sync.",
+            badge
+        ));
+    }
+    if s_lower.contains("watchlist") && (s_lower.contains("status") || s_lower.contains("picker") || s_lower.contains("label")) {
+        matched.push(format!(
+            "{} Status & List Picker Popup: Label or move any anime between Watching, Plan to Watch, Completed, On-Hold, Dropped, or Remove across AniList, MyAnimeList, Both, or Local in one step. How to use: Highlight any anime and press '+' -> use 'Tab' or '←/→' to choose where to save, then press '1'–'6' (or '↑/↓' + 'Enter') to apply.",
             badge
         ));
     }
@@ -992,18 +996,20 @@ Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle
     #[test]
     fn test_default_release_notes_and_pip_hud_commit_translation() {
         let notes = default_current_release_notes();
-        assert_eq!(notes.len(), 6);
-        assert!(notes.iter().any(|n| n.contains("MyAnimeList") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("Picture-in-Picture") && n.contains("Shift+P") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("Shift+I") && n.contains("[i HUD]") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("Auto-Fullscreen") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("90%") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("What's New") && n.contains("How to use:")));
+        assert_eq!(notes.len(), 4);
+        assert!(notes.iter().any(|n| n.contains("MyAnimeList") && n.contains("Password Login") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("AniList") && n.contains("5 categories") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Status Labels on Watchlist Cards") && n.contains("Watch") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Status & List Picker Popup") && n.contains("'+'") && n.contains("How to use:")));
+        for n in &notes {
+            let lower = n.to_ascii_lowercase();
+            assert!(!lower.contains("plain english"), "should not mention plain english: {n}");
+            assert!(!lower.contains("jargon"), "should not mention jargon: {n}");
+        }
 
         let combined = simplify_release_notes(
-            "Automated build for commit `329154d`: Port Phaenna Floating PiP mode and Multi-Color Bento Video Info HUD",
+            "Automated build for commit `25ed768`: Sync all 5 tracker statuses into Watchlist with Solus status labels and Bento picker",
         );
-        assert!(combined.iter().any(|n| n.contains("Picture-in-Picture")));
-        assert!(combined.iter().any(|n| n.contains("Live Video & Audio Info Card")));
+        assert!(combined.iter().any(|n| n.contains("Status & List Picker Popup")));
     }
 }

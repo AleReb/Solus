@@ -228,7 +228,7 @@ fn render_available(
 
     let notes = notes_for_info(info);
     let mut notes_lines = Vec::new();
-    push_plain_english_section(&mut notes_lines, &notes, "What's New & Fixed for You (Plain English):");
+    push_plain_english_section(&mut notes_lines, &notes, "What's New & Fixed:");
     frame.render_widget(
         Paragraph::new(notes_lines).wrap(Wrap { trim: false }),
         chunks[1],
@@ -338,7 +338,7 @@ fn render_downloading(
     push_plain_english_section(
         &mut notes_lines,
         &notes,
-        "What's New & Fixed in This Update (Plain English):",
+        "What's New & Fixed in This Update:",
     );
     frame.render_widget(
         Paragraph::new(notes_lines).wrap(Wrap { trim: false }),
@@ -457,7 +457,7 @@ fn render_post_update_welcome(
     push_plain_english_section(
         &mut notes_lines,
         &notes,
-        "What's New & Fixed for You (Plain English):",
+        "What's New & Fixed:",
     );
     frame.render_widget(
         Paragraph::new(notes_lines).wrap(Wrap { trim: false }),
@@ -578,7 +578,8 @@ mod tests {
         terminal.draw(|f| render_overlay(f, &state)).unwrap();
         let avail_text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(avail_text.contains("Update Now"));
-        assert!(avail_text.contains("Plain English"));
+        assert!(avail_text.contains("What's New & Fixed:"));
+        assert!(!avail_text.contains("Plain English"));
         assert!(avail_text.contains("Auto-Fullscreen"));
 
         // 2. Downloading phase still displays plain-English notes
