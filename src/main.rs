@@ -420,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
     state.force_ipv4 = cfg.force_ipv4;
     state.auto_abr_downshift = cfg.auto_abr_downshift;
     state.auto_fullscreen = cfg.auto_fullscreen;
+    state.auto_pip = cfg.auto_pip;
     set_global_network_flags(cfg.network_mode, cfg.force_ipv4);
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     if let Some(pb_settings) = db::user::get_profile_playback_settings(&pool, &state.active_profile_id).await {
@@ -2509,6 +2510,22 @@ async fn handle_mouse(
                         cycle_network_mode(state, cfg, true, tx).await;
                         return true;
                     }
+                    if layout.pip_chip_rect.contains(pos) {
+                        toggle_pip_mode_action(state, cfg);
+                        return true;
+                    }
+                    if layout.corner_chip_rect.contains(pos) {
+                        cycle_pip_corner_action(state, cfg);
+                        return true;
+                    }
+                    if layout.autofs_chip_rect.contains(pos) {
+                        toggle_auto_fullscreen_action(state, cfg);
+                        return true;
+                    }
+                    if layout.hud_chip_rect.contains(pos) {
+                        toggle_info_hud_action(state, false);
+                        return true;
+                    }
                     if layout.launch_btn_rect.contains(pos) {
                         let enter_key = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
                         handle_playback_options(enter_key, state, pool, cfg, tx).await;
@@ -4465,6 +4482,21 @@ async fn handle_playback_options(
         KeyCode::Char('n') | KeyCode::Char('N') => {
             cycle_network_mode(state, cfg, true, tx).await;
         }
+        KeyCode::Char('w') => {
+            toggle_pip_mode_action(state, cfg);
+        }
+        KeyCode::Char('W') => {
+            cycle_pip_corner_action(state, cfg);
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            toggle_auto_fullscreen_action(state, cfg);
+        }
+        KeyCode::Char('i') => {
+            toggle_info_hud_action(state, false);
+        }
+        KeyCode::Char('I') => {
+            toggle_info_hud_action(state, true);
+        }
         KeyCode::Char('e') | KeyCode::Enter => {
             let force_enqueue = matches!(key.code, KeyCode::Char('e'));
             if let Some(anime) = state.selected_anime.clone() {
@@ -4634,6 +4666,7 @@ async fn handle_playback_options(
                             network_mode: state.network_mode,
                             force_ipv4: cfg.force_ipv4,
                             auto_fullscreen: cfg.auto_fullscreen,
+                            auto_pip: cfg.auto_pip,
                         };
                         start_playback(state, opts, title, ep, tx, pool, cfg).await;
                     }
@@ -4953,16 +4986,20 @@ async fn execute_hub_action(
             state.show_toast(format!("❖ Anime4K: {}", modes[next].as_str()), unix_now());
         }
         AutoFullscreen => {
-            cfg.auto_fullscreen = !cfg.auto_fullscreen;
-            state.auto_fullscreen = cfg.auto_fullscreen;
-            let _ = cfg.save();
-            services::ipc::send_set_fullscreen(cfg.auto_fullscreen);
-            let msg = if cfg.auto_fullscreen {
-                "❖ Auto-Fullscreen on Launch: Enabled"
-            } else {
-                "❖ Auto-Fullscreen on Launch: Disabled"
-            };
-            state.show_toast(msg, unix_now());
+            toggle_auto_fullscreen_action(state, cfg);
+        }
+        PipMode => {
+            toggle_pip_mode_action(state, cfg);
+        }
+        PipCorner => {
+            if delta < 0 {
+                let n = services::ipc::PIP_CORNER_LABELS.len();
+                state.pip_corner_idx = (state.pip_corner_idx + n - 1) % n;
+            }
+            cycle_pip_corner_action(state, cfg);
+        }
+        ToggleInfoHud => {
+            toggle_info_hud_action(state, false);
         }
         AmbilightGlow => {
             cfg.ambilight_enabled = !cfg.ambilight_enabled;
@@ -7057,6 +7094,7 @@ async fn play_queue_item(
             network_mode: state.network_mode,
             force_ipv4: cfg.force_ipv4,
             auto_fullscreen: cfg.auto_fullscreen,
+            auto_pip: cfg.auto_pip,
         });
 
     opts.ipc_socket = None;
@@ -7064,6 +7102,7 @@ async fn play_queue_item(
     opts.network_mode = state.network_mode;
     opts.force_ipv4 = cfg.force_ipv4;
     opts.auto_fullscreen = cfg.auto_fullscreen;
+    opts.auto_pip = cfg.auto_pip;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -8377,7 +8416,7 @@ async fn handle_playback(
     key:   event::KeyEvent,
     state: &mut AppState,
     pool:  &sqlx::SqlitePool,
-    cfg:   &config::Config,
+    cfg:   &mut config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     match key.code {
@@ -8408,8 +8447,92 @@ async fn handle_playback(
         KeyCode::Char('0') => {
             adjust_subtitle_delay(state, pool, None).await;
         }
+        KeyCode::Char('p') => {
+            toggle_pip_mode_action(state, cfg);
+        }
+        KeyCode::Char('P') => {
+            cycle_pip_corner_action(state, cfg);
+        }
+        KeyCode::Char('i') => {
+            toggle_info_hud_action(state, false);
+        }
+        KeyCode::Char('I') => {
+            toggle_info_hud_action(state, true);
+        }
         _ => {}
     }
+}
+
+fn toggle_auto_fullscreen_action(state: &mut AppState, cfg: &mut config::Config) {
+    cfg.auto_fullscreen = !cfg.auto_fullscreen;
+    if cfg.auto_fullscreen {
+        cfg.auto_pip = false;
+        state.auto_pip = false;
+        state.live_playback.pip_mode = false;
+    }
+    state.auto_fullscreen = cfg.auto_fullscreen;
+    let _ = cfg.save();
+    services::ipc::send_set_fullscreen(cfg.auto_fullscreen);
+    let msg = if cfg.auto_fullscreen {
+        "❖ Auto-Fullscreen on Launch: Enabled"
+    } else {
+        "❖ Auto-Fullscreen on Launch: Disabled"
+    };
+    state.show_toast(msg, unix_now());
+}
+
+fn toggle_pip_mode_action(state: &mut AppState, cfg: &mut config::Config) {
+    let next = !(state.live_playback.pip_mode || cfg.auto_pip);
+    cfg.auto_pip = next;
+    state.auto_pip = next;
+    state.live_playback.pip_mode = next;
+    if next {
+        cfg.auto_fullscreen = false;
+        state.auto_fullscreen = false;
+    }
+    let _ = cfg.save();
+    services::ipc::send_set_pip_mode(next);
+    let msg = if next {
+        "◈ Picture-in-Picture (PiP): Enabled (Floating Corner)"
+    } else {
+        "◈ Picture-in-Picture (PiP): Disabled (Standard Window)"
+    };
+    state.show_toast(msg, unix_now());
+}
+
+fn cycle_pip_corner_action(state: &mut AppState, cfg: &mut config::Config) {
+    let n = services::ipc::PIP_CORNER_LABELS.len();
+    if !(state.live_playback.pip_mode || cfg.auto_pip) {
+        cfg.auto_pip = true;
+        state.auto_pip = true;
+        state.live_playback.pip_mode = true;
+        cfg.auto_fullscreen = false;
+        state.auto_fullscreen = false;
+        let _ = cfg.save();
+    } else {
+        state.pip_corner_idx = (state.pip_corner_idx + 1) % n;
+    }
+    services::ipc::send_cycle_pip_corner();
+    let label = services::ipc::PIP_CORNER_LABELS[state.pip_corner_idx % n];
+    state.show_toast(format!("◈ PiP Corner: {label}"), unix_now());
+}
+
+fn toggle_info_hud_action(state: &mut AppState, pin: bool) {
+    let sent = if pin {
+        services::ipc::send_pin_info_hud()
+    } else {
+        services::ipc::send_toggle_info_hud()
+    };
+    let msg = if sent {
+        if pin {
+            "◈ Toggled Pinned 1Hz Bento Info HUD in mpv"
+        } else {
+            "◈ Toggled 6s Bento Info HUD in mpv"
+        }
+    } else {
+        "Launch playback with mpv to toggle the Bento Info HUD"
+    };
+    state.show_toast(msg, unix_now());
 }
 
 // ── Tailored Algorithm Screens ────────────────────────────────────────────────
@@ -9104,6 +9227,7 @@ async fn launch_remote_stream_switch(
         network_mode: state.network_mode,
         force_ipv4: cfg.force_ipv4,
         auto_fullscreen: cfg.auto_fullscreen,
+        auto_pip: cfg.auto_pip,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
 }
@@ -9144,6 +9268,7 @@ async fn start_playback(
 
     let mut opts = opts;
     opts.auto_fullscreen = cfg.auto_fullscreen;
+    opts.auto_pip = cfg.auto_pip;
     state.last_play_options = Some(opts.clone());
     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
     let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
@@ -9257,6 +9382,7 @@ async fn start_playback(
         init_tbr_kbps,
         opts.stream_url.as_deref().unwrap_or(""),
     );
+    state.live_playback.pip_mode = opts.auto_pip;
 
     services::ipc::set_active_socket_path(Some(sock_path.clone()));
     opts.ipc_socket = Some(sock_path.clone());

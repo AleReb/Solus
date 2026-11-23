@@ -52,6 +52,9 @@ pub enum HubActionId {
     RemoteArtMode,
     Anime4kMode,
     AutoFullscreen,
+    PipMode,
+    PipCorner,
+    ToggleInfoHud,
     AmbilightGlow,
     AutoSkipIntro,
     CheckUpdates,
@@ -193,6 +196,42 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
             badge: if cfg.auto_fullscreen { "[✓] Enabled".into() } else { "[ ] Disabled".into() },
             description: "Automatically enter fullscreen mode when launching mpv, IINA, or VLC, and toggle any currently open mpv window live via IPC.",
             kind: HubActionKind::Toggle(cfg.auto_fullscreen),
+        },
+        HubItem {
+            id: HubActionId::PipMode,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Floating Picture-in-Picture (PiP)",
+            keywords: "pip picture in picture float floating mini corner ontop work",
+            badge: if state.live_playback.pip_mode || cfg.auto_pip { "[✓] Float ON".into() } else { "[ ] Disabled".into() },
+            description: "Pin a borderless 16:9 floating mpv window in the corner above all apps so you can watch & work simultaneously ([p] toggle, [P] corner in mpv).",
+            kind: HubActionKind::Toggle(state.live_playback.pip_mode || cfg.auto_pip),
+        },
+        HubItem {
+            id: HubActionId::PipCorner,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "PiP Window Corner & Size",
+            keywords: "pip corner size bottom top left right compact theater",
+            badge: format!(
+                "[ {} ▾ ]",
+                crate::services::ipc::PIP_CORNER_LABELS[state.pip_corner_idx % crate::services::ipc::PIP_CORNER_LABELS.len()]
+            ),
+            description: "Cycle floating Picture-in-Picture corners and scales (Bottom-Right 30% -> Bottom-Left -> Top-Right -> Top-Left -> Compact 24% -> Theater 38%).",
+            kind: HubActionKind::Cycle {
+                options: crate::services::ipc::PIP_CORNER_LABELS.to_vec(),
+                current: state.pip_corner_idx % crate::services::ipc::PIP_CORNER_LABELS.len(),
+            },
+        },
+        HubItem {
+            id: HubActionId::ToggleInfoHud,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Multi-Color Bento Video Info HUD",
+            keywords: "hud info stats overlay codec fps bitrate buffer bento diagnostics",
+            badge: "[ Toggle i / I ]".into(),
+            description: "Toggle the multi-color ASS Bento Info HUD inside mpv (i = 6s overlay, I = 1Hz live pin, F1 = raw mpv stats).",
+            kind: HubActionKind::Execute("Toggle Info HUD"),
         },
         HubItem {
             id: HubActionId::Anime4kMode,
@@ -1121,6 +1160,40 @@ fn render_inspector_card(
                 Span::styled("Shortcut   : ", Style::default().fg(theme.text_dim)),
                 Span::styled(
                     "Press [f] inside the player anytime to toggle fullscreen",
+                    Style::default().fg(theme.accent),
+                ),
+            ]));
+        }
+        HubActionId::PipMode | HubActionId::PipCorner => {
+            let corner_lbl = crate::services::ipc::PIP_CORNER_LABELS
+                [state.pip_corner_idx % crate::services::ipc::PIP_CORNER_LABELS.len()];
+            lines.push(Line::from(vec![
+                Span::styled("Window Mode: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!("Borderless Always-On-Top · {corner_lbl}"),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Player Keys: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    "[p] Toggle PiP Float   [P] Cycle Corner & Size",
+                    Style::default().fg(theme.accent),
+                ),
+            ]));
+        }
+        HubActionId::ToggleInfoHud => {
+            lines.push(Line::from(vec![
+                Span::styled("Overlay    : ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    "Multi-Color ASS Bento Card (Video · Audio · Cache)",
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Player Keys: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    "[i] 6s Overlay   [I] Pin 1Hz Live   [F1] Raw Stats",
                     Style::default().fg(theme.accent),
                 ),
             ]));

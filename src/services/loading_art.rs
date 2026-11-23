@@ -183,9 +183,9 @@ pub fn generate_y2k_loading_screen(
 
     // YouTube Keybindings Legend
     fill_rect(&mut canvas, hud_x, 486, 580, 2, dim_border);
-    draw_text(&mut canvas, "YOUTUBE KEYS:", hud_x, 504, 2, accent);
-    draw_text(&mut canvas, "K / SPACE  PLAY-PAUSE    J / L  -10S / +10S", hud_x, 530, 2, white);
-    draw_text(&mut canvas, "M MUTE     F FULLSCREEN  C SUBS    0-9 SEEK %", hud_x, 554, 2, muted);
+    draw_text(&mut canvas, "PLAYER KEYS:", hud_x, 504, 2, accent);
+    draw_text(&mut canvas, "K/SPACE PLAY   J/L +-10S   P/SHIFT+P PIP", hud_x, 530, 2, white);
+    draw_text(&mut canvas, "I/SHIFT+I HUD  F FULL    C SUBS   0-9 SEEK", hud_x, 554, 2, muted);
 
     let dir = crate::config::Config::cache_dir()
         .map(|d| d.join("loading"))

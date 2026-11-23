@@ -53,6 +53,9 @@ pub struct PlayOptions {
     /// Launch external video player in fullscreen mode automatically
     #[serde(default)]
     pub auto_fullscreen: bool,
+    /// Launch external video player in floating borderless Picture-in-Picture (PiP) corner mode
+    #[serde(default)]
+    pub auto_pip: bool,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -508,7 +511,15 @@ if [ -n "$SOLUS_SHADERS" ]; then
     fi
 fi
 
-if [ "$SOLUS_AUTO_FULLSCREEN" = "1" ]; then
+if [ "$SOLUS_AUTO_PIP" = "1" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-fullscreen=no" "--mpv-ontop=yes" "--mpv-border=no" "--mpv-keepaspect-window=yes" "--mpv-window-scale=0.30" "--mpv-geometry=30%x30%-24-24" "--mpv-script-opts=solus_auto_pip=1")
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=("--video-on-top")
+    else
+        args+=("--fullscreen=no" "--ontop=yes" "--border=no" "--keepaspect-window=yes" "--window-scale=0.30" "--geometry=30%x30%-24-24" "--script-opts=solus_auto_pip=1")
+    fi
+elif [ "$SOLUS_AUTO_FULLSCREEN" = "1" ]; then
     if [ "$is_iina" -eq 1 ]; then
         args+=("--mpv-fullscreen=yes")
     elif [ "$is_vlc" -eq 1 ]; then
@@ -657,8 +668,14 @@ m cycle mute
 M cycle mute
 f cycle fullscreen
 F cycle fullscreen
+ESC set fullscreen no
 c cycle sub-visibility
 C cycle sub-visibility
+p script-binding solus-toggle-pip
+P script-binding solus-cycle-pip-corner
+i script-binding solus-toggle-hud
+I script-binding solus-pin-hud
+F1 script-binding stats/display-stats-toggle
 0 seek 0 absolute-percent
 1 seek 10 absolute-percent
 2 seek 20 absolute-percent
@@ -692,9 +709,10 @@ pub fn ensure_youtube_input_conf() -> Option<PathBuf> {
     Some(path)
 }
 
-const SOLUS_AUDIO_LUA: &str = r##"-- Solus Smart Audio Cycle Bridge
--- Cycles embedded mpv audio tracks natively with an exact seek buffer flush when multiple
--- tracks exist, or signals Solus over stdout to hot-swap between split Sub/Dub embeds.
+const SOLUS_AUDIO_LUA: &str = r##"-- Solus Unified mpv Companion Script:
+--   1. Smart Audio Cycle Bridge (# / Ctrl+a)
+--   2. Floating Picture-in-Picture Controller (p toggle, P cycle corner/size)
+--   3. Multi-Color Curated Bento Video Info HUD (i 6s toggle, I 1Hz pin, F1 raw stats)
 local function solus_cycle_audio()
     local tracks = mp.get_property_native("track-list") or {}
     local audio_tracks = {}
@@ -729,6 +747,253 @@ end
 mp.add_forced_key_binding("#", "solus-cycle-audio-hash", solus_cycle_audio)
 mp.add_forced_key_binding("SHARP", "solus-cycle-audio-sharp", solus_cycle_audio)
 mp.add_forced_key_binding("Ctrl+a", "solus-cycle-audio-ctrl", solus_cycle_audio)
+
+-- =============================================================================
+-- 2. Picture-in-Picture (PiP) Floating Window Controller ([p] / [P])
+-- =============================================================================
+local pip_active = (mp.get_opt("solus_auto_pip") or "0") == "1"
+local pip_idx = 1
+local pip_presets = {
+    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24" },
+    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24" },
+    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24" },
+    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24" },
+    { label = "Compact 24%",      scale = 0.24, geom = "24%x24%-20-20" },
+    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28" },
+}
+
+local function apply_pip_preset()
+    local pr = pip_presets[pip_idx]
+    mp.set_property_bool("fullscreen", false)
+    mp.set_property_bool("ontop", true)
+    mp.set_property_bool("border", false)
+    mp.set_property_bool("keepaspect-window", true)
+    mp.set_property_number("window-scale", pr.scale)
+    mp.set_property("geometry", pr.geom)
+    mp.osd_message("◈ PiP Floating: " .. pr.label .. " ([P] corner, [p] exit)", 2.2)
+end
+
+local function toggle_pip()
+    pip_active = not pip_active
+    if pip_active then
+        apply_pip_preset()
+    else
+        mp.set_property_bool("ontop", false)
+        mp.set_property_bool("border", true)
+        mp.set_property_number("window-scale", 1.0)
+        mp.set_property("geometry", "50%:50%")
+        mp.osd_message("◈ PiP Floating: OFF (Standard Window)", 2.0)
+    end
+end
+
+local function cycle_pip_corner()
+    if not pip_active then
+        pip_active = true
+    else
+        pip_idx = (pip_idx % #pip_presets) + 1
+    end
+    apply_pip_preset()
+end
+
+mp.add_forced_key_binding("p", "solus-toggle-pip", toggle_pip)
+mp.add_forced_key_binding("P", "solus-cycle-pip-corner", cycle_pip_corner)
+
+-- =============================================================================
+-- 3. Multi-Color Curated Bento Video Info HUD ([i] 6s / [I] Pinned 1Hz / [F1] Raw)
+-- =============================================================================
+local hud_ov = mp.create_osd_overlay("ass-events")
+hud_ov.res_x = 1280
+hud_ov.res_y = 720
+local hud_visible = false
+local hud_pinned = false
+local hud_tick_timer = nil
+local hud_hide_timer = nil
+
+local function esc_ass(s)
+    if not s then return "" end
+    return tostring(s):gsub("[{}]", ""):gsub("[\r\n]+", " ")
+end
+
+local function fmt_clock(s)
+    if not s or s < 0 then return "--:--" end
+    local tot = math.floor(s)
+    local h = math.floor(tot / 3600)
+    local m = math.floor((tot % 3600) / 60)
+    local sec = tot % 60
+    if h > 0 then
+        return string.format("%d:%02d:%02d", h, m, sec)
+    end
+    return string.format("%02d:%02d", m, sec)
+end
+
+local function fmt_speed(bps)
+    if not bps or bps <= 0 then return "" end
+    if bps >= 1048576 then
+        return string.format("%.1f MB/s", bps / 1048576.0)
+    elseif bps >= 1024 then
+        return string.format("%d KB/s", math.floor(bps / 1024.0))
+    end
+    return string.format("%d B/s", math.floor(bps))
+end
+
+local function hide_info_hud()
+    hud_visible = false
+    hud_pinned = false
+    if hud_tick_timer then hud_tick_timer:kill(); hud_tick_timer = nil end
+    if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
+    hud_ov:remove()
+end
+
+local function render_info_hud()
+    if not hud_visible then
+        hud_ov:remove()
+        return
+    end
+    local mtitle = esc_ass(mp.get_property("media-title", "Solus Stream"))
+    if #mtitle > 68 then mtitle = string.sub(mtitle, 1, 65) .. "..." end
+
+    local pos = mp.get_property_number("time-pos", 0) or 0
+    local dur = mp.get_property_number("duration", 0) or 0
+    local rem = math.max(0, dur - pos)
+    local pct = mp.get_property_number("percent-pos", 0) or 0
+    local spd = mp.get_property_number("speed", 1.0) or 1.0
+    local vw = mp.get_property_number("width", 0) or 0
+    local vh = mp.get_property_number("height", 0) or 0
+    local fps = mp.get_property_number("estimated-vf-fps", 0) or 0
+    local disp_fps = mp.get_property_number("display-fps", 0) or 0
+    local vcodec = esc_ass(mp.get_property("video-codec", "—")):upper()
+    local vbit = mp.get_property_number("video-bitrate", 0) or 0
+    local hwdec = esc_ass(mp.get_property("hwdec-current", ""))
+    local drops = (mp.get_property_number("decoder-frame-drop-count", 0) or 0) + (mp.get_property_number("frame-drop-count", 0) or 0)
+    local vo = esc_ass(mp.get_property("current-vo", "gpu-next"))
+    local avs = mp.get_property_number("avsync", 0) or 0
+    local shaders_s = esc_ass(mp.get_property("glsl-shaders", ""))
+
+    local acodec = esc_ass(mp.get_property("audio-codec-name", mp.get_property("audio-codec", "—"))):upper()
+    local abit = mp.get_property_number("audio-bitrate", 0) or 0
+    local sr = mp.get_property_number("audio-params/samplerate", 0) or 0
+    local ch_n = mp.get_property_number("audio-params/channel-count", 2) or 2
+    local vol = mp.get_property_number("volume", 100) or 100
+    local muted = mp.get_property_bool("mute", false)
+
+    local sub_vis = mp.get_property_bool("sub-visibility", false)
+    local sub_delay = mp.get_property_number("sub-delay", 0) or 0
+    local sub_lbl = sub_vis and string.format("ON (%+.2fs)", sub_delay) or "OFF"
+
+    local c_dur = mp.get_property_number("demuxer-cache-duration", 0) or 0
+    local c_spd = mp.get_property_number("cache-speed", 0) or 0
+    local c_bytes = 0
+    local cst = mp.get_property_native("demuxer-cache-state")
+    if cst and cst["total-bytes"] then c_bytes = cst["total-bytes"] end
+
+    local q_tag = (vh >= 2160 and "4K UHD") or (vh >= 1440 and "1440p QHD") or (vh >= 1080 and "1080p FHD") or (vh >= 720 and "720p HD") or "Stream"
+    local win_badge = pip_active and "PIP FLOAT" or (mp.get_property_bool("fullscreen", false) and "FULLSCREEN" or "WINDOWED")
+    local pin_badge = hud_pinned and "PINNED 1Hz" or "AUTO 6s"
+    local hw_lbl = (hwdec ~= "" and hwdec ~= "no") and ("GPU · " .. hwdec) or "CPU Software"
+    local hw_col = (hwdec ~= "" and hwdec ~= "no") and "&H99D334&" or "&H24BFFB&"
+    local drop_col = (drops > 0) and "&H5E3FF4&" or "&H99D334&"
+    local vol_str = muted and "MUTED" or string.format("%d%%", math.floor(vol))
+    local vol_col = muted and "&H5E3FF4&" or "&H99D334&"
+    local vbit_s = (vbit > 0) and string.format("%.2f Mbps", vbit / 1000000.0) or "HLS ABR"
+    local abit_s = (abit > 0) and string.format("%d kbps", math.floor(abit / 1000.0)) or "Auto"
+    local sr_s = (sr > 0) and string.format("%.1f kHz", sr / 1000.0) or "Auto"
+    local shader_state = (shaders_s ~= "") and "Anime4K Active" or "Off (Native)"
+    local c_mib = c_bytes / 1048576.0
+    local spd_txt = fmt_speed(c_spd)
+    local buf_health = (c_dur >= 12.0) and "Healthy" or ((c_dur >= 3.0) and "Fair" or "Low")
+    local buf_col = (c_dur >= 12.0) and "&H99D334&" or ((c_dur >= 3.0) and "&H24BFFB&" or "&H5E3FF4&")
+
+    local prog_w = math.max(8, math.floor(1140 * math.min(1.0, math.max(0.0, pct / 100.0))))
+    local buf_frac = math.min(1.0, c_dur / 60.0)
+    local buf_w = math.max(12, math.floor(520 * buf_frac))
+
+    -- Glass Bento Card at (x: 42..1238, y: 26..378)
+    local ass = string.format(
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H18&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HF8BD38&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
+        "{\\an7\\pos(66,42)\\bord0\\shad0\\fs19\\b1\\1c&HF8BD38&}◈ SOLUS INFO HUD   " ..
+        "{\\1c&H24BFFB&}[%s]   {\\1c&H99D334&}[%s]   {\\1c&HFA8BA7&}[%s]\n" ..
+        "{\\an7\\pos(66,70)\\bord0\\shad0\\fs24\\b1\\1c&HFA8BA7&}%s\n" ..
+        "{\\an7\\pos(66,102)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}%s / %s (%d%%)  ·  -%s left  ·  Speed %.2fx\n" ..
+        "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 1140 0 l 1140 6 l 0 6{\\p0}\n" ..
+        "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&HFA8BA7&\\p1}m 0 0 l %d 0 l %d 6 l 0 6{\\p0}\n" ..
+        "{\\an7\\pos(66,150)\\bord0\\shad0\\fs16\\b1\\1c&HF8BD38&}▶ VIDEO & QUALITY\n" ..
+        "{\\an7\\pos(66,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Stream  : {\\1c&HFAF4F0&\\b1}%dx%d  %s\n" ..
+        "{\\an7\\pos(66,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&HF8BD38&}%s  ·  %s\n" ..
+        "{\\an7\\pos(66,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Rate    : {\\1c&H99D334&}%.2f fps{\\1c&HC8B8A4&} (Disp %.0fHz)\n" ..
+        "{\\an7\\pos(66,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Decode  : {\\1c%s}%s\n" ..
+        "{\\an7\\pos(460,150)\\bord0\\shad0\\fs16\\b1\\1c&HFA8BA7&}♪ AUDIO & CHANNELS\n" ..
+        "{\\an7\\pos(460,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&HFA8BA7&}%s  ·  %s\n" ..
+        "{\\an7\\pos(460,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Output  : {\\1c&HFAF4F0&}%s  ·  %d ch\n" ..
+        "{\\an7\\pos(460,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Volume  : {\\1c%s}%s {\\1c&HC8B8A4&}· Speed %.2fx\n" ..
+        "{\\an7\\pos(460,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Subs    : {\\1c&H24BFFB&}%s\n" ..
+        "{\\an7\\pos(860,150)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}◈ CACHE & ENGINE\n" ..
+        "{\\an7\\pos(860,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Shaders : {\\1c&HFA8BA7&}%s\n" ..
+        "{\\an7\\pos(860,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}VideoOut: {\\1c&H24BFFB&}%s\n" ..
+        "{\\an7\\pos(860,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Dropped : {\\1c%s}%d frames\n" ..
+        "{\\an7\\pos(860,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}A/V Sync: {\\1c&H99D334&}%+.1f ms\n" ..
+        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}⚡ DEMUXER CACHE   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
+        "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
+        "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
+        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[i] 6s HUD  [I] Pin 1Hz  {\\1c&H99D334&}[p] PiP Float  [P] PiP Corner  {\\1c&H24BFFB&}[f] Fullscreen  {\\1c&HFA8BA7&}[F1] Raw Stats",
+        q_tag, win_badge, pin_badge,
+        mtitle,
+        fmt_clock(pos), fmt_clock(dur), math.floor(pct), fmt_clock(rem), spd,
+        prog_w, prog_w,
+        vw, vh, q_tag,
+        vcodec, vbit_s,
+        fps, disp_fps,
+        hw_col, hw_lbl,
+        acodec, abit_s,
+        sr_s, ch_n,
+        vol_col, vol_str, spd,
+        sub_lbl,
+        shader_state,
+        vo,
+        drop_col, drops,
+        avs * 1000.0,
+        c_dur, c_mib, (spd_txt ~= "") and ("· " .. spd_txt) or "", buf_col, buf_health,
+        buf_col, buf_w, buf_w
+    )
+    hud_ov.data = ass
+    hud_ov:update()
+end
+
+local function ensure_hud_timer()
+    if not hud_tick_timer then
+        hud_tick_timer = mp.add_periodic_timer(1.0, render_info_hud)
+    end
+end
+
+local function toggle_info_hud()
+    if hud_visible and not hud_pinned then
+        hide_info_hud()
+        return
+    end
+    hud_pinned = false
+    hud_visible = true
+    if hud_hide_timer then hud_hide_timer:kill() end
+    hud_hide_timer = mp.add_timeout(6.0, function()
+        if not hud_pinned then hide_info_hud() end
+    end)
+    ensure_hud_timer()
+    render_info_hud()
+end
+
+local function pin_info_hud()
+    if hud_visible and hud_pinned then
+        hide_info_hud()
+        return
+    end
+    if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
+    hud_visible = true
+    hud_pinned = true
+    ensure_hud_timer()
+    render_info_hud()
+end
+
+mp.add_forced_key_binding("i", "solus-toggle-hud", toggle_info_hud)
+mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
 "##;
 
 /// Ensure Solus's `mpv` audio-switch helper script exists on disk and return its path.
@@ -793,7 +1058,15 @@ pub fn build_mpv_direct_args(
         "--referrer=https://zokoanime.video/".to_string(),
         "--input-terminal=no".to_string(),
     ];
-    if opts.auto_fullscreen {
+    if opts.auto_pip {
+        args.push("--fullscreen=no".to_string());
+        args.push("--ontop=yes".to_string());
+        args.push("--border=no".to_string());
+        args.push("--keepaspect-window=yes".to_string());
+        args.push("--window-scale=0.30".to_string());
+        args.push("--geometry=30%x30%-24-24".to_string());
+        args.push("--script-opts=solus_auto_pip=1".to_string());
+    } else if opts.auto_fullscreen {
         args.push("--fullscreen=yes".to_string());
     }
     args.extend(mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file));
@@ -927,7 +1200,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // --play-and-exit ensures VLC immediately quits when playback finishes or the window is closed
                 cmd.arg("--play-and-exit");
                 cmd.arg("--no-video-title-show");
-                if opts.auto_fullscreen {
+                if opts.auto_pip {
+                    cmd.arg("--video-on-top");
+                } else if opts.auto_fullscreen {
                     cmd.arg("--fullscreen");
                 }
                 cmd.arg(format!("--meta-title={} Episode {}", opts.title, opts.episode));
@@ -968,7 +1243,15 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--no-stdin");
                 cmd.arg("--mpv-ytdl=no");
                 cmd.arg("--mpv-force-window=immediate");
-                if opts.auto_fullscreen {
+                if opts.auto_pip {
+                    cmd.arg("--mpv-fullscreen=no");
+                    cmd.arg("--mpv-ontop=yes");
+                    cmd.arg("--mpv-border=no");
+                    cmd.arg("--mpv-keepaspect-window=yes");
+                    cmd.arg("--mpv-window-scale=0.30");
+                    cmd.arg("--mpv-geometry=30%x30%-24-24");
+                    cmd.arg("--mpv-script-opts=solus_auto_pip=1");
+                } else if opts.auto_fullscreen {
                     cmd.arg("--mpv-fullscreen=yes");
                 }
                 for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, is_local_file) {
@@ -1080,6 +1363,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
 
             cmd.env("SOLUS_REAL_PLAYER", &player);
             cmd.env("SOLUS_AUTO_FULLSCREEN", if opts.auto_fullscreen { "1" } else { "0" });
+            cmd.env("SOLUS_AUTO_PIP", if opts.auto_pip { "1" } else { "0" });
             if opts.dub {
                 cmd.env("SOLUS_AUDIO_DUB", "1");
             } else {
@@ -1177,6 +1461,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         cmd.env("SOLUS_AUDIO_DUB", "0");
     }
     cmd.env("SOLUS_AUTO_FULLSCREEN", if opts.auto_fullscreen { "1" } else { "0" });
+    cmd.env("SOLUS_AUTO_PIP", if opts.auto_pip { "1" } else { "0" });
     if let Some(ref script_path) = audio_script {
         cmd.env("SOLUS_AUDIO_SCRIPT", script_path);
     }
@@ -1197,13 +1482,22 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     if player.contains("iina") {
         player_flags.push("--keep-running".to_string());
         player_flags.push("--no-stdin".to_string());
-        if opts.auto_fullscreen {
+        if opts.auto_pip {
+            player_flags.push("--mpv-fullscreen=no".to_string());
+            player_flags.push("--mpv-ontop=yes".to_string());
+            player_flags.push("--mpv-border=no".to_string());
+            player_flags.push("--mpv-keepaspect-window=yes".to_string());
+            player_flags.push("--mpv-window-scale=0.30".to_string());
+            player_flags.push("--mpv-geometry=30%x30%-24-24".to_string());
+        } else if opts.auto_fullscreen {
             player_flags.push("--mpv-fullscreen=yes".to_string());
         }
     } else if player.to_lowercase().contains("vlc") {
         player_flags.push("--play-and-exit".to_string());
         player_flags.push("--no-video-title-show".to_string());
-        if opts.auto_fullscreen {
+        if opts.auto_pip {
+            player_flags.push("--video-on-top".to_string());
+        } else if opts.auto_fullscreen {
             player_flags.push("--fullscreen".to_string());
         }
         player_flags.push(format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()));
@@ -1212,7 +1506,14 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         }
     } else {
         player_flags.push("--input-terminal=no".to_string());
-        if opts.auto_fullscreen {
+        if opts.auto_pip {
+            player_flags.push("--fullscreen=no".to_string());
+            player_flags.push("--ontop=yes".to_string());
+            player_flags.push("--border=no".to_string());
+            player_flags.push("--keepaspect-window=yes".to_string());
+            player_flags.push("--window-scale=0.30".to_string());
+            player_flags.push("--geometry=30%x30%-24-24".to_string());
+        } else if opts.auto_fullscreen {
             player_flags.push("--fullscreen=yes".to_string());
         }
         for net_flag in mpv_network_args(opts.network_mode, opts.force_ipv4, false) {
@@ -1347,6 +1648,7 @@ mod tests {
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
             auto_fullscreen: false,
+            auto_pip: false,
         }
     }
 
@@ -1414,6 +1716,7 @@ mod tests {
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
             auto_fullscreen: false,
+            auto_pip: false,
         });
         assert_eq!(
             args,
@@ -1453,6 +1756,7 @@ mod tests {
             network_mode: crate::config::NetworkMode::Normal,
             force_ipv4: false,
             auto_fullscreen: false,
+            auto_pip: false,
         });
         assert_eq!(
             args,
@@ -1619,7 +1923,32 @@ mod tests {
         let wrapper = ensure_player_wrapper("mpv").unwrap();
         let script = std::fs::read_to_string(wrapper).unwrap();
         assert!(script.contains("SOLUS_AUTO_FULLSCREEN"));
+        assert!(script.contains("SOLUS_AUTO_PIP"));
         assert!(script.contains("--fullscreen=yes"));
         assert!(script.contains("--mpv-fullscreen=yes"));
+
+        o.auto_fullscreen = false;
+        o.auto_pip = true;
+        let pip_args = build_mpv_direct_args(&o, "https://cdn.example.com/stream.m3u8", None);
+        assert!(pip_args.contains(&"--fullscreen=no".to_string()));
+        assert!(pip_args.contains(&"--ontop=yes".to_string()));
+        assert!(pip_args.contains(&"--border=no".to_string()));
+        assert!(pip_args.contains(&"--window-scale=0.30".to_string()));
+        assert!(pip_args.contains(&"--geometry=30%x30%-24-24".to_string()));
+        assert!(pip_args.contains(&"--script-opts=solus_auto_pip=1".to_string()));
+
+        let yt_path = ensure_youtube_input_conf().unwrap();
+        let yt_text = std::fs::read_to_string(yt_path).unwrap();
+        assert!(yt_text.contains("p script-binding solus-toggle-pip"));
+        assert!(yt_text.contains("P script-binding solus-cycle-pip-corner"));
+        assert!(yt_text.contains("i script-binding solus-toggle-hud"));
+        assert!(yt_text.contains("I script-binding solus-pin-hud"));
+        assert!(yt_text.contains("F1 script-binding stats/display-stats-toggle"));
+
+        let lua_path = ensure_solus_audio_lua().unwrap();
+        let lua_text = std::fs::read_to_string(lua_path).unwrap();
+        assert!(lua_text.contains("solus-toggle-pip"));
+        assert!(lua_text.contains("solus-toggle-hud"));
+        assert!(lua_text.contains("SOLUS INFO HUD"));
     }
 }

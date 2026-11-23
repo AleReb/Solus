@@ -223,6 +223,95 @@ pub fn send_set_fullscreen(fullscreen: bool) -> bool {
     all_ok
 }
 
+/// Labels for the 6 Picture-in-Picture corner & window size presets.
+pub const PIP_CORNER_LABELS: [&str; 6] = [
+    "Bottom-Right 30%",
+    "Bottom-Left 30%",
+    "Top-Right 30%",
+    "Top-Left 30%",
+    "Compact 24%",
+    "Theater 38%",
+];
+
+/// Build mpv IPC JSON commands to toggle borderless always-on-top Picture-in-Picture mode.
+pub fn build_set_pip_mode_commands(enabled: bool) -> Vec<Value> {
+    if enabled {
+        vec![
+            serde_json::json!({ "command": ["set_property", "fullscreen", false] }),
+            serde_json::json!({ "command": ["set_property", "ontop", true] }),
+            serde_json::json!({ "command": ["set_property", "border", false] }),
+            serde_json::json!({ "command": ["set_property", "keepaspect-window", true] }),
+            serde_json::json!({ "command": ["set_property", "window-scale", 0.30] }),
+            serde_json::json!({ "command": ["set_property", "geometry", "30%x30%-24-24"] }),
+            serde_json::json!({ "command": ["show-text", "◈ Picture-in-Picture: ON ([p] toggle, [P] corner)", 2400] }),
+        ]
+    } else {
+        vec![
+            serde_json::json!({ "command": ["set_property", "ontop", false] }),
+            serde_json::json!({ "command": ["set_property", "border", true] }),
+            serde_json::json!({ "command": ["set_property", "window-scale", 1.0] }),
+            serde_json::json!({ "command": ["set_property", "geometry", "50%:50%"] }),
+            serde_json::json!({ "command": ["show-text", "◈ Picture-in-Picture: OFF (Standard Window)", 2000] }),
+        ]
+    }
+}
+
+pub fn send_set_pip_mode(enabled: bool) -> bool {
+    let cmds = build_set_pip_mode_commands(enabled);
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+pub fn build_cycle_pip_corner_commands() -> Vec<Value> {
+    vec![serde_json::json!({ "command": ["script-binding", "solus-cycle-pip-corner"] })]
+}
+
+pub fn send_cycle_pip_corner() -> bool {
+    let cmds = build_cycle_pip_corner_commands();
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+pub fn build_toggle_info_hud_commands() -> Vec<Value> {
+    vec![serde_json::json!({ "command": ["script-binding", "solus-toggle-hud"] })]
+}
+
+pub fn send_toggle_info_hud() -> bool {
+    let cmds = build_toggle_info_hud_commands();
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+pub fn build_pin_info_hud_commands() -> Vec<Value> {
+    vec![serde_json::json!({ "command": ["script-binding", "solus-pin-hud"] })]
+}
+
+pub fn send_pin_info_hud() -> bool {
+    let cmds = build_pin_info_hud_commands();
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
 /// Parse `demuxer-cache-state` JSON object returning `(cache_duration_secs, fw_bytes)`.
 pub fn parse_demuxer_cache_state(line: &str) -> Option<(f64, u64)> {
     let parsed: Value = serde_json::from_str(line).ok()?;
@@ -1145,5 +1234,21 @@ mod tests {
         assert_eq!(net_cmds.len(), 5);
         assert!(net_cmds[0].to_string().contains("120"));
         assert!(net_cmds[3].to_string().contains("1800000"));
+
+        let pip_on = build_set_pip_mode_commands(true);
+        assert_eq!(pip_on.len(), 7);
+        assert!(pip_on[0].to_string().contains("\"fullscreen\",false"));
+        assert!(pip_on[1].to_string().contains("\"ontop\",true"));
+        assert!(pip_on[2].to_string().contains("\"border\",false"));
+        assert!(pip_on[5].to_string().contains("30%x30%-24-24"));
+
+        let pip_off = build_set_pip_mode_commands(false);
+        assert_eq!(pip_off.len(), 5);
+        assert!(pip_off[0].to_string().contains("\"ontop\",false"));
+        assert!(pip_off[1].to_string().contains("\"border\",true"));
+
+        assert!(build_cycle_pip_corner_commands()[0].to_string().contains("solus-cycle-pip-corner"));
+        assert!(build_toggle_info_hud_commands()[0].to_string().contains("solus-toggle-hud"));
+        assert!(build_pin_info_hud_commands()[0].to_string().contains("solus-pin-hud"));
     }
 }

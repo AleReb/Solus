@@ -23,6 +23,10 @@ pub struct PlaybackOptionsLayout {
     pub audio_chip_rect:   Rect,
     pub anime4k_chip_rect: Rect,
     pub network_chip_rect: Rect,
+    pub pip_chip_rect:     Rect,
+    pub corner_chip_rect:  Rect,
+    pub autofs_chip_rect:  Rect,
+    pub hud_chip_rect:     Rect,
     pub player_rect:       Rect,
     pub provider_rect:     Rect,
     pub quality_rect:      Rect,
@@ -79,10 +83,39 @@ pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
         width: inner_x.saturating_add(inner_w).saturating_sub(a4k_x),
         height: 1,
     };
+    let net_row = header_rect.y.saturating_add(3);
     let network_chip_rect = Rect {
         x: inner_x,
-        y: header_rect.y.saturating_add(3),
+        y: net_row,
         width: 24.min(inner_w),
+        height: 1,
+    };
+    let pip_x = inner_x.saturating_add(25);
+    let pip_chip_rect = Rect {
+        x: pip_x,
+        y: net_row,
+        width: 10.min(inner_x.saturating_add(inner_w).saturating_sub(pip_x)),
+        height: 1,
+    };
+    let corner_x = pip_x.saturating_add(11);
+    let corner_chip_rect = Rect {
+        x: corner_x,
+        y: net_row,
+        width: 9.min(inner_x.saturating_add(inner_w).saturating_sub(corner_x)),
+        height: 1,
+    };
+    let autofs_x = corner_x.saturating_add(10);
+    let autofs_chip_rect = Rect {
+        x: autofs_x,
+        y: net_row,
+        width: 13.min(inner_x.saturating_add(inner_w).saturating_sub(autofs_x)),
+        height: 1,
+    };
+    let hud_x = autofs_x.saturating_add(14);
+    let hud_chip_rect = Rect {
+        x: hud_x,
+        y: net_row,
+        width: 8.min(inner_x.saturating_add(inner_w).saturating_sub(hud_x)),
         height: 1,
     };
 
@@ -110,6 +143,10 @@ pub fn compute_layout(area: Rect) -> PlaybackOptionsLayout {
         audio_chip_rect,
         anime4k_chip_rect,
         network_chip_rect,
+        pip_chip_rect,
+        corner_chip_rect,
+        autofs_chip_rect,
+        hud_chip_rect,
         player_rect: body_cols[0],
         provider_rect: body_cols[1],
         quality_rect: body_cols[2],
@@ -268,23 +305,45 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 crate::config::NetworkMode::CongestedWifi => "<=720p30 · 120s Disk · Compact Thumbs",
                 crate::config::NetworkMode::UltraSaver => "<=480p30 · 180s Disk · Low Bandwidth",
             };
+            let pip_on = state.live_playback.pip_mode || state.auto_pip;
+            let pip_pill = if pip_on { "[PiP:ON] " } else { "[PiP:OFF]" };
+            let autofs_pill = if state.auto_fullscreen { "[AutoFS:ON] " } else { "[AutoFS:OFF]" };
             let mut row3 = vec![
                 Span::styled(" Network: ", Style::default().fg(theme.text_dim)),
                 Span::styled(
                     format!(" {} ", state.network_mode.short_tag()),
                     Style::default().fg(net_fg).bg(net_bg).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" "),
-                Span::styled("([n] cycle)", Style::default().fg(theme.text_dim)),
-                Span::raw("  ·  "),
-                Span::styled(cap_desc, Style::default().fg(theme.text)),
+                Span::styled(" [n] ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!(" {pip_pill} "),
+                    Style::default()
+                        .fg(if pip_on { Color::Black } else { theme.text })
+                        .bg(if pip_on { theme.primary } else { Color::Reset })
+                        .add_modifier(if pip_on { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(
+                    " [Corner] ",
+                    Style::default().fg(if pip_on { theme.accent } else { theme.text_dim }),
+                ),
+                Span::styled(
+                    format!(" {autofs_pill} "),
+                    Style::default()
+                        .fg(if state.auto_fullscreen { Color::Black } else { theme.text })
+                        .bg(if state.auto_fullscreen { theme.secondary } else { Color::Reset })
+                        .add_modifier(if state.auto_fullscreen { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(" [i HUD] ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
             ];
             if state.live_playback.started_at.is_some() {
-                row3.push(Span::styled("  ·  ", Style::default().fg(theme.divider)));
+                row3.push(Span::styled(" · ", Style::default().fg(theme.divider)));
                 row3.push(Span::styled(
                     state.live_playback.compact_status_text(),
                     Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
                 ));
+            } else {
+                row3.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+                row3.push(Span::styled(cap_desc, Style::default().fg(theme.text_dim)));
             }
             Line::from(row3)
         },
@@ -615,6 +674,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::raw(" Audio  "),
         Span::styled(" n/N ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Net  "),
+        Span::styled(" w/W ", Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" PiP  "),
+        Span::styled(" f ", Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD)),
+        Span::raw(" FS  "),
+        Span::styled(" i/I ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::raw(" HUD  "),
         Span::styled(" [/] ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
         Span::raw(" Delay  "),
         Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(theme.border_idle)),

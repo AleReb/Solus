@@ -997,6 +997,7 @@ pub async fn resolve_item_prefetch(
         network_mode,
         force_ipv4,
         auto_fullscreen: false,
+        auto_pip: false,
     };
 
     Some(ResolvedPrefetch {
@@ -1051,6 +1052,7 @@ mod tests {
                 network_mode: crate::config::NetworkMode::Normal,
                 force_ipv4: false,
                 auto_fullscreen: false,
+                auto_pip: false,
             },
             resolved_at,
             sub_synced: false,

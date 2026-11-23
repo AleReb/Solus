@@ -82,11 +82,15 @@ fn render_logs(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState,
 fn render_controls(frame: &mut Frame, area: ratatui::layout::Rect, theme: &ThemePalette) {
     let controls = Paragraph::new(Line::from(vec![
         Span::styled(" q ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Stop    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" Stop   ", Style::default().fg(theme.text_dim)),
         Span::styled(" n ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
-        Span::styled(" Next Ep    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" Next Ep   ", Style::default().fg(theme.text_dim)),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Sub/Dub    ", Style::default().fg(theme.text_dim)),
+        Span::styled(" Sub/Dub   ", Style::default().fg(theme.text_dim)),
+        Span::styled(" p/P ", Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" PiP/Corner   ", Style::default().fg(theme.text_dim)),
+        Span::styled(" i/I ", Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Info HUD   ", Style::default().fg(theme.text_dim)),
         Span::styled(" Esc ", Style::default().fg(Color::Black).bg(theme.border_idle).add_modifier(Modifier::BOLD)),
         Span::styled(" Return", Style::default().fg(theme.text_dim)),
     ]))

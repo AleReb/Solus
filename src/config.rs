@@ -331,6 +331,9 @@ pub struct Config {
     /// Automatically launch the external video player (mpv / IINA / VLC) in fullscreen mode
     #[serde(default)]
     pub auto_fullscreen: bool,
+    /// Automatically launch the external video player in borderless Picture-in-Picture (PiP) corner mode
+    #[serde(default)]
+    pub auto_pip: bool,
 }
 
 impl Default for Config {
@@ -355,6 +358,7 @@ impl Default for Config {
             force_ipv4:       false,
             auto_abr_downshift: true,
             auto_fullscreen:  false,
+            auto_pip:         false,
         }
     }
 }
@@ -983,6 +987,7 @@ mod tests {
             force_ipv4:       true,
             auto_abr_downshift: false,
             auto_fullscreen:  true,
+            auto_pip:         false,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();

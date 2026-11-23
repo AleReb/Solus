@@ -691,6 +691,8 @@ pub struct AppState {
     pub force_ipv4:                  bool,
     pub auto_abr_downshift:          bool,
     pub auto_fullscreen:             bool,
+    pub auto_pip:                    bool,
+    pub pip_corner_idx:              usize,
     pub live_playback:               LivePlaybackTelemetry,
     pub stream_ladder_cache:         HashMap<(i64, u32, bool), crate::api::subtitles::ResolvedStreamLadder>,
     /// Settings Control Hub v2 navigation + Remote live state
@@ -725,6 +727,7 @@ pub struct LivePlaybackTelemetry {
     pub prompted_congested_mode: bool,
     pub abr_refresh_in_flight:   bool,
     pub last_time_pos:           f64,
+    pub pip_mode:                bool,
 }
 
 impl LivePlaybackTelemetry {
@@ -1032,6 +1035,8 @@ impl AppState {
             force_ipv4: false,
             auto_abr_downshift: true,
             auto_fullscreen: false,
+            auto_pip: false,
+            pip_corner_idx: 0,
             live_playback: LivePlaybackTelemetry::default(),
             stream_ladder_cache: HashMap::new(),
             settings_category: 0,
