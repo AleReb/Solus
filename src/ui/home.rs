@@ -11,10 +11,10 @@ use ratatui::{
 use std::collections::HashMap;
 
 use crate::{
-    config::WatchlistTarget,
+    config::{WatchStatus, WatchlistTarget},
     db::{cache::Anime, user::WatchlistSource},
     services::tailored::clean_synopsis_single_line,
-    state::{AppState, CategoryRow, Screen, WatchlistPromptMode},
+    state::{AppState, CategoryRow, Screen, WatchlistPickerChoice},
     ui::components::{
         cover::HalfblockCover,
         dock::{build_dock_row_plan, DockChip, DockRowPlan},
@@ -1703,14 +1703,28 @@ fn render_watchlist_slots_widgets(
                 rect,
             } => {
                 if let Some(anime) = data.watchlist.get(*anime_idx) {
-                    let progress = data.progress_labels.get(&anime.id).map(String::as_str);
                     let selected = wl_active && (*anime_idx == wl_offset);
                     let tag = if data.watchlist_sources.is_empty() {
                         None
                     } else {
                         Some(*source)
                     };
-                    render_card_with_source(frame, *rect, anime, selected, None, progress, tag, state);
+                    let watch_status = data
+                        .watchlist_statuses
+                        .get(&anime.id)
+                        .copied()
+                        .or(Some(WatchStatus::Planning));
+                    render_card_with_source(
+                        frame,
+                        *rect,
+                        anime,
+                        selected,
+                        None,
+                        None,
+                        tag,
+                        watch_status,
+                        state,
+                    );
                 }
             }
         }
@@ -1810,9 +1824,10 @@ fn render_card(
     progress: Option<&str>,
     state: &mut AppState,
 ) {
-    render_card_with_source(frame, area, anime, selected, rank, progress, None, state);
+    render_card_with_source(frame, area, anime, selected, rank, progress, None, None, state);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_card_with_source(
     frame: &mut Frame,
     area: Rect,
@@ -1821,6 +1836,7 @@ fn render_card_with_source(
     rank: Option<usize>,
     progress: Option<&str>,
     source_tag: Option<WatchlistSource>,
+    watch_status: Option<WatchStatus>,
     state: &mut AppState,
 ) {
     if area.height < 4 {
@@ -1935,14 +1951,39 @@ fn render_card_with_source(
     frame.render_widget(title, chunks[1]);
 
     // Metadata / Colorized Progress Line
-    let meta_line = build_card_meta_line(anime, progress, selected, &theme);
+    let meta_line = build_card_meta_line(anime, progress, watch_status, area.width, selected, &theme);
     frame.render_widget(Paragraph::new(meta_line), chunks[2]);
 }
 
-/// Build the bottom line of a card with colorized progress bars or score/format chips.
+fn status_accent_color(status: WatchStatus) -> Color {
+    match status {
+        WatchStatus::Watching => Color::Rgb(80, 250, 123),
+        WatchStatus::Planning => Color::Rgb(189, 147, 249),
+        WatchStatus::Completed => Color::Rgb(103, 232, 249),
+        WatchStatus::Paused => Color::Rgb(251, 191, 36),
+        WatchStatus::Dropped => Color::Rgb(255, 105, 135),
+    }
+}
+
+fn compact_format_chip(raw: &str, max_width: u16) -> &'static str {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "TV" => "TV",
+        "TV_SHORT" => "SHRT",
+        "MOVIE" => if max_width >= 21 { "MOVIE" } else { "MOV" },
+        "SPECIAL" => "SPC",
+        "OVA" => "OVA",
+        "ONA" => "ONA",
+        "MUSIC" => "MUS",
+        _ => "TV",
+    }
+}
+
+/// Build the bottom line of a card with colorized progress bars, Watchlist status tags, or score/format chips.
 fn build_card_meta_line(
     anime: &Anime,
     progress: Option<&str>,
+    watch_status: Option<WatchStatus>,
+    card_width: u16,
     selected: bool,
     theme: &crate::ui::theme::ThemePalette,
 ) -> Line<'static> {
@@ -1963,7 +2004,7 @@ fn build_card_meta_line(
         }
 
         return Line::from(Span::styled(
-            truncate_chars(prog, 20),
+            truncate_chars(prog, card_width.max(18) as usize),
             Style::default()
                 .fg(if selected { theme.accent } else { theme.secondary })
                 .add_modifier(Modifier::BOLD),
@@ -1974,20 +2015,43 @@ fn build_card_meta_line(
         .score
         .map(|s| format!(" {:.1}", s as f32 / 10.0))
         .unwrap_or_else(|| " N/A".to_string());
-    let fmt_str = anime.format.as_deref().unwrap_or("TV").to_string();
-    let is_airing = anime.status.as_deref() == Some("RELEASING");
+    let raw_fmt = anime.format.as_deref().unwrap_or("TV");
+    let fmt_str = if watch_status.is_some() {
+        compact_format_chip(raw_fmt, card_width).to_string()
+    } else {
+        raw_fmt.to_string()
+    };
 
     let mut spans = vec![
         Span::styled(
-            score_str,
+            score_str.clone(),
             Style::default()
                 .fg(if selected { theme.accent } else { theme.text })
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(fmt_str, Style::default().fg(theme.text_dim)),
+        Span::styled(fmt_str.clone(), Style::default().fg(theme.text_dim)),
     ];
-    if is_airing {
+
+    if let Some(st) = watch_status {
+        let status_color = status_accent_color(st);
+        let prefix_len = score_str.chars().count() + 3 + fmt_str.chars().count() + 3;
+        let full_tag = st.short_card_tag();
+        let tag_str = if prefix_len + full_tag.chars().count() <= card_width as usize {
+            full_tag.to_string()
+        } else if prefix_len + st.short_word().chars().count() <= card_width as usize {
+            st.short_word().to_string()
+        } else {
+            st.glyph().to_string()
+        };
+        spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+        spans.push(Span::styled(
+            tag_str,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if anime.status.as_deref() == Some("RELEASING") {
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
         spans.push(Span::styled("●", Style::default().fg(Color::Rgb(80, 250, 123))));
     }
@@ -2075,6 +2139,7 @@ pub struct HomeData {
     pub continue_watching: Vec<Anime>,
     pub watchlist: Vec<Anime>,
     pub watchlist_sources: HashMap<i64, WatchlistSource>,
+    pub watchlist_statuses: HashMap<i64, WatchStatus>,
     pub progress_labels: HashMap<i64, String>,
     pub resume_next: HashMap<i64, u32>,
     pub trending: Vec<Anime>,
@@ -2090,6 +2155,7 @@ impl HomeData {
             continue_watching: Vec::new(),
             watchlist: Vec::new(),
             watchlist_sources: HashMap::new(),
+            watchlist_statuses: HashMap::new(),
             progress_labels: HashMap::new(),
             resume_next: HashMap::new(),
             trending: Vec::new(),
@@ -2109,16 +2175,16 @@ impl HomeData {
     }
 }
 
-/// Modal size percentages for the Watchlist Add/Remove database target picker popup.
+/// Modal size percentages for the Bento Status & Tracker List Picker popup.
 pub fn watchlist_modal_pct(area: Rect) -> (u16, u16) {
-    if area.width >= 100 && area.height >= 26 {
-        (60, 52)
+    if area.width >= 104 && area.height >= 28 {
+        (68, 66)
     } else {
-        (86, 72)
+        (92, 84)
     }
 }
 
-/// Render the centered opaque Watchlist Add/Remove Database Target Picker modal.
+/// Render the centered opaque Bento Status & Tracker List Picker modal.
 pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
     let Some(ref prompt) = state.watchlist_target_prompt else {
         return;
@@ -2146,20 +2212,17 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
         .split(vert[1])[1];
 
     let bg = Color::Rgb(15, 16, 25);
-    let card_bg = Color::Rgb(22, 24, 38);
+    let card_bg = Color::Rgb(24, 27, 43);
+    let pill_bg = Color::Rgb(28, 31, 48);
     let emerald = Color::Rgb(80, 250, 123);
     let cyan = Color::Rgb(103, 232, 249);
     let mal_blue = Color::Rgb(108, 160, 255);
     let amber = Color::Rgb(251, 191, 36);
+    let rose = Color::Rgb(255, 105, 135);
     let muted = Color::Rgb(150, 156, 185);
 
     frame.render_widget(Clear, modal);
     frame.render_widget(Block::default().style(Style::default().bg(bg)), modal);
-
-    let title_str = match prompt.mode {
-        WatchlistPromptMode::Add => " + ADD TO WATCHLIST DATABASES ",
-        WatchlistPromptMode::RemoveShared => " 󰅖 REMOVE FROM WATCHLIST DATABASES ",
-    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -2167,25 +2230,35 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
         .border_style(Style::default().fg(theme.primary))
         .style(Style::default().bg(bg))
         .title(Span::styled(
-            title_str,
+            " ✦ UPDATE ANIME STATUS & TRACKER LIST ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)
                 .add_modifier(Modifier::BOLD),
-        ));
+        ))
+        .title(
+            Line::from(vec![Span::styled(
+                format!(" {} ", prompt.target.label()),
+                Style::default()
+                    .fg(amber)
+                    .add_modifier(Modifier::BOLD),
+            )])
+            .alignment(Alignment::Right),
+        );
     let inner = outer.inner(modal);
     frame.render_widget(outer, modal);
 
-    if inner.width < 20 || inner.height < 10 {
+    if inner.width < 24 || inner.height < 12 {
         return;
     }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Anime title + tracker write readiness
-            Constraint::Min(6),    // 4 selectable targets
-            Constraint::Length(2), // Key hints footer
+            Constraint::Length(3), // Anime title + current label & sync status
+            Constraint::Length(4), // Target database pills
+            Constraint::Min(7),    // 6 selectable labels
+            Constraint::Length(2), // Footer hints
         ])
         .split(inner);
 
@@ -2204,22 +2277,56 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
         ("MAL Offline", muted)
     };
 
+    let fmt = prompt.anime.format.as_deref().unwrap_or("TV");
+    let eps_str = prompt
+        .anime
+        .episodes
+        .map(|e| format!("{e} EPS"))
+        .unwrap_or_else(|| "? EPS".to_string());
+    let score_str = prompt
+        .anime
+        .score
+        .map(|s| format!(" {:.1}", s as f32 / 10.0))
+        .unwrap_or_else(|| " N/A".to_string());
+
+    let mut line2_spans = vec![Span::styled(" Current: ", Style::default().fg(muted))];
+    if let Some(curr) = prompt.current_status {
+        let sc = status_accent_color(curr);
+        line2_spans.push(Span::styled(
+            format!("[ {} {} ]", curr.glyph(), curr.full_label().to_uppercase()),
+            Style::default().fg(sc).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        line2_spans.push(Span::styled("[ NOT IN LIST ]", Style::default().fg(muted)));
+    }
+    if let Some(src) = prompt.current_source {
+        line2_spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+        line2_spans.push(Span::styled(
+            src.divider_label(),
+            Style::default()
+                .fg(source_accent_color(src, &theme))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    line2_spans.extend([
+        Span::styled("  ·  Sync: ", Style::default().fg(muted)),
+        Span::styled(al_cap.0, Style::default().fg(al_cap.1).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(theme.divider)),
+        Span::styled(mal_cap.0, Style::default().fg(mal_cap.1).add_modifier(Modifier::BOLD)),
+    ]);
+
     let header_lines = vec![
         Line::from(vec![
-            Span::styled(" Show: ", Style::default().fg(muted)),
+            Span::styled(" Show:    ", Style::default().fg(muted)),
             Span::styled(
-                truncate_chars(&prompt.anime.display_title(), inner.width.saturating_sub(10) as usize),
+                truncate_chars(&prompt.anime.display_title(), inner.width.saturating_sub(28) as usize),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(format!("  ({fmt} · {eps_str} · {score_str})"), Style::default().fg(muted)),
         ]),
-        Line::from(vec![
-            Span::styled(" Sync: ", Style::default().fg(muted)),
-            Span::styled(al_cap.0, Style::default().fg(al_cap.1).add_modifier(Modifier::BOLD)),
-            Span::styled("  ·  ", Style::default().fg(theme.divider)),
-            Span::styled(mal_cap.0, Style::default().fg(mal_cap.1).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(line2_spans),
     ];
     frame.render_widget(
         Paragraph::new(header_lines)
@@ -2228,64 +2335,67 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
         chunks[0],
     );
 
-    let options = prompt.options_for_mode();
+    // Target Database Pills Row
+    let mut target_spans = vec![Span::raw(" ")];
+    for tgt in WatchlistTarget::ALL {
+        let active = tgt == prompt.target;
+        let (icon, label, accent) = match tgt {
+            WatchlistTarget::Both => ("◈", "Both (AL + MAL)", amber),
+            WatchlistTarget::AniList => ("✦", "AniList", cyan),
+            WatchlistTarget::Mal => ("◆", "MyAnimeList", mal_blue),
+            WatchlistTarget::Local => ("•", "Local Only", muted),
+        };
+        let pill_text = if active {
+            format!(" {icon} {label} ✓ ")
+        } else {
+            format!(" {icon} {label} ")
+        };
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(muted).bg(pill_bg)
+        };
+        target_spans.push(Span::styled(pill_text, style));
+        target_spans.push(Span::raw(" "));
+    }
+    let target_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.divider))
+        .style(Style::default().bg(bg))
+        .title(Span::styled(
+            " Where to Save ([Tab / ←→] Switch Target DB) ",
+            Style::default().fg(muted),
+        ));
+    let t_inner = target_block.inner(chunks[1]);
+    frame.render_widget(target_block, chunks[1]);
+    frame.render_widget(Paragraph::new(Line::from(target_spans)), t_inner);
+
+    // 6 Selectable Label Rows
     let mut rows = Vec::new();
-    for (idx, target) in options.iter().enumerate() {
+    for (idx, choice) in crate::state::WatchlistTargetPrompt::CHOICES.iter().enumerate() {
         let sel = idx == prompt.cursor;
         let num = idx + 1;
-        let (icon, label, desc, accent) = match (prompt.mode, target) {
-            (WatchlistPromptMode::Add, WatchlistTarget::Both) => (
-                "✦+◆",
-                "Both Databases (AniList + MyAnimeList + Solus)",
-                "Writes Planning live to both websites and shows under ◈ BOTH",
-                amber,
+        let (glyph, title, desc, accent, is_curr) = match choice {
+            WatchlistPickerChoice::SetStatus(st) => (
+                st.glyph(),
+                st.full_label(),
+                st.description(),
+                status_accent_color(*st),
+                prompt.current_status == Some(*st),
             ),
-            (WatchlistPromptMode::Add, WatchlistTarget::AniList) => (
-                "✦  ",
-                "AniList Database Only (+ Solus)",
-                "Writes Planning live to anilist.co and shows under ✦ ANILIST",
-                cyan,
-            ),
-            (WatchlistPromptMode::Add, WatchlistTarget::Mal) => (
-                "◆  ",
-                "MyAnimeList Database Only (+ Solus)",
-                "Writes Plan to Watch live to myanimelist.net and shows under ◆ MAL",
-                mal_blue,
-            ),
-            (WatchlistPromptMode::Add, WatchlistTarget::Local) => (
-                "•  ",
-                "Local Solus Only",
-                "Saves locally inside Solus under • LOCAL without website writes",
-                muted,
-            ),
-            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Both) => (
-                "✦+◆",
-                "Remove from BOTH Websites + Solus",
-                "Deletes live from AniList + MyAnimeList databases and Solus",
-                Color::Rgb(255, 105, 135),
-            ),
-            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Mal) => (
-                "◆  ",
-                "Remove from MyAnimeList Only",
-                "Deletes live from myanimelist.net -> keeps card under ✦ ANILIST",
-                mal_blue,
-            ),
-            (WatchlistPromptMode::RemoveShared, WatchlistTarget::AniList) => (
-                "✦  ",
-                "Remove from AniList Only",
-                "Deletes live from anilist.co -> keeps card under ◆ MAL",
-                cyan,
-            ),
-            (WatchlistPromptMode::RemoveShared, WatchlistTarget::Local) => (
-                "•  ",
-                "Hide Locally on Solus Only",
-                "Removes from Solus Watchlist without touching remote websites",
-                muted,
+            WatchlistPickerChoice::Remove => (
+                "󰆴",
+                "Remove Entry",
+                "Delete completely from the selected database(s)",
+                rose,
+                false,
             ),
         };
-
         let row_bg = if sel { card_bg } else { bg };
-        rows.push(Line::from(vec![
+        let mut line_spans = vec![
             Span::styled(
                 if sel { " ▶ " } else { "   " },
                 Style::default()
@@ -2294,39 +2404,50 @@ pub fn render_watchlist_target_modal(frame: &mut Frame, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("[{num}] {icon} "),
+                format!("[{num}]  {glyph}  "),
                 Style::default()
                     .fg(accent)
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                label,
+                format!("{:<15}", title),
                 Style::default()
-                    .fg(if sel { Color::White } else { Color::Rgb(215, 220, 238) })
+                    .fg(if sel { Color::White } else { accent })
                     .bg(row_bg)
-                    .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(Modifier::BOLD),
             ),
-        ]));
-        rows.push(Line::from(vec![
-            Span::styled("       ", Style::default().bg(row_bg)),
             Span::styled(desc, Style::default().fg(muted).bg(row_bg)),
-        ]));
+        ];
+        if is_curr {
+            line_spans.push(Span::styled(
+                "  [CURRENT]",
+                Style::default().fg(emerald).bg(row_bg).add_modifier(Modifier::BOLD),
+            ));
+        }
+        rows.push(Line::from(line_spans));
     }
 
-    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: true }), chunks[1]);
+    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: true }), chunks[2]);
 
     let footer = Line::from(vec![
-        Span::styled(" [1-4]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Quick Pick   ", Style::default().fg(muted)),
-        Span::styled("[↑↓]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(" Move   ", Style::default().fg(muted)),
+        Span::styled(" [1-6]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quick Apply   ", Style::default().fg(muted)),
+        Span::styled("[↑↓/jk]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(" Select Label   ", Style::default().fg(muted)),
+        Span::styled("[Tab/←→]", Style::default().fg(amber).add_modifier(Modifier::BOLD)),
+        Span::styled(" Target DB   ", Style::default().fg(muted)),
         Span::styled("[Enter]", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
-        Span::styled(" Confirm & Update DB   ", Style::default().fg(muted)),
-        Span::styled("[Esc]", Style::default().fg(Color::Rgb(255, 105, 135)).add_modifier(Modifier::BOLD)),
-        Span::styled(" Cancel", Style::default().fg(muted)),
+        Span::styled(" Save   ", Style::default().fg(muted)),
+        Span::styled("[Esc]", Style::default().fg(rose).add_modifier(Modifier::BOLD)),
+        Span::styled(" Close", Style::default().fg(muted)),
     ]);
-    frame.render_widget(Paragraph::new(footer).style(Style::default().bg(bg)), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(footer)
+            .style(Style::default().bg(bg))
+            .wrap(Wrap { trim: true }),
+        chunks[3],
+    );
 }
 
 /// Compute the centered modal rectangle for the Exit Confirmation popup.
@@ -2605,6 +2726,9 @@ mod tests {
         data.watchlist_sources.insert(1, WatchlistSource::AniList);
         data.watchlist_sources.insert(2, WatchlistSource::Mal);
         data.watchlist_sources.insert(3, WatchlistSource::Both);
+        data.watchlist_statuses.insert(1, WatchStatus::Watching);
+        data.watchlist_statuses.insert(2, WatchStatus::Completed);
+        data.watchlist_statuses.insert(3, WatchStatus::Planning);
         data.featured = Some(both_show.clone());
 
         let mut state = AppState::new();
@@ -2630,9 +2754,17 @@ mod tests {
         assert!(out.contains("◈BOTH"), "missing Both divider badge");
         assert!(out.contains("[AL]"), "missing [AL] card badge");
         assert!(out.contains("[MAL]"), "missing [MAL] card badge");
+        assert!(out.contains("·  Watch"), "missing spaced Watching label on card");
+        assert!(out.contains("· 󰄬 Done"), "missing spaced Completed label on card");
 
-        // Now open interactive Watchlist Target Picker modal and verify render
-        state.open_watchlist_prompt(both_show, WatchlistPromptMode::Add, false);
+        // Now open interactive Bento Status & Tracker List Picker modal and verify render
+        state.open_watchlist_status_picker(
+            both_show,
+            crate::state::WatchlistPromptMode::Add,
+            Some(WatchStatus::Watching),
+            Some(WatchlistSource::Both),
+            false,
+        );
         terminal
             .draw(|f| {
                 render(f, &mut state, &data);
@@ -2647,8 +2779,10 @@ mod tests {
             }
             modal_out.push('\n');
         }
-        assert!(modal_out.contains("ADD TO WATCHLIST DATABASES"));
-        assert!(modal_out.contains("Both Databases (AniList + MyAnimeList + Solus)"));
+        assert!(modal_out.contains("UPDATE ANIME STATUS & TRACKER LIST"));
+        assert!(modal_out.contains("Both (AL + MAL)"));
+        assert!(modal_out.contains("Plan to Watch"));
+        assert!(modal_out.contains("Dropped"));
     }
 
     #[test]

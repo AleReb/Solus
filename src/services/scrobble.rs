@@ -6,11 +6,11 @@
 
 use crate::api::anilist::AniListClient;
 use crate::api::mal::MalClient;
-use crate::config::{AuthConfig, TrackerProvider, TrackersConfig, WatchlistTarget};
+use crate::config::{AuthConfig, TrackerProvider, TrackersConfig, WatchStatus, WatchlistTarget};
 use crate::db::cache::{get_mal_id_for_anime, save_crosswalk_links, upsert_anime, Anime};
 use crate::db::user::{
-    add_to_watchlist, delete_tracker_entry, get_anime_watchlist_source, remove_from_watchlist,
-    upsert_tracker_entry, WatchlistSource,
+    add_to_watchlist_with_status, delete_tracker_entry, get_active_profile_id,
+    get_anime_watchlist_source, remove_from_watchlist, upsert_tracker_entry, WatchlistSource,
 };
 use crate::error::Result;
 use crate::services::tracker_merge::MergeDiffItem;
@@ -211,6 +211,7 @@ pub async fn sync_episode_watched_all(
 }
 
 /// Add an anime to Solus Watchlist AND push `PLANNING` live to the chosen tracker DB(s).
+#[allow(dead_code)]
 pub async fn add_watchlist_to_target(
     pool: &SqlitePool,
     anime: &Anime,
@@ -219,8 +220,54 @@ pub async fn add_watchlist_to_target(
     trackers: &TrackersConfig,
     now: i64,
 ) -> Result<WritebackOutcome> {
+    set_watchlist_status_on_target(pool, anime, WatchStatus::Planning, target, auth, trackers, now)
+        .await
+}
+
+/// Set an anime's canonical `WatchStatus` in Solus SQLite AND push live to chosen tracker DB(s).
+pub async fn set_watchlist_status_on_target(
+    pool: &SqlitePool,
+    anime: &Anime,
+    status: WatchStatus,
+    target: WatchlistTarget,
+    auth: &mut AuthConfig,
+    trackers: &TrackersConfig,
+    now: i64,
+) -> Result<WritebackOutcome> {
     upsert_anime(pool, anime).await?;
-    add_to_watchlist(pool, anime.id, now).await?;
+    add_to_watchlist_with_status(pool, anime.id, status, now).await?;
+
+    let pid = get_active_profile_id(pool).await;
+    match status {
+        WatchStatus::Watching => {
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
+                 VALUES (?, ?, 0, ?)",
+            )
+            .bind(&pid)
+            .bind(anime.id)
+            .bind(now)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query(
+                "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'continue_watching'",
+            )
+            .bind(&pid)
+            .bind(anime.id)
+            .execute(pool)
+            .await;
+        }
+        WatchStatus::Completed | WatchStatus::Dropped => {
+            let _ = sqlx::query(
+                "DELETE FROM continue_watching WHERE profile_id = ? AND anime_id = ?",
+            )
+            .bind(&pid)
+            .bind(anime.id)
+            .execute(pool)
+            .await;
+        }
+        _ => {}
+    }
 
     let mal_cid = trackers.resolved_mal_client_id();
     if matches!(target, WatchlistTarget::Both | WatchlistTarget::Mal) {
@@ -247,7 +294,7 @@ pub async fn add_watchlist_to_target(
     let mal_tok = if want_mal { auth.mal_token() } else { None };
     if want_mal && mal_tok.is_none() {
         outcome.warnings.push(if auth.mal.username.is_some() {
-            "MAL read-only (connect OAuth in [L] to write)".into()
+            "MAL read-only (press [p] Password Login in [L] to write)".into()
         } else {
             "MAL not connected".into()
         });
@@ -260,10 +307,17 @@ pub async fn add_watchlist_to_target(
         None
     };
 
+    let status_str = status.to_tracker_status();
+    let completed_eps = if status == WatchStatus::Completed {
+        anime.episodes.filter(|&e| e > 0).map(|e| e as u32)
+    } else {
+        None
+    };
+
     let al_fut = async {
         if let Some(tok) = al_tok {
             let client = AniListClient::with_token(Some(tok));
-            Some(client.save_planning_entry(anime.id).await)
+            Some(client.save_list_entry(anime.id, status_str, completed_eps).await)
         } else {
             None
         }
@@ -273,10 +327,10 @@ pub async fn add_watchlist_to_target(
         if let Some(tok) = mal_tok {
             if let Some(mid) = mal_id {
                 let client = MalClient::with_token(mal_cid.clone(), Some(tok));
-                Some(client.update_list_status(mid, "PLANNING", None, None).await)
+                Some(client.update_list_status(mid, status_str, completed_eps, None).await)
             } else {
                 Some(Err(crate::error::AppError::Parse(
-                    "Unable to resolve MAL ID for live add".into(),
+                    "Unable to resolve MAL ID for live update".into(),
                 )))
             }
         } else {
@@ -285,6 +339,7 @@ pub async fn add_watchlist_to_target(
     };
 
     let (al_res, mal_res) = tokio::join!(al_fut, mal_fut);
+    let stored_prog = completed_eps.unwrap_or(0);
 
     if let Some(res) = al_res {
         match res {
@@ -294,8 +349,8 @@ pub async fn add_watchlist_to_target(
                     pool,
                     anime.id,
                     TrackerProvider::AniList,
-                    "PLANNING",
-                    0,
+                    status_str,
+                    stored_prog,
                     None,
                     Some(now),
                     now,
@@ -314,8 +369,8 @@ pub async fn add_watchlist_to_target(
                     pool,
                     anime.id,
                     TrackerProvider::Mal,
-                    "PLANNING",
-                    0,
+                    status_str,
+                    stored_prog,
                     None,
                     Some(now),
                     now,
@@ -326,11 +381,11 @@ pub async fn add_watchlist_to_target(
         }
     }
 
-    let label = match target {
-        WatchlistTarget::Local => "Added to Solus Watchlist (Local)",
-        _ => "Added to Watchlist",
+    let action_label = match target {
+        WatchlistTarget::Local => format!("Labeled \"{}\" · {} (Local)", anime.display_title(), status.full_label()),
+        _ => format!("Labeled \"{}\" · {}", anime.display_title(), status.full_label()),
     };
-    Ok(outcome.finalize(label))
+    Ok(outcome.finalize(&action_label))
 }
 
 /// Remove an anime from the selected live tracker database(s) AND update Solus SQLite cleanly.
@@ -578,7 +633,7 @@ pub async fn push_parity_diffs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{init, user::is_in_watchlist};
+    use crate::db::{init, user::{add_to_watchlist, is_in_watchlist}};
 
     fn sample_anime(id: i64, mal_id: Option<i64>, title: &str) -> Anime {
         Anime {

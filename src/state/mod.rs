@@ -109,36 +109,55 @@ pub enum WatchlistPromptMode {
     RemoveShared,
 }
 
-/// Interactive Watchlist Database Target Picker modal overlay state.
+/// Selectable action row inside the Bento Status & Tracker List Picker popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchlistPickerChoice {
+    SetStatus(crate::config::WatchStatus),
+    Remove,
+}
+
+/// Interactive Status & Watchlist Database Target Picker modal overlay state.
 #[derive(Debug, Clone)]
 pub struct WatchlistTargetPrompt {
     pub anime: Anime,
     pub mode: WatchlistPromptMode,
     pub cursor: usize,
+    pub target: crate::config::WatchlistTarget,
+    pub current_status: Option<crate::config::WatchStatus>,
+    pub current_source: Option<crate::db::user::WatchlistSource>,
     pub from_detail: bool,
 }
 
 impl WatchlistTargetPrompt {
-    pub fn options_for_mode(&self) -> [crate::config::WatchlistTarget; 4] {
-        match self.mode {
-            WatchlistPromptMode::Add => [
-                crate::config::WatchlistTarget::Both,
-                crate::config::WatchlistTarget::AniList,
-                crate::config::WatchlistTarget::Mal,
-                crate::config::WatchlistTarget::Local,
-            ],
-            WatchlistPromptMode::RemoveShared => [
-                crate::config::WatchlistTarget::Both,
-                crate::config::WatchlistTarget::Mal,
-                crate::config::WatchlistTarget::AniList,
-                crate::config::WatchlistTarget::Local,
-            ],
-        }
+    pub const CHOICES: [WatchlistPickerChoice; 6] = [
+        WatchlistPickerChoice::SetStatus(crate::config::WatchStatus::Watching),
+        WatchlistPickerChoice::SetStatus(crate::config::WatchStatus::Planning),
+        WatchlistPickerChoice::SetStatus(crate::config::WatchStatus::Completed),
+        WatchlistPickerChoice::SetStatus(crate::config::WatchStatus::Paused),
+        WatchlistPickerChoice::SetStatus(crate::config::WatchStatus::Dropped),
+        WatchlistPickerChoice::Remove,
+    ];
+
+    pub fn selected_choice(&self) -> WatchlistPickerChoice {
+        Self::CHOICES[self.cursor.min(Self::CHOICES.len() - 1)]
     }
 
+    pub fn cycle_target(&mut self, forward: bool) {
+        self.target = if forward {
+            self.target.next()
+        } else {
+            self.target.prev()
+        };
+    }
+
+    #[allow(dead_code)]
+    pub fn options_for_mode(&self) -> [crate::config::WatchlistTarget; 4] {
+        crate::config::WatchlistTarget::ALL
+    }
+
+    #[allow(dead_code)]
     pub fn selected_target(&self) -> crate::config::WatchlistTarget {
-        let opts = self.options_for_mode();
-        opts[self.cursor.min(opts.len() - 1)]
+        self.target
     }
 }
 
@@ -1444,27 +1463,54 @@ impl AppState {
         self.oauth_pending = None;
     }
 
-    /// Open the interactive Watchlist Database Target Picker popup.
-    pub fn open_watchlist_prompt(&mut self, anime: Anime, mode: WatchlistPromptMode, from_detail: bool) {
-        let default_cursor = match mode {
-            WatchlistPromptMode::Add => {
-                let has_al = self.auth.has_anilist();
-                let has_mal = self.auth.has_mal();
-                match (has_al, has_mal) {
-                    (true, true) => 0,   // Both
-                    (true, false) => 1,  // AniList
-                    (false, true) => 2,  // MAL
-                    (false, false) => 3, // Local
-                }
+    /// Open the interactive Bento Status & Watchlist Database Target Picker popup.
+    pub fn open_watchlist_status_picker(
+        &mut self,
+        anime: Anime,
+        mode: WatchlistPromptMode,
+        current_status: Option<crate::config::WatchStatus>,
+        current_source: Option<crate::db::user::WatchlistSource>,
+        from_detail: bool,
+    ) {
+        let has_al = self.auth.has_anilist();
+        let has_mal = self.auth.has_mal();
+        let default_target = match current_source {
+            Some(crate::db::user::WatchlistSource::Both) if has_al && has_mal => {
+                crate::config::WatchlistTarget::Both
             }
-            WatchlistPromptMode::RemoveShared => 0,
+            Some(crate::db::user::WatchlistSource::AniList) if has_al => {
+                crate::config::WatchlistTarget::AniList
+            }
+            Some(crate::db::user::WatchlistSource::Mal) if has_mal => {
+                crate::config::WatchlistTarget::Mal
+            }
+            _ => match (has_al, has_mal) {
+                (true, true) => crate::config::WatchlistTarget::Both,
+                (true, false) => crate::config::WatchlistTarget::AniList,
+                (false, true) => crate::config::WatchlistTarget::Mal,
+                (false, false) => crate::config::WatchlistTarget::Local,
+            },
+        };
+        let default_cursor = match mode {
+            WatchlistPromptMode::RemoveShared => 5,
+            WatchlistPromptMode::Add => current_status
+                .map(|st| st.picker_index())
+                .unwrap_or(1),
         };
         self.watchlist_target_prompt = Some(WatchlistTargetPrompt {
             anime,
             mode,
             cursor: default_cursor,
+            target: default_target,
+            current_status,
+            current_source,
             from_detail,
         });
+    }
+
+    /// Compatibility wrapper opening the Status & Watchlist Target Picker popup.
+    pub fn open_watchlist_prompt(&mut self, anime: Anime, mode: WatchlistPromptMode, from_detail: bool) {
+        self.open_watchlist_status_picker(anime, mode, None, None, from_detail);
     }
 
     /// Open the Tailored Algorithm 10-question wizard.

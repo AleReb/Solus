@@ -670,13 +670,151 @@ impl MergePolicy {
     }
 }
 
-/// Target database(s) chosen when interactively adding or removing Watchlist items
+/// Target database(s) chosen when interactively adding, labeling, or removing Watchlist items
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchlistTarget {
     Both,
     AniList,
     Mal,
     Local,
+}
+
+impl WatchlistTarget {
+    pub const ALL: [WatchlistTarget; 4] = [
+        WatchlistTarget::Both,
+        WatchlistTarget::AniList,
+        WatchlistTarget::Mal,
+        WatchlistTarget::Local,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "Both (AL + MAL)",
+            Self::AniList => "AniList",
+            Self::Mal => "MyAnimeList",
+            Self::Local => "Local Only",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Both => Self::AniList,
+            Self::AniList => Self::Mal,
+            Self::Mal => Self::Local,
+            Self::Local => Self::Both,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Both => Self::Local,
+            Self::AniList => Self::Both,
+            Self::Mal => Self::AniList,
+            Self::Local => Self::Mal,
+        }
+    }
+}
+
+/// Canonical 5-state anime list status shared across Solus, AniList, and MyAnimeList.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WatchStatus {
+    Watching,
+    #[default]
+    Planning,
+    Completed,
+    Paused,
+    Dropped,
+}
+
+impl WatchStatus {
+    pub const ALL: [WatchStatus; 5] = [
+        WatchStatus::Watching,
+        WatchStatus::Planning,
+        WatchStatus::Completed,
+        WatchStatus::Paused,
+        WatchStatus::Dropped,
+    ];
+
+    pub fn from_tracker_status(raw: &str) -> Self {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "CURRENT" | "WATCHING" | "REPEATING" => Self::Watching,
+            "COMPLETED" => Self::Completed,
+            "PAUSED" | "ON_HOLD" | "ON-HOLD" | "ONHOLD" => Self::Paused,
+            "DROPPED" => Self::Dropped,
+            _ => Self::Planning,
+        }
+    }
+
+    pub fn to_tracker_status(self) -> &'static str {
+        match self {
+            Self::Watching => "CURRENT",
+            Self::Planning => "PLANNING",
+            Self::Completed => "COMPLETED",
+            Self::Paused => "PAUSED",
+            Self::Dropped => "DROPPED",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Watching => "",
+            Self::Planning => "󰃰",
+            Self::Completed => "󰄬",
+            Self::Paused => "󰏤",
+            Self::Dropped => "󰅖",
+        }
+    }
+
+    pub fn short_word(self) -> &'static str {
+        match self {
+            Self::Watching => "Watch",
+            Self::Planning => "Plan",
+            Self::Completed => "Done",
+            Self::Paused => "Hold",
+            Self::Dropped => "Drop",
+        }
+    }
+
+    pub fn short_card_tag(self) -> &'static str {
+        match self {
+            Self::Watching => " Watch",
+            Self::Planning => "󰃰 Plan",
+            Self::Completed => "󰄬 Done",
+            Self::Paused => "󰏤 Hold",
+            Self::Dropped => "󰅖 Drop",
+        }
+    }
+
+    pub fn full_label(self) -> &'static str {
+        match self {
+            Self::Watching => "Watching",
+            Self::Planning => "Plan to Watch",
+            Self::Completed => "Completed",
+            Self::Paused => "On-Hold",
+            Self::Dropped => "Dropped",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Watching => "Active rotation — tracks episodes as you watch",
+            Self::Planning => "Saved in your backlog for later",
+            Self::Completed => "Finished all episodes of this show",
+            Self::Paused => "Paused temporarily — keeps your episode spot",
+            Self::Dropped => "Stopped watching — kept in your list history",
+        }
+    }
+
+    pub fn picker_index(self) -> usize {
+        match self {
+            Self::Watching => 0,
+            Self::Planning => 1,
+            Self::Completed => 2,
+            Self::Paused => 3,
+            Self::Dropped => 4,
+        }
+    }
 }
 
 /// Connection & token state for a single tracker provider

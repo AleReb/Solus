@@ -75,9 +75,13 @@ enum AppMessage {
         vlc: bool,
         prompt_setup: bool,
     },
-    /// Watchlist changed — send fresh grouped list and provenance sources to update home row immediately
-    WatchlistUpdated(Vec<db::cache::Anime>, std::collections::HashMap<i64, db::user::WatchlistSource>),
-    /// Live Watchlist database writeback completed (`+` / `x` popup or direct delete)
+    /// Watchlist changed — send fresh grouped list, provenance sources, and statuses to update home row immediately
+    WatchlistUpdated(
+        Vec<db::cache::Anime>,
+        std::collections::HashMap<i64, db::user::WatchlistSource>,
+        std::collections::HashMap<i64, config::WatchStatus>,
+    ),
+    /// Live Watchlist status / database writeback completed (`+` / `x` popup or direct delete)
     WatchlistWritebackCompleted {
         anime_id: i64,
         removed_completely: bool,
@@ -85,6 +89,8 @@ enum AppMessage {
         outcome_summary: String,
         wl: Vec<db::cache::Anime>,
         sources: std::collections::HashMap<i64, db::user::WatchlistSource>,
+        statuses: std::collections::HashMap<i64, config::WatchStatus>,
+        cw: Vec<db::cache::Anime>,
     },
     /// Dual-tracker sync / OAuth / username sync completed cleanly
     TrackerSyncCompleted {
@@ -761,9 +767,10 @@ async fn main() -> anyhow::Result<()> {
                         state.open_setup();
                     }
                 }
-                AppMessage::WatchlistUpdated(list, sources) => {
+                AppMessage::WatchlistUpdated(list, sources, statuses) => {
                     home_data.watchlist = list;
                     home_data.watchlist_sources = sources;
+                    home_data.watchlist_statuses = statuses;
                     let max_idx = home_data.watchlist.len().saturating_sub(1);
                     let offset  = state.row_offset("watchlist").min(max_idx);
                     state.row_offsets.insert("watchlist".to_string(), offset);
@@ -777,12 +784,19 @@ async fn main() -> anyhow::Result<()> {
                     outcome_summary,
                     wl,
                     sources,
+                    statuses,
+                    cw,
                 } => {
                     home_data.watchlist = wl;
                     home_data.watchlist_sources = sources;
+                    home_data.watchlist_statuses = statuses;
+                    home_data.continue_watching = cw;
                     let max_idx = home_data.watchlist.len().saturating_sub(1);
                     let offset = state.row_offset("watchlist").min(max_idx);
                     state.row_offsets.insert("watchlist".to_string(), offset);
+                    let cw_max = home_data.continue_watching.len().saturating_sub(1);
+                    let cw_off = state.row_offset("continue_watching").min(cw_max);
+                    state.row_offsets.insert("continue_watching".to_string(), cw_off);
                     if state.active_row == state::CategoryRow::Watchlist && home_data.watchlist.is_empty() {
                         state.active_row = next_non_empty_row(&state.active_row, &home_data, 1);
                     }
@@ -1041,6 +1055,9 @@ async fn main() -> anyhow::Result<()> {
                                 home_data.watchlist = wl;
                                 home_data.watchlist_sources = sources;
                             }
+                            if let Ok(statuses) = db::user::get_watchlist_statuses(&pool).await {
+                                home_data.watchlist_statuses = statuses;
+                            }
                             refresh_home_cover(&mut state, &home_data, &pool, &tx);
                             prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
                         }
@@ -1069,6 +1086,9 @@ async fn main() -> anyhow::Result<()> {
                             if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(&pool).await {
                                 home_data.watchlist = wl;
                                 home_data.watchlist_sources = sources;
+                            }
+                            if let Ok(statuses) = db::user::get_watchlist_statuses(&pool).await {
+                                home_data.watchlist_statuses = statuses;
                             }
                             refresh_home_cover(&mut state, &home_data, &pool, &tx);
                             prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
@@ -2826,15 +2846,10 @@ async fn handle_home(
             state.open_setup();
         }
 
-        // Toggle watchlist for the highlighted card directly from Home
+        // Open Bento Status & Tracker List Picker for the highlighted card from Home
         KeyCode::Char('+') => {
             if let Some(anime) = active_anime(state, home_data) {
-                let in_wl = db::user::is_in_watchlist(pool, anime.id).await.unwrap_or(false);
-                if in_wl {
-                    trigger_watchlist_remove_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
-                } else {
-                    trigger_watchlist_add_flow(anime, false, Some(home_data), state, pool, cfg, tx).await;
-                }
+                trigger_watchlist_status_picker_flow(anime, false, Some(home_data), state, pool).await;
             }
         }
 
@@ -4129,14 +4144,10 @@ async fn handle_detail(
             }
         }
 
-        // Watchlist toggle — updates live across databases via interactive Target Picker
+        // Watchlist / Status label picker — updates status or removes across connected trackers
         KeyCode::Char('+') => {
             if let Some(anime) = state.selected_anime.clone() {
-                if state.in_watchlist {
-                    trigger_watchlist_remove_flow(anime, true, None, state, pool, cfg, tx).await;
-                } else {
-                    trigger_watchlist_add_flow(anime, true, None, state, pool, cfg, tx).await;
-                }
+                trigger_watchlist_status_picker_flow(anime, true, None, state, pool).await;
             }
         }
 
@@ -5161,7 +5172,8 @@ fn handle_setup(
 
 async fn broadcast_watchlist(pool: &sqlx::SqlitePool, tx: &tokio::sync::mpsc::Sender<AppMessage>) {
     if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(pool).await {
-        let _ = tx.send(AppMessage::WatchlistUpdated(wl, sources)).await;
+        let statuses = db::user::get_watchlist_statuses(pool).await.unwrap_or_default();
+        let _ = tx.send(AppMessage::WatchlistUpdated(wl, sources, statuses)).await;
     }
 }
 
@@ -5180,43 +5192,33 @@ fn spawn_merge_audit(
     });
 }
 
-async fn trigger_watchlist_add_flow(
+async fn trigger_watchlist_status_picker_flow(
     anime: db::cache::Anime,
     from_detail: bool,
-    home_data_opt: Option<&mut ui::home::HomeData>,
+    home_data_opt: Option<&ui::home::HomeData>,
     state: &mut AppState,
     pool: &sqlx::SqlitePool,
-    _cfg: &config::Config,
-    tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let _ = db::cache::upsert_anime(pool, &anime).await;
-    if state.auth.is_authenticated() {
-        state.open_watchlist_prompt(anime, state::WatchlistPromptMode::Add, from_detail);
-        return;
-    }
-
-    let now = unix_now();
-    if db::user::add_to_watchlist(pool, anime.id, now).await.is_ok() {
-        if from_detail {
-            state.in_watchlist = true;
-        }
-        if state.screen == Screen::Calendar {
-            state.calendar_tracked_ids.insert(anime.id);
-        }
-        state.show_toast("Added to Solus Watchlist (Local)", now);
-        if let Some(hd) = home_data_opt {
-            if let Ok((wl, sources)) = services::sync::load_watchlist_with_sources(pool).await {
-                hd.watchlist = wl;
-                hd.watchlist_sources = sources;
-            }
-        } else {
-            let pool2 = pool.clone();
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                broadcast_watchlist(&pool2, &tx2).await;
-            });
-        }
-    }
+    let current_status = home_data_opt
+        .and_then(|hd| hd.watchlist_statuses.get(&anime.id).copied())
+        .or(db::user::get_anime_watch_status(pool, anime.id).await);
+    let in_wl = db::user::is_in_watchlist(pool, anime.id).await.unwrap_or(false);
+    let current_source = if in_wl || current_status.is_some() {
+        home_data_opt
+            .and_then(|hd| hd.watchlist_sources.get(&anime.id).copied())
+            .or_else(|| None)
+            .or(db::user::get_anime_watchlist_source(pool, anime.id).await.ok())
+    } else {
+        None
+    };
+    state.open_watchlist_status_picker(
+        anime,
+        state::WatchlistPromptMode::Add,
+        current_status,
+        current_source,
+        from_detail,
+    );
 }
 
 async fn trigger_watchlist_remove_flow(
@@ -5236,9 +5238,19 @@ async fn trigger_watchlist_remove_flow(
                 .await
                 .unwrap_or(db::user::WatchlistSource::Local),
         );
+    let current_status = home_data_opt
+        .as_ref()
+        .and_then(|hd| hd.watchlist_statuses.get(&anime.id).copied())
+        .or(db::user::get_anime_watch_status(pool, anime.id).await);
 
     if source == db::user::WatchlistSource::Both {
-        state.open_watchlist_prompt(anime, state::WatchlistPromptMode::RemoveShared, from_detail);
+        state.open_watchlist_status_picker(
+            anime,
+            state::WatchlistPromptMode::RemoveShared,
+            current_status,
+            Some(source),
+            from_detail,
+        );
         return;
     }
 
@@ -5254,6 +5266,7 @@ async fn trigger_watchlist_remove_flow(
     if let Some(hd) = home_data_opt {
         hd.watchlist.retain(|a| a.id != anime.id);
         hd.watchlist_sources.remove(&anime.id);
+        hd.watchlist_statuses.remove(&anime.id);
         let max_idx = hd.watchlist.len().saturating_sub(1);
         let offset = state.row_offset("watchlist").min(max_idx);
         state.row_offsets.insert("watchlist".to_string(), offset);
@@ -5288,6 +5301,10 @@ async fn trigger_watchlist_remove_flow(
         let (wl, sources) = services::sync::load_watchlist_with_sources(&pool2)
             .await
             .unwrap_or_default();
+        let statuses = db::user::get_watchlist_statuses(&pool2).await.unwrap_or_default();
+        let cw = services::sync::load_continue_watching(&pool2)
+            .await
+            .unwrap_or_default();
         let still_in_wl = db::user::is_in_watchlist(&pool2, anime.id).await.unwrap_or(false);
         let _ = tx2
             .send(AppMessage::WatchlistWritebackCompleted {
@@ -5297,14 +5314,16 @@ async fn trigger_watchlist_remove_flow(
                 outcome_summary: outcome.summary,
                 wl,
                 sources,
+                statuses,
+                cw,
             })
             .await;
     });
 }
 
-async fn commit_watchlist_target(
+async fn commit_watchlist_choice(
     prompt: state::WatchlistTargetPrompt,
-    target: config::WatchlistTarget,
+    choice: state::WatchlistPickerChoice,
     state: &mut AppState,
     pool: &sqlx::SqlitePool,
     cfg: &config::Config,
@@ -5312,21 +5331,30 @@ async fn commit_watchlist_target(
 ) {
     let now = unix_now();
     let anime = prompt.anime;
-    let is_add = prompt.mode == state::WatchlistPromptMode::Add;
-    let target_label = match target {
-        config::WatchlistTarget::Both => "Both (AniList + MAL)",
-        config::WatchlistTarget::AniList => "AniList",
-        config::WatchlistTarget::Mal => "MyAnimeList",
-        config::WatchlistTarget::Local => "Local Solus",
-    };
+    let target = prompt.target;
+    let target_label = target.label();
 
-    if is_add {
-        if prompt.from_detail {
-            state.in_watchlist = true;
+    let is_add = matches!(choice, state::WatchlistPickerChoice::SetStatus(_));
+    match choice {
+        state::WatchlistPickerChoice::SetStatus(status) => {
+            if prompt.from_detail {
+                state.in_watchlist = true;
+            }
+            state.show_toast(
+                format!(
+                    "Labeling \"{}\" · {} ({target_label})...",
+                    anime.display_title(),
+                    status.full_label()
+                ),
+                now,
+            );
         }
-        state.show_toast(format!("Adding \"{}\" to {target_label}...", anime.display_title()), now);
-    } else {
-        state.show_toast(format!("Updating {target_label} database..."), now);
+        state::WatchlistPickerChoice::Remove => {
+            state.show_toast(
+                format!("Removing \"{}\" ({target_label})...", anime.display_title()),
+                now,
+            );
+        }
     }
 
     let pool2 = pool.clone();
@@ -5334,31 +5362,39 @@ async fn commit_watchlist_target(
     let mut auth_clone = state.auth.clone();
     let trackers_cfg = cfg.trackers.clone();
     tokio::spawn(async move {
-        let outcome = if is_add {
-            services::scrobble::add_watchlist_to_target(
-                &pool2,
-                &anime,
-                target,
-                &mut auth_clone,
-                &trackers_cfg,
-                now,
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            services::scrobble::remove_watchlist_from_target(
-                &pool2,
-                &anime,
-                target,
-                &mut auth_clone,
-                &trackers_cfg,
-                now,
-            )
-            .await
-            .unwrap_or_default()
+        let outcome = match choice {
+            state::WatchlistPickerChoice::SetStatus(status) => {
+                services::scrobble::set_watchlist_status_on_target(
+                    &pool2,
+                    &anime,
+                    status,
+                    target,
+                    &mut auth_clone,
+                    &trackers_cfg,
+                    now,
+                )
+                .await
+                .unwrap_or_default()
+            }
+            state::WatchlistPickerChoice::Remove => {
+                services::scrobble::remove_watchlist_from_target(
+                    &pool2,
+                    &anime,
+                    target,
+                    &mut auth_clone,
+                    &trackers_cfg,
+                    now,
+                )
+                .await
+                .unwrap_or_default()
+            }
         };
 
         let (wl, sources) = services::sync::load_watchlist_with_sources(&pool2)
+            .await
+            .unwrap_or_default();
+        let statuses = db::user::get_watchlist_statuses(&pool2).await.unwrap_or_default();
+        let cw = services::sync::load_continue_watching(&pool2)
             .await
             .unwrap_or_default();
         let still_in_wl = db::user::is_in_watchlist(&pool2, anime.id).await.unwrap_or(false);
@@ -5370,6 +5406,8 @@ async fn commit_watchlist_target(
                 outcome_summary: outcome.summary,
                 wl,
                 sources,
+                statuses,
+                cw,
             })
             .await;
     });
@@ -5389,42 +5427,35 @@ async fn handle_watchlist_target_modal(
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(ref mut p) = state.watchlist_target_prompt {
-                p.cursor = if p.cursor == 0 { 3 } else { p.cursor - 1 };
+                p.cursor = if p.cursor == 0 { 5 } else { p.cursor - 1 };
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(ref mut p) = state.watchlist_target_prompt {
-                p.cursor = (p.cursor + 1) % 4;
+                p.cursor = (p.cursor + 1) % 6;
             }
         }
-        KeyCode::Char('1') => {
-            if let Some(p) = state.watchlist_target_prompt.take() {
-                let target = p.options_for_mode()[0];
-                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(ref mut p) = state.watchlist_target_prompt {
+                p.cycle_target(true);
             }
         }
-        KeyCode::Char('2') => {
-            if let Some(p) = state.watchlist_target_prompt.take() {
-                let target = p.options_for_mode()[1];
-                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(ref mut p) = state.watchlist_target_prompt {
+                p.cycle_target(false);
             }
         }
-        KeyCode::Char('3') => {
+        KeyCode::Char(c @ '1'..='6') => {
+            let idx = (c as usize) - ('1' as usize);
             if let Some(p) = state.watchlist_target_prompt.take() {
-                let target = p.options_for_mode()[2];
-                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
-            }
-        }
-        KeyCode::Char('4') => {
-            if let Some(p) = state.watchlist_target_prompt.take() {
-                let target = p.options_for_mode()[3];
-                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+                let choice = state::WatchlistTargetPrompt::CHOICES[idx];
+                commit_watchlist_choice(p, choice, state, pool, cfg, tx).await;
             }
         }
         KeyCode::Enter => {
             if let Some(p) = state.watchlist_target_prompt.take() {
-                let target = p.selected_target();
-                commit_watchlist_target(p, target, state, pool, cfg, tx).await;
+                let choice = p.selected_choice();
+                commit_watchlist_choice(p, choice, state, pool, cfg, tx).await;
             }
         }
         _ => {}
@@ -8529,12 +8560,7 @@ async fn handle_calendar(
         KeyCode::Char('+') => {
             if let Some(entry) = focused_calendar_entry(state) {
                 let anime = entry.anime().clone();
-                let in_wl = db::user::is_in_watchlist(pool, anime.id).await.unwrap_or(false);
-                if in_wl {
-                    trigger_watchlist_remove_flow(anime, false, None, state, pool, cfg, tx).await;
-                } else {
-                    trigger_watchlist_add_flow(anime, false, None, state, pool, cfg, tx).await;
-                }
+                trigger_watchlist_status_picker_flow(anime, false, None, state, pool).await;
             }
         }
         _ => {}
@@ -9044,12 +9070,7 @@ async fn handle_tailored_results(
         }
         KeyCode::Char('+') => {
             if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor).cloned() {
-                let in_wl = db::user::is_in_watchlist(pool, focused.anime.id).await.unwrap_or(false);
-                if in_wl {
-                    trigger_watchlist_remove_flow(focused.anime, false, None, state, pool, cfg, tx).await;
-                } else {
-                    trigger_watchlist_add_flow(focused.anime, false, None, state, pool, cfg, tx).await;
-                }
+                trigger_watchlist_status_picker_flow(focused.anime, false, None, state, pool).await;
             }
         }
         _ => {}

@@ -1,6 +1,6 @@
 //! User data: multi-user profiles, watch history, continue watching, watchlist.
 
-use crate::config::{AudioMode, TrackerProvider};
+use crate::config::{AudioMode, TrackerProvider, WatchStatus};
 use crate::error::Result;
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
@@ -621,13 +621,28 @@ pub async fn remove_continue_watching(pool: &SqlitePool, anime_id: i64) -> Resul
 
 /// Add a show to the watchlist (and clear any prior sync dismissal).
 pub async fn add_to_watchlist(pool: &SqlitePool, anime_id: i64, now: i64) -> Result<()> {
+    add_to_watchlist_with_status(pool, anime_id, WatchStatus::Planning, now).await
+}
+
+/// Add or update a show's canonical status label in the active profile's watchlist.
+pub async fn add_to_watchlist_with_status(
+    pool: &SqlitePool,
+    anime_id: i64,
+    status: WatchStatus,
+    now: i64,
+) -> Result<()> {
     let pid = get_active_profile_id(pool).await;
     sqlx::query(
-        "INSERT OR IGNORE INTO watchlist (profile_id, anime_id, added_at) VALUES (?, ?, ?)",
+        "INSERT INTO watchlist (profile_id, anime_id, added_at, status)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
+             status   = excluded.status,
+             added_at = excluded.added_at",
     )
     .bind(&pid)
     .bind(anime_id)
     .bind(now)
+    .bind(status.to_tracker_status())
     .execute(pool)
     .await?;
     let _ = sqlx::query(
@@ -1374,15 +1389,60 @@ pub async fn get_anime_watchlist_source(
 
     let in_al = rows
         .iter()
-        .any(|(p, st)| p == TrackerProvider::AniList.as_str() && st == "PLANNING");
+        .any(|(p, _)| p == TrackerProvider::AniList.as_str());
     let in_mal = rows
         .iter()
-        .any(|(p, st)| p == TrackerProvider::Mal.as_str() && st == "PLANNING");
+        .any(|(p, _)| p == TrackerProvider::Mal.as_str());
     Ok(WatchlistSource::from_flags(in_al, in_mal))
 }
 
-/// Fetch all Watchlist anime IDs paired with their tracker provenance, grouped cleanly
-/// in deterministic `AniList -> Mal -> Both -> Local` order with zero duplicate anime IDs.
+/// Fetch resolved Watchlist statuses (`anime_id -> WatchStatus`) for the active profile.
+pub async fn get_watchlist_statuses(pool: &SqlitePool) -> Result<HashMap<i64, WatchStatus>> {
+    let pid = get_active_profile_id(pool).await;
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT anime_id, COALESCE(NULLIF(TRIM(status), ''), 'PLANNING') FROM watchlist WHERE profile_id = ?",
+    )
+    .bind(&pid)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for (id, raw_status) in rows {
+        map.insert(id, WatchStatus::from_tracker_status(&raw_status));
+    }
+    Ok(map)
+}
+
+/// Fetch the resolved `WatchStatus` for a single anime from Watchlist or connected tracker snapshots.
+pub async fn get_anime_watch_status(pool: &SqlitePool, anime_id: i64) -> Option<WatchStatus> {
+    let pid = get_active_profile_id(pool).await;
+    if let Ok(Some(raw)) = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM watchlist WHERE profile_id = ? AND anime_id = ?",
+    )
+    .bind(&pid)
+    .bind(anime_id)
+    .fetch_optional(pool)
+    .await
+    {
+        return Some(WatchStatus::from_tracker_status(&raw));
+    }
+
+    if let Ok(Some(raw)) = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM tracker_entries WHERE profile_id = ? AND anime_id = ? LIMIT 1",
+    )
+    .bind(&pid)
+    .bind(anime_id)
+    .fetch_optional(pool)
+    .await
+    {
+        return Some(WatchStatus::from_tracker_status(&raw));
+    }
+
+    None
+}
+
+/// Fetch all Watchlist anime IDs paired with their tracker provenance across all 5 statuses,
+/// ordered cleanly by `AniList -> Mal -> Both -> Local`, then status priority, with zero duplicates.
 pub async fn get_watchlist_with_sources(
     pool: &SqlitePool,
 ) -> Result<Vec<(i64, WatchlistSource)>> {
@@ -1394,14 +1454,12 @@ pub async fn get_watchlist_with_sources(
                     WHERE te.profile_id = w.profile_id
                       AND te.anime_id = w.anime_id
                       AND te.provider = 'anilist'
-                      AND te.status = 'PLANNING'
                 ) AS in_al,
                 EXISTS(
                     SELECT 1 FROM tracker_entries te
                     WHERE te.profile_id = w.profile_id
                       AND te.anime_id = w.anime_id
                       AND te.provider = 'mal'
-                      AND te.status = 'PLANNING'
                 ) AS in_mal
          FROM watchlist w
          WHERE w.profile_id = ?
@@ -1411,6 +1469,14 @@ pub async fn get_watchlist_with_sources(
                 WHEN in_al = 0 AND in_mal = 1 THEN 1
                 WHEN in_al = 1 AND in_mal = 1 THEN 2
                 ELSE 3
+            END ASC,
+            CASE w.status
+                WHEN 'CURRENT' THEN 0
+                WHEN 'PLANNING' THEN 1
+                WHEN 'PAUSED' THEN 2
+                WHEN 'COMPLETED' THEN 3
+                WHEN 'DROPPED' THEN 4
+                ELSE 1
             END ASC,
             w.added_at DESC,
             w.anime_id ASC",

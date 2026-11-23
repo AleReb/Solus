@@ -385,7 +385,7 @@ pub async fn load_more_like_this(
 /// Load HomeData directly from the local SQLite cache without any network requests.
 /// Runs in < 15ms to allow instant (<50ms) cold launch.
 pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
-    let (trending, popular, top_rated, seasonal, continue_entries, continue_watching, watchlist_pack) = tokio::join!(
+    let (trending, popular, top_rated, seasonal, continue_entries, continue_watching, watchlist_pack, watchlist_statuses) = tokio::join!(
         cache::get_category(pool, meta::TRENDING),
         cache::get_category(pool, meta::POPULAR),
         cache::get_category(pool, meta::TOP_RATED),
@@ -393,6 +393,7 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
         user::get_continue_watching(pool),
         load_continue_watching(pool),
         load_watchlist_with_sources(pool),
+        user::get_watchlist_statuses(pool),
     );
 
     let trending          = trending.unwrap_or_default();
@@ -402,6 +403,7 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     let continue_entries  = continue_entries.unwrap_or_default();
     let continue_watching = continue_watching.unwrap_or_default();
     let (watchlist, watchlist_sources) = watchlist_pack.unwrap_or_default();
+    let watchlist_statuses = watchlist_statuses.unwrap_or_default();
     let featured          = trending.first().cloned();
     let resume_next: HashMap<i64, u32> = continue_entries
         .into_iter()
@@ -410,13 +412,23 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
                 .iter()
                 .find(|anime| anime.id == entry.anime_id)
                 .map(|anime| {
-                    let next = (entry.last_episode as u32).saturating_add(1);
+                    let next = if entry.last_episode <= 0 {
+                        1
+                    } else {
+                        (entry.last_episode as u32).saturating_add(1)
+                    };
                     match anime.episodes {
                         Some(total) => next.min(total as u32).max(1),
                         None => next.max(1),
                     }
                 })
-                .unwrap_or_else(|| (entry.last_episode as u32).saturating_add(1).max(1));
+                .unwrap_or_else(|| {
+                    if entry.last_episode <= 0 {
+                        1
+                    } else {
+                        (entry.last_episode as u32).saturating_add(1).max(1)
+                    }
+                });
             (entry.anime_id, next)
         })
         .collect();
@@ -467,6 +479,7 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
         continue_watching,
         watchlist,
         watchlist_sources,
+        watchlist_statuses,
         progress_labels,
         resume_next,
         trending,

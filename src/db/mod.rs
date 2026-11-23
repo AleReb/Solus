@@ -377,6 +377,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
     }
 
+    // Schema enhancement: store canonical 5-state list status directly on watchlist entries
+    let _ = sqlx::query(
+        "ALTER TABLE watchlist ADD COLUMN status TEXT NOT NULL DEFAULT 'PLANNING';",
+    )
+    .execute(pool)
+    .await;
+
     // Performance indexes for instant local browsing, scrobbling, and history aggregation
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_history_profile_anime ON history(profile_id, anime_id);")
         .execute(pool)

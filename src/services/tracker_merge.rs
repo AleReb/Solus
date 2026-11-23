@@ -338,18 +338,18 @@ pub async fn merge_and_reconcile(
 
     let mut tx = pool.begin().await?;
 
-    // Track shows that belonged to replaced providers' Planning list so if they
+    // Track shows that belonged to replaced providers so if they
     // were removed on the website itself, they are cleanly evicted locally too.
-    let mut prev_replaced_planning: HashSet<i64> = HashSet::new();
+    let mut prev_replaced_tracked: HashSet<i64> = HashSet::new();
     for provider in replaced_providers {
         let prev_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT anime_id FROM tracker_entries WHERE profile_id = ? AND provider = ? AND status = 'PLANNING'",
+            "SELECT anime_id FROM tracker_entries WHERE profile_id = ? AND provider = ?",
         )
         .bind(&pid)
         .bind(provider.as_str())
         .fetch_all(&mut *tx)
         .await?;
-        prev_replaced_planning.extend(prev_ids);
+        prev_replaced_tracked.extend(prev_ids);
 
         sqlx::query("DELETE FROM tracker_entries WHERE profile_id = ? AND provider = ?")
             .bind(&pid)
@@ -464,15 +464,25 @@ pub async fn merge_and_reconcile(
             }
         }
 
+        if !dismissed_wl.contains(&anime_id) {
+            sqlx::query(
+                "INSERT INTO watchlist (profile_id, anime_id, added_at, status)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(profile_id, anime_id) DO UPDATE SET
+                     status   = excluded.status,
+                     added_at = MAX(watchlist.added_at, excluded.added_at)",
+            )
+            .bind(&pid)
+            .bind(anime_id)
+            .bind(resolved.best_updated_at.max(now))
+            .bind(&resolved.status)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         match resolved.status.as_str() {
             "CURRENT" => {
-                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
-                    .bind(&pid)
-                    .bind(anime_id)
-                    .execute(&mut *tx)
-                    .await?;
-
-                if resolved.progress > 0 && !dismissed_cw.contains(&anime_id) {
+                if resolved.progress > 0 {
                     sqlx::query(
                         "INSERT INTO history (profile_id, anime_id, episode, watched_at)
                          VALUES (?, ?, ?, ?)
@@ -484,7 +494,9 @@ pub async fn merge_and_reconcile(
                     .bind(now)
                     .execute(&mut *tx)
                     .await?;
+                }
 
+                if !dismissed_cw.contains(&anime_id) {
                     sqlx::query(
                         "INSERT INTO continue_watching (profile_id, anime_id, last_episode, last_watched)
                          VALUES (?, ?, ?, ?)
@@ -508,50 +520,20 @@ pub async fn merge_and_reconcile(
                     .await;
                 }
             }
-            "PLANNING" => {
-                if !dismissed_wl.contains(&anime_id) {
-                    sqlx::query("INSERT OR IGNORE INTO watchlist (profile_id, anime_id, added_at) VALUES (?, ?, ?)")
-                        .bind(&pid)
-                        .bind(anime_id)
-                        .bind(resolved.best_updated_at.max(now))
-                        .execute(&mut *tx)
-                        .await?;
-
-                    let _ = sqlx::query(
-                        "DELETE FROM dismissed_sync WHERE profile_id = ? AND anime_id = ? AND list_type = 'watchlist'",
-                    )
-                    .bind(&pid)
-                    .bind(anime_id)
-                    .execute(&mut *tx)
-                    .await;
-                }
-            }
-            "COMPLETED" => {
-                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
-                    .bind(&pid)
-                    .bind(anime_id)
-                    .execute(&mut *tx)
-                    .await?;
+            "COMPLETED" | "DROPPED" => {
                 sqlx::query("DELETE FROM continue_watching WHERE profile_id = ? AND anime_id = ?")
                     .bind(&pid)
                     .bind(anime_id)
                     .execute(&mut *tx)
                     .await?;
             }
-            _ => {
-                // PAUSED / DROPPED: keep out of Planning Watchlist so it stays accurate
-                sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
-                    .bind(&pid)
-                    .bind(anime_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            _ => {}
         }
     }
 
     // Evict shows that vanished completely from a synced provider's website
     // unless another connected provider still holds them or they are purely Local.
-    for old_wl_id in prev_replaced_planning {
+    for old_wl_id in prev_replaced_tracked {
         if !tracked_ids.contains(&old_wl_id) {
             sqlx::query("DELETE FROM watchlist WHERE profile_id = ? AND anime_id = ?")
                 .bind(&pid)
@@ -786,8 +768,12 @@ mod tests {
         let mut wl_b = get_watchlist(&pool_b).await.unwrap();
         wl_a.sort();
         wl_b.sort();
-        assert_eq!(wl_a, vec![19, 9253]);
-        assert_eq!(wl_b, vec![19, 9253]);
+        assert_eq!(wl_a, vec![19, 9253, 154587]);
+        assert_eq!(wl_b, vec![19, 9253, 154587]);
+        let statuses_a = crate::db::user::get_watchlist_statuses(&pool_a).await.unwrap();
+        assert_eq!(statuses_a.get(&154587), Some(&crate::config::WatchStatus::Watching));
+        assert_eq!(statuses_a.get(&19), Some(&crate::config::WatchStatus::Planning));
+        assert_eq!(statuses_a.get(&9253), Some(&crate::config::WatchStatus::Planning));
     }
 
     #[tokio::test]
