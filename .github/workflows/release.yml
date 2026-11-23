@@ -142,6 +142,13 @@ jobs:
           body: |
             <!-- solus-sha:${{ github.sha }} -->
             <!-- solus-ts:${{ steps.meta.outputs.commit_ts }} -->
+            <!-- solus-notes-start -->
+            - [NEW] Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window that stays on top of other apps. How to use: Press 'p' inside the video player to turn PiP on or off, press 'Shift+P' to move it to another corner or resize it, or click [PiP:ON/OFF] and [Corner] in the Episode Launch Menu (Enter / o, or press 'w' / 'W') or Settings ('s').
+            - [NEW] Live Video & Audio Info Card: Check your video resolution, frame rate, audio language, and stream health at a glance. How to use: Press 'i' in the player to show the info card for 6 seconds, press 'Shift+I' to keep it pinned on screen, or click [i HUD] in the Episode Launch Menu or Settings ('s').
+            - [NEW] Auto-Fullscreen on Launch: Automatically open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s'), or click [AutoFS:ON/OFF] (or press 'f') in the Episode Launch Menu (Enter / o).
+            - [FIXED] Smarter Watch Queue Protection: Episodes now stay in your Watch Queue until you finish at least 90% of the episode, so closing the player early or a crash never skips ahead by accident. How to use: Press 'Q' from the home screen anytime to resume your queue right where you left off.
+            - [NEW] Plain-English Update Summaries: Every update now shows a clear, jargon-free guide to what changed, what was fixed, and how to use it. How to use: Open Settings ('s') and select 'What's New & Release Notes' anytime.
+            <!-- solus-notes-end -->
             Automated build for commit `${{ steps.meta.outputs.short_sha }}`: ${{ steps.meta.outputs.commit_msg }}
           files: artifacts/*
           draft: false

@@ -60,10 +60,11 @@ pub struct LastSeenBuild {
 }
 
 const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
-    "[NEW] Added an Auto-Fullscreen setting in the Control Hub so your video player can open in fullscreen automatically.",
-    "[FIXED] Episodes now stay in your watch queue until you finish at least 90% of the episode, so closing the player early never skips ahead.",
-    "[NEW] Added clear, jargon-free update summaries during and after updates so you always know what changed and what was fixed.",
-    "[IMPROVED] Smoother video streaming that automatically adjusts quality on slow Wi-Fi to prevent mid-episode buffering.",
+    "[NEW] Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window that stays on top of other apps. How to use: Press 'p' inside the video player to turn PiP on or off, press 'Shift+P' to move it to another corner or resize it, or click [PiP:ON/OFF] and [Corner] in the Episode Launch Menu (Enter / o, or press 'w' / 'W') or Settings ('s').",
+    "[NEW] Live Video & Audio Info Card: Check your video resolution, frame rate, audio language, and stream health at a glance. How to use: Press 'i' in the player to show the info card for 6 seconds, press 'Shift+I' to keep it pinned on screen, or click [i HUD] in the Episode Launch Menu or Settings ('s').",
+    "[NEW] Auto-Fullscreen on Launch: Automatically open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s'), or click [AutoFS:ON/OFF] (or press 'f') in the Episode Launch Menu (Enter / o).",
+    "[FIXED] Smarter Watch Queue Protection: Episodes now stay in your Watch Queue until you finish at least 90% of the episode, so closing the player early or a crash never skips ahead by accident. How to use: Press 'Q' from the home screen anytime to resume your queue right where you left off.",
+    "[NEW] Plain-English Update Summaries: Every update now shows a clear, jargon-free guide to what changed, what was fixed, and how to use it. How to use: Open Settings ('s') and select 'What's New & Release Notes' anytime.",
 ];
 
 /// Return plain-English release highlights for the currently running Solus build.
@@ -97,7 +98,7 @@ pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
         let inner_start = start_idx + "<!-- solus-notes-start -->".len();
         if inner_start < end_idx {
             for line in raw_body[inner_start..end_idx].lines() {
-                if let Some(translated) = translate_single_note_line(line) {
+                for translated in translate_note_lines(line) {
                     push_unique_bullet(&mut bullets, translated);
                 }
             }
@@ -106,7 +107,7 @@ pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
 
     if bullets.is_empty() {
         for line in raw_body.lines() {
-            if let Some(translated) = translate_single_note_line(line) {
+            for translated in translate_note_lines(line) {
                 push_unique_bullet(&mut bullets, translated);
             }
             if bullets.len() >= 5 {
@@ -135,7 +136,7 @@ fn push_unique_bullet(bullets: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn translate_single_note_line(raw_line: &str) -> Option<String> {
+fn translate_note_lines(raw_line: &str) -> Vec<String> {
     let trimmed = raw_line.trim();
     if trimmed.is_empty()
         || trimmed.starts_with("<!--")
@@ -143,7 +144,7 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         || trimmed.starts_with("Full Changelog")
         || trimmed.starts_with("**Full Changelog**")
     {
-        return None;
+        return Vec::new();
     }
 
     let mut line = trimmed
@@ -155,7 +156,7 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         }
     }
     if line.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     // Strip automated rolling release wrapper: "Automated build for commit `abcd123`: <msg>"
@@ -165,7 +166,7 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         }
     }
     if line.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     for prefix in ["Simple:", "simple:", "Note:", "note:"] {
@@ -176,9 +177,9 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
                     || clean.starts_with("[FIXED]")
                     || clean.starts_with("[IMPROVED]")
                 {
-                    return Some(ensure_period(clean));
+                    return vec![ensure_period(clean)];
                 }
-                return Some(format!("[IMPROVED] {}", ensure_period(clean)));
+                return vec![format!("[IMPROVED] {}", ensure_period(clean))];
             }
         }
     }
@@ -187,7 +188,7 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         if let Some(rest) = line.strip_prefix(badge) {
             let cleaned = strip_github_trailers(rest.trim());
             if !cleaned.is_empty() {
-                return Some(format!("{} {}", badge, ensure_period(&cleaned)));
+                return vec![format!("{} {}", badge, ensure_period(&cleaned))];
             }
         }
     }
@@ -207,13 +208,14 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         || lower.starts_with("build:")
         || lower.starts_with("bump ")
     {
-        return None;
+        return Vec::new();
     }
 
     let badge = if lower.starts_with("feat")
         || lower.starts_with("add ")
         || lower.starts_with("added ")
         || lower.starts_with("introduce")
+        || lower.starts_with("port ")
     {
         "[NEW]"
     } else if lower.starts_with("fix")
@@ -231,13 +233,31 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
     let stripped = strip_conventional_prefix(line);
     let stripped = strip_github_trailers(&stripped);
     if stripped.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let s_lower = stripped.to_ascii_lowercase();
+    let mut matched = Vec::new();
+
+    if s_lower.contains("pip")
+        || s_lower.contains("picture-in-picture")
+        || s_lower.contains("picture on picture")
+        || s_lower.contains("floating")
+    {
+        matched.push(format!(
+            "{} Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window on top of other apps. How to use: Press 'p' in the player to toggle PiP, 'Shift+P' to move corners/resize, or toggle it in the Episode Launch Menu ('w'/'W') or Settings ('s').",
+            badge
+        ));
+    }
+    if s_lower.contains("bento") || s_lower.contains("info hud") || s_lower.contains("video info") {
+        matched.push(format!(
+            "{} Live Video & Audio Info Card: View video quality, frame rate, audio track, and stream health on screen. How to use: Press 'i' in the player for a 6-second peek, 'Shift+I' to pin it live, or click [i HUD] in the Episode Launch Menu or Settings ('s').",
+            badge
+        ));
+    }
     if s_lower.contains("fullscreen") || s_lower.contains("auto_fullscreen") {
-        return Some(format!(
-            "{} Added an Auto-Fullscreen setting in the Control Hub so your video player can open in fullscreen automatically.",
+        matched.push(format!(
+            "{} Auto-Fullscreen on Launch: Open your video player in fullscreen as soon as an episode starts. How to use: Turn on 'Auto-Fullscreen on Launch' in Settings ('s') or press 'f' in the Episode Launch Menu (Enter / o).",
             badge
         ));
     }
@@ -250,8 +270,8 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
             || s_lower.contains("restore")
             || s_lower.contains("completion"))
     {
-        return Some(format!(
-            "{} Episodes now stay in your watch queue until you finish at least 90% of the episode, so closing the player early never skips ahead.",
+        matched.push(format!(
+            "{} Smarter Watch Queue Protection: Episodes stay in your queue until you finish at least 90% of the episode, so closing early or a crash never skips ahead. How to use: Press 'Q' from the home screen anytime to resume your queue.",
             badge
         ));
     }
@@ -263,11 +283,15 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
             || s_lower.contains("transparency")
             || s_lower.contains("popup"))
     {
-        return Some(format!(
-            "{} Added clear, jargon-free update summaries during and after updates so you always know what changed and what was fixed.",
+        matched.push(format!(
+            "{} Plain-English Update Summaries: Updates now show clear, jargon-free notes on what changed and how to use it. How to use: Open Settings ('s') and select 'What's New & Release Notes' anytime.",
             badge
         ));
     }
+    if !matched.is_empty() {
+        return matched;
+    }
+
     if s_lower.contains("network_mode")
         || s_lower.contains("auto-abr")
         || s_lower.contains("abr")
@@ -275,47 +299,47 @@ fn translate_single_note_line(raw_line: &str) -> Option<String> {
         || s_lower.contains("readahead")
         || s_lower.contains("rebuffer")
     {
-        return Some(format!(
+        return vec![format!(
             "{} Smoother video streaming that automatically adjusts quality on slow Wi-Fi to prevent mid-episode buffering.",
             badge
-        ));
+        )];
     }
     if s_lower.contains("remote") && (s_lower.contains("theme") || s_lower.contains("qr") || s_lower.contains("mobile")) {
-        return Some(format!(
+        return vec![format!(
             "{} Upgraded the phone remote control with smoother playback syncing and customizable themes.",
             badge
-        ));
+        )];
     }
     if s_lower.contains("subtitle") || s_lower.contains("subsync") || s_lower.contains("sub-delay") || s_lower.contains(".vtt") {
-        return Some(format!(
+        return vec![format!(
             "{} Cleaner, better-timed subtitles that stay in sync with voices and avoid overlapping on-screen text.",
             badge
-        ));
+        )];
     }
     if (s_lower.contains("audio") || s_lower.contains("dub")) && (s_lower.contains("switch") || s_lower.contains("track")) {
-        return Some(format!(
+        return vec![format!(
             "{} Smoother switching between Japanese (Sub) and English (Dub) audio tracks.",
             badge
-        ));
+        )];
     }
     if s_lower.contains("anilist") || s_lower.contains("mal") || s_lower.contains("scrobble") || s_lower.contains("tracker") {
-        return Some(format!(
+        return vec![format!(
             "{} More reliable episode progress saving and watchlist syncing with AniList and MyAnimeList.",
             badge
-        ));
+        )];
     }
     if s_lower.contains("cover") || s_lower.contains("thumbnail") || s_lower.contains("portrait") || s_lower.contains("banner") {
-        return Some(format!(
+        return vec![format!(
             "{} Crisper anime cover art and episode thumbnails with smoother browsing.",
             badge
-        ));
+        )];
     }
 
     let humanized = humanize_free_text(&stripped);
     if humanized.len() < 4 {
-        return None;
+        return Vec::new();
     }
-    Some(format!("{} {}", badge, ensure_period(&humanized)))
+    vec![format!("{} {}", badge, ensure_period(&humanized))]
 }
 
 fn strip_conventional_prefix(line: &str) -> String {
@@ -956,5 +980,22 @@ Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle
 
         // Subsequent launch does not re-show the same popup
         assert!(check_or_take_post_update_welcome_at(&path, "1.0.8", "2222222").is_none());
+    }
+
+    #[test]
+    fn test_default_release_notes_and_pip_hud_commit_translation() {
+        let notes = default_current_release_notes();
+        assert_eq!(notes.len(), 5);
+        assert!(notes.iter().any(|n| n.contains("Picture-in-Picture") && n.contains("Shift+P") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Shift+I") && n.contains("[i HUD]") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Auto-Fullscreen") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("90%") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("What's New") && n.contains("How to use:")));
+
+        let combined = simplify_release_notes(
+            "Automated build for commit `329154d`: Port Phaenna Floating PiP mode and Multi-Color Bento Video Info HUD",
+        );
+        assert!(combined.iter().any(|n| n.contains("Picture-in-Picture")));
+        assert!(combined.iter().any(|n| n.contains("Live Video & Audio Info Card")));
     }
 }

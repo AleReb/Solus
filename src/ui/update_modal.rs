@@ -28,7 +28,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         return;
     };
 
-    let area = centered_rect(72, 62, frame.area());
+    let area = centered_rect(80, 76, frame.area());
     frame.render_widget(Clear, area);
 
     let theme = state.theme();
@@ -100,13 +100,37 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 }
 
 fn notes_for_info(info: &crate::services::updater::UpdateInfo) -> Vec<String> {
-    if !info.simple_notes.is_empty() {
+    let mut notes = if !info.simple_notes.is_empty() {
         info.simple_notes.clone()
     } else if let Some(ref raw) = info.release_notes {
         simplify_release_notes(raw)
     } else {
         default_current_release_notes()
+    };
+
+    if notes.len() < 5 {
+        for fallback in default_current_release_notes() {
+            if notes.len() >= 5 {
+                break;
+            }
+            let prefix = fallback
+                .split_once(':')
+                .map(|(head, _)| head.to_ascii_lowercase())
+                .unwrap_or_else(|| fallback.to_ascii_lowercase());
+            let already_present = notes.iter().any(|existing| {
+                let ex_prefix = existing
+                    .split_once(':')
+                    .map(|(head, _)| head.to_ascii_lowercase())
+                    .unwrap_or_else(|| existing.to_ascii_lowercase());
+                ex_prefix == prefix || existing.eq_ignore_ascii_case(&fallback)
+            });
+            if !already_present {
+                notes.push(fallback);
+            }
+        }
     }
+
+    notes
 }
 
 fn push_plain_english_section(lines: &mut Vec<Line<'static>>, notes: &[String], header: &str) {
@@ -115,46 +139,57 @@ fn push_plain_english_section(lines: &mut Vec<Line<'static>>, notes: &[String], 
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
-    for note in notes.iter().take(5) {
+    for (idx, note) in notes.iter().take(5).enumerate() {
         lines.push(format_plain_english_bullet(note));
+        if idx + 1 < notes.len().min(5) {
+            lines.push(Line::from(""));
+        }
+    }
+}
+
+fn append_body_with_how_to_use(spans: &mut Vec<Span<'static>>, body: &str) {
+    if let Some((desc, guide)) = body.split_once("How to use:") {
+        if !desc.is_empty() {
+            spans.push(Span::styled(
+                desc.to_string(),
+                Style::default().fg(Color::White),
+            ));
+        }
+        spans.push(Span::styled(
+            "How to use:",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            guide.to_string(),
+            Style::default().fg(Color::Rgb(215, 225, 240)),
+        ));
+    } else {
+        spans.push(Span::styled(
+            body.to_string(),
+            Style::default().fg(Color::White),
+        ));
     }
 }
 
 fn format_plain_english_bullet(note: &str) -> Line<'static> {
     let trimmed = note.trim();
-    if let Some(rest) = trimmed.strip_prefix("[NEW]") {
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(EMERALD)),
-            Span::styled(
-                "[NEW] ",
-                Style::default().fg(EMERALD).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(rest.trim().to_string(), Style::default().fg(Color::White)),
-        ])
-    } else if let Some(rest) = trimmed.strip_prefix("[FIXED]") {
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(CYAN)),
-            Span::styled(
-                "[FIXED] ",
-                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(rest.trim().to_string(), Style::default().fg(Color::White)),
-        ])
-    } else if let Some(rest) = trimmed.strip_prefix("[IMPROVED]") {
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(AMBER)),
-            Span::styled(
-                "[IMPROVED] ",
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(rest.trim().to_string(), Style::default().fg(Color::White)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(CYAN)),
-            Span::styled(trimmed.to_string(), Style::default().fg(Color::White)),
-        ])
+    for (badge, color) in [("[NEW]", EMERALD), ("[FIXED]", CYAN), ("[IMPROVED]", AMBER)] {
+        if let Some(rest) = trimmed.strip_prefix(badge) {
+            let mut spans = vec![
+                Span::styled("  • ", Style::default().fg(color)),
+                Span::styled(
+                    format!("{badge} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            append_body_with_how_to_use(&mut spans, rest.trim());
+            return Line::from(spans);
+        }
     }
+
+    let mut spans = vec![Span::styled("  • ", Style::default().fg(CYAN))];
+    append_body_with_how_to_use(&mut spans, trimmed);
+    Line::from(spans)
 }
 
 fn render_available(
