@@ -1,5 +1,38 @@
 # Raspberry Pi / uConsole: Linux ARM64
 
+## Prebuilt releases from this fork
+
+For Debian 13 / Raspberry Pi OS based on Debian 13, use the ARM64 binary from
+[AleReb/Solus releases](https://github.com/AleReb/Solus/releases) instead of compiling:
+
+```sh
+bash scripts/raspberry-pi/install-release.sh --terminal foot
+```
+
+Use `--terminal kitty` or `--terminal keep` if preferred. USB options are forwarded:
+
+```sh
+bash scripts/raspberry-pi/install-release.sh --terminal foot \
+  --download-dir /media/your-user/your-drive/Anime --usb-uuid YOUR-FILESYSTEM-UUID
+```
+
+The script downloads `solus-linux-aarch64` and `SHA256SUMS-arm64.txt` over HTTPS,
+checks the binary checksum, and calls the existing installer with `--binary` and
+`--sha256`. It never installs Rust or compiles locally. Playback dependencies still
+need to be installed; `--skip-deps` is available if they are already present.
+Use `--tag arm64-YYYYMMDD-COMMIT` to pin a specific release, or `--repo OWNER/REPO`
+to use another repository that publishes assets with these names.
+
+These are dynamically linked Debian 13 binaries, not universal Linux executables.
+Older Debian/Raspberry Pi OS releases and 32-bit systems are not supported by these
+assets. `BUILD-INFO.txt` identifies the exact source commit. Original source and
+the MIT license are available in the release and repository.
+
+The fork's `ARM64 binary release` GitHub Actions workflow builds natively on an ARM64
+runner inside Debian 13, tests the installer, and publishes a commit-specific release
+with checksums. It runs on application changes to `raspberry-pi-arm64` and supports
+manual runs. It does not change the upstream multi-platform release workflow.
+
 These optional scripts build the existing Solus application natively. The original
 `install.sh`, `install.ps1`, Cargo files, Rust sources, and release workflow are unchanged.
 All project credit and the MIT license remain with the upstream authors.

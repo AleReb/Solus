@@ -22,6 +22,21 @@ https://github.com/user-attachments/assets/a7c6c35f-ac28-49ef-bb0f-fbfc72bc4177
 
 ## Install
 
+### Raspberry Pi ARM64: install a prebuilt release
+
+This fork publishes a Debian 13 ARM64 executable in [GitHub Releases](https://github.com/AleReb/Solus/releases).
+From this checkout, install without Rust or local compilation:
+
+```bash
+bash scripts/raspberry-pi/install-release.sh --terminal foot
+# Or use --terminal kitty / --terminal keep.
+```
+
+The installer verifies SHA256 and accepts the same USB download options as the
+[Raspberry Pi installer](docs/raspberry-pi.md). GitHub Actions builds subsequent ARM64
+releases when application code changes on this fork's `raspberry-pi-arm64` branch;
+the workflow can also be started manually. Other platforms keep the original installers below.
+
 ### macOS and Linux
 
 Open a terminal and run:
