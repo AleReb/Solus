@@ -24,20 +24,72 @@ https://github.com/user-attachments/assets/a7c6c35f-ac28-49ef-bb0f-fbfc72bc4177
 
 ### Raspberry Pi ARM64: install a prebuilt release
 
-This fork publishes a Debian 13 ARM64 executable in [GitHub Releases](https://github.com/AleReb/Solus/releases).
-From this checkout, install without Rust or local compilation:
+Download the compiled executable from this fork's [latest ARM64 release](https://github.com/AleReb/Solus/releases/latest).
+**Rust and local compilation are not required.** GitHub Actions builds the releases.
+
+Requirements: **Debian 13 / Raspberry Pi OS based on Debian 13, 64-bit ARM64**
+(`uname -m` must print `aarch64`), a graphical desktop, Internet access, and sudo
+for system dependencies. These binaries are not for 32-bit Raspberry Pi OS or older
+distributions. Foot requires Wayland; choose Kitty for an X11 desktop.
+
+For a fresh installation:
+
+```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates
+git clone --branch raspberry-pi-arm64 --single-branch https://github.com/AleReb/Solus.git
+cd Solus
+bash scripts/raspberry-pi/install-release.sh --terminal foot
+```
+
+Choose the terminal you prefer; run **one** of these alternatives:
 
 ```bash
 bash scripts/raspberry-pi/install-release.sh --terminal foot
-# Or use --terminal kitty / --terminal keep.
+bash scripts/raspberry-pi/install-release.sh --terminal kitty
+bash scripts/raspberry-pi/install-release.sh --terminal keep
 ```
 
-The installer verifies SHA256 and accepts the same USB download options as the
-[Raspberry Pi installer](docs/raspberry-pi.md). GitHub Actions builds subsequent ARM64
-releases when application code changes on this fork's `raspberry-pi-arm64` branch;
-the workflow can also be started manually. Other platforms keep the original installers below.
+The installer downloads `solus-linux-aarch64` and `SHA256SUMS-arm64.txt` from the
+latest release, verifies SHA256, installs the required system packages, and preserves
+existing preferences and history. It does not change desktop keyboard shortcuts.
+Open your selected terminal and run:
 
-### macOS and Linux
+```bash
+solus
+```
+
+To update an existing checkout and installation, without compiling:
+
+```bash
+git pull --ff-only
+bash scripts/raspberry-pi/install-release.sh --terminal keep
+```
+
+Use `--skip-deps` if the system dependencies are already installed. To select a
+specific snapshot, add `--tag arm64-20261124-9969aa1`
+([release details](https://github.com/AleReb/Solus/releases/tag/arm64-20261124-9969aa1)).
+
+For downloads on a USB drive, find its filesystem UUID and mount point with
+`lsblk -o NAME,LABEL,UUID,MOUNTPOINTS`, then substitute your own values:
+
+```bash
+bash scripts/raspberry-pi/install-release.sh --terminal foot \
+  --download-dir /media/your-user/your-drive/Anime \
+  --usb-uuid YOUR-FILESYSTEM-UUID
+```
+
+The configured USB directory and UUID are preserved on subsequent updates. Downloads
+stay organized by series; the launcher checks the USB before starting Solus. See the
+[Raspberry Pi guide](docs/raspberry-pi.md) for storage permissions, backups, and maintenance.
+
+GitHub Actions builds subsequent ARM64 releases when application code changes on
+this fork's `raspberry-pi-arm64` branch; the workflow also supports manual runs.
+The [first automatic ARM64 release](https://github.com/AleReb/Solus/releases/tag/arm64-20261124-9969aa1)
+was built and its installer checks passed on GitHub. These community builds retain
+the original project's MIT license and attribution.
+
+### macOS and Linux x86_64
 
 Open a terminal and run:
 
@@ -69,9 +121,11 @@ notepad install.ps1
 .\install.ps1
 ```
 
-### Raspberry Pi and uConsole
+### Raspberry Pi: build from source (optional)
 
-Raspberry Pi support is available for 64-bit ARM Linux systems.
+Use the prebuilt release above to avoid compilation. If you prefer to build the
+application yourself, use a 64-bit ARM Linux system and the source installer below.
+This option installs Rust and compiles locally, which takes time and memory.
 
 Preview the installation:
 
